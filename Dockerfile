@@ -1,58 +1,55 @@
-FROM python:3.12.10-slim-bookworm as base
+# 使用官方Rust镜像作为构建环境
+FROM rust:1.75 as builder
 
-# Setup env
-ENV LANG C.UTF-8
-ENV LC_ALL C.UTF-8
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONFAULTHANDLER 1
-ENV PATH=/home/ftuser/.local/bin:$PATH
-ENV FT_APP_ENV="docker"
+# 设置工作目录
+WORKDIR /app
 
-# Prepare environment
-RUN mkdir /freqtrade \
-  && apt-get update \
-  && apt-get -y install sudo libatlas3-base curl sqlite3 libgomp1 \
-  && apt-get clean \
-  && useradd -u 1000 -G sudo -U -m -s /bin/bash ftuser \
-  && chown ftuser:ftuser /freqtrade \
-  # Allow sudoers
-  && echo "ftuser ALL=(ALL) NOPASSWD: /bin/chown" >> /etc/sudoers
+# 复制Cargo.toml和Cargo.lock（如果存在）
+COPY Cargo.toml ./
 
-WORKDIR /freqtrade
+# 创建虚拟main.rs来缓存依赖
+RUN mkdir src && echo "fn main() {}" > src/main.rs
 
-# Install dependencies
-FROM base as python-deps
-RUN  apt-get update \
-  && apt-get -y install build-essential libssl-dev git libffi-dev libgfortran5 pkg-config cmake gcc \
-  && apt-get clean \
-  && pip install --upgrade pip wheel
+# 构建依赖（缓存层）
+RUN cargo build --release
 
-# Install TA-lib
-COPY build_helpers/* /tmp/
-RUN cd /tmp && /tmp/install_ta-lib.sh && rm -r /tmp/*ta-lib*
-ENV LD_LIBRARY_PATH /usr/local/lib
+# 复制源代码
+COPY src/ ./src/
 
-# Install dependencies
-COPY --chown=ftuser:ftuser requirements.txt requirements-hyperopt.txt /freqtrade/
-USER ftuser
-RUN  pip install --user --no-cache-dir "numpy<2.0" \
-  && pip install --user --no-cache-dir -r requirements-hyperopt.txt
+# 重新构建应用（使用缓存的依赖）
+RUN cargo build --release
 
-# Copy dependencies to runtime-image
-FROM base as runtime-image
-COPY --from=python-deps /usr/local/lib /usr/local/lib
-ENV LD_LIBRARY_PATH /usr/local/lib
+# 使用轻量级运行时镜像
+FROM debian:bullseye-slim
 
-COPY --from=python-deps --chown=ftuser:ftuser /home/ftuser/.local /home/ftuser/.local
+# 安装必要的运行时依赖
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-USER ftuser
-# Install and execute
-COPY --chown=ftuser:ftuser . /freqtrade/
+# 创建非root用户
+RUN useradd -m -u 1000 appuser
 
-RUN pip install -e . --user --no-cache-dir --no-build-isolation \
-  && mkdir /freqtrade/user_data/ \
-  && freqtrade install-ui
+# 设置工作目录
+WORKDIR /app
 
-ENTRYPOINT ["freqtrade"]
-# Default to trade mode
-CMD [ "trade" ]
+# 从构建阶段复制二进制文件
+COPY --from=builder /app/target/release/edgex-high-frequency-bot /app/
+
+# 复制配置文件（如果有）
+COPY --chown=appuser:appuser .env.example /app/
+
+# 设置文件权限
+RUN chown -R appuser:appuser /app
+
+# 切换到非root用户
+USER appuser
+
+# 设置环境变量
+ENV RUST_LOG=info
+
+# 暴露必要的端口（如果需要）
+# EXPOSE 8080
+
+# 设置入口点
+ENTRYPOINT ["./edgex-high-frequency-bot"]

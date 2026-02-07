@@ -1,0 +1,10 @@
+FROM freqtradeorg/freqtrade:stable
+
+WORKDIR /freqtrade
+
+# Copy repository code to ensure Coinbase exchange subclass is available
+COPY . /freqtrade/
+
+# Install runtime dependencies
+RUN pip install --no-cache-dir --user -r requirements.txt
+

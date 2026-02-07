@@ -1,7 +1,8 @@
 ---
 services:
   freqtrade:
-    image: freqtradeorg/freqtrade:stable
+    image: freqtradeorg/freqtrade:coinbase-advanced-trade
+    # image: freqtradeorg/freqtrade:stable
     # image: freqtradeorg/freqtrade:develop
     # Use plotting image
     # image: freqtradeorg/freqtrade:develop_plot
@@ -14,10 +15,10 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu]
-    # Build step - only needed when additional dependencies are needed
-    # build:
-    #   context: .
-    #   dockerfile: "./docker/Dockerfile.custom"
+    # Build the local image to include custom exchange support.
+    build:
+      context: .
+      dockerfile: "./Dockerfile"
     restart: unless-stopped
     container_name: freqtrade
     volumes:

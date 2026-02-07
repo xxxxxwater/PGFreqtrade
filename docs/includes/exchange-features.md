@@ -7,6 +7,7 @@
 | [Bitmart](exchanges.md#bitmart) | spot | | ❌ (not supported) |
 | [Bitget](exchanges.md#bitget) | spot | | market, limit |
 | [Bitget](exchanges.md#bitget) | futures | isolated | market, limit |
+| [Coinbase](exchanges.md#coinbase-advanced-trade) | spot | | ❌ (not supported) |
 | [Bybit](exchanges.md#bybit) | spot | | ❌ (not supported) |
 | [Bybit](exchanges.md#bybit) | futures | isolated | market, limit |
 | [Gate.io](exchanges.md#gateio) | spot | | limit |

@@ -159,6 +159,18 @@ BingX supports [time_in_force](configuration.md#understand-order_time_in_force) 
 !!! Tip "Stoploss on Exchange"
     Bingx supports `stoploss_on_exchange` and can use both stop-limit and stop-market orders. It provides great advantages, so we recommend to benefit from it by enabling stoploss on exchange.
 
+## Coinbase Advanced Trade
+
+Use the exchange name `coinbase` in your configuration to connect via the Coinbase Advanced Trade API.
+
+```json
+"exchange": {
+    "name": "coinbase",
+    "key": "your_exchange_key",
+    "secret": "your_exchange_secret"
+}
+```
+
 ## Kraken
 
 Kraken supports [time_in_force](configuration.md#understand-order_time_in_force) with settings "GTC" (good till cancelled), "IOC" (immediate-or-cancel) and "PO" (Post only) settings.

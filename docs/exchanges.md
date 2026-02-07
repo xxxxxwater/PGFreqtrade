@@ -245,6 +245,14 @@ Configure your exchange name as `coinbase`, and use the API credentials created 
 Advanced Trade settings. Refer to the Coinbase Advanced Trade API documentation for the
 required permissions and key formats.
 
+Coinbase supports [time_in_force](configuration.md#understand-order_time_in_force) with
+settings "GTC" (good till cancelled), "IOC" (immediate-or-cancel), "FOK" (fill-or-kill), and
+"PO" (post only).
+
+Ensure your Coinbase API key has at least "View" and "Trade" permissions enabled for Advanced
+Trade. Additional wallet permissions are not required unless you need them for account
+management outside of trading.
+
 ## HTX
 
 !!! Tip "Stoploss on Exchange"

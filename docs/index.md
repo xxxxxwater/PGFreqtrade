@@ -42,6 +42,7 @@ Please read the [exchange specific notes](exchanges.md) to learn about eventual,
 - [X] [Binance](https://www.binance.com/)
 - [X] [BingX](https://bingx.com/invite/0EM9RX)
 - [X] [Bitmart](https://bitmart.com/)
+- [X] [Coinbase Advanced Trade](https://www.coinbase.com/advanced-trade)
 - [X] [Bybit](https://bybit.com/)
 - [X] [Gate.io](https://www.gate.io/ref/6266643)
 - [X] [HTX](https://www.htx.com/)

@@ -10,6 +10,7 @@ from freqtrade.exchange.bitmart import Bitmart
 from freqtrade.exchange.bitpanda import Bitpanda
 from freqtrade.exchange.bitvavo import Bitvavo
 from freqtrade.exchange.bybit import Bybit
+from freqtrade.exchange.coinbase import Coinbase
 from freqtrade.exchange.cryptocom import Cryptocom
 
 

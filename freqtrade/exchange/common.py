@@ -60,6 +60,7 @@ SUPPORTED_EXCHANGES = [
     "binance",
     "bingx",
     "bitmart",
+    "coinbase",
     "bybit",
     "gate",
     "htx",

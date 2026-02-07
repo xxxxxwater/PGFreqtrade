@@ -238,6 +238,13 @@ Kucoin supports [time_in_force](configuration.md#understand-order_time_in_force)
 For Kucoin, it is suggested to add `"KCS/<STAKE>"` to your blacklist to avoid issues, unless you are willing to maintain enough extra `KCS` on the account or unless you're willing to disable using `KCS` for fees. 
 Kucoin accounts may use `KCS` for fees, and if a trade happens to be on `KCS`, further trades may consume this position and make the initial `KCS` trade unsellable as the expected amount is not there anymore.
 
+## Coinbase Advanced Trade
+
+Coinbase Advanced Trade is supported through the CCXT `coinbase` exchange.
+Configure your exchange name as `coinbase`, and use the API credentials created in the Coinbase
+Advanced Trade settings. Refer to the Coinbase Advanced Trade API documentation for the
+required permissions and key formats.
+
 ## HTX
 
 !!! Tip "Stoploss on Exchange"

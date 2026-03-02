@@ -20,7 +20,7 @@ services:
       context: .
       dockerfile: "./Dockerfile"
     restart: unless-stopped
-    container_name: freqtrade
+    container_name: Coinbase-Advaced-5M
     volumes:
       - "./user_data:/freqtrade/user_data"
     # Expose api on port 8080 (localhost only)

@@ -49,6 +49,7 @@ Freqtrade expects exchange adapters to answer:
 Files involved:
 - `freqtrade/exchange/coinbase.py`
 - `freqtrade/exchange/coinbase_advanced_compat.py`
+- `freqtrade/exchange/coinbase_advanced_models.py`
 
 Key behavior:
 - Spot uses plain symbols like `BTC/USDC`
@@ -120,7 +121,7 @@ Freqtrade futures flow needs consistent position data to:
 - manage exits
 
 ### Test-branch implementation
-`normalize_coinbase_position()` attempts to normalize:
+`CoinbaseAdvancedPositionView` / `normalize_coinbase_position()` attempt to normalize:
 - contracts from `contracts`, `contractSize`, `amount`, or `info.number_of_contracts`
 - leverage from `leverage` or `info.leverage`
 - margin mode from `marginMode` / `info.margin_mode`

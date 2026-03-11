@@ -11,6 +11,7 @@ Source copy from:
 ### Exchange layer
 - Expanded `freqtrade/exchange/coinbase.py`
 - Added `freqtrade/exchange/coinbase_advanced_compat.py`
+- Added `freqtrade/exchange/coinbase_advanced_models.py`
 - Added test futures support scaffolding
 - Added CCXT `defaultType` / `defaultSubType` routing
 - Added balance / position normalization

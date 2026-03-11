@@ -10,7 +10,8 @@ This tree is the **experimental Coinbase Advanced integration branch**.
 1. `TEST_BRANCH_COINBASE_ADVANCED_CHANGELOG.md`
 2. `docs/coinbase_advanced_futures_test.md`
 3. `freqtrade/exchange/coinbase.py`
-4. `user_data/config.coinbase_advanced_futures.example.json`
+4. `freqtrade/exchange/coinbase_advanced_compat.py`
+5. `user_data/config.coinbase_advanced_futures.example.json`
 5. `user_data/config.coinbase_advanced_futures.live-template.json`
 6. `user_data/strategies/VWAP_V4_CoinbaseAdvancedFutures.py`
 7. `user_data/strategies/CoinbaseAdvancedDirectionalFutures.py`

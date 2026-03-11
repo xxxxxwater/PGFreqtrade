@@ -10,12 +10,14 @@ Source copy from:
 
 ### Exchange layer
 - Expanded `freqtrade/exchange/coinbase.py`
+- Added `freqtrade/exchange/coinbase_advanced_compat.py`
 - Added test futures support scaffolding
 - Added CCXT `defaultType` / `defaultSubType` routing
 - Added balance / position normalization
 - Added futures order param shaping
 - Added leverage prep hooks
 - Added conservative liquidation and funding-fee helpers
+- Split Coinbase Advanced / CCXT compatibility logic into a project-local helper module
 
 ### User configs / strategies
 - Added `user_data/config.coinbase_advanced_futures.example.json`

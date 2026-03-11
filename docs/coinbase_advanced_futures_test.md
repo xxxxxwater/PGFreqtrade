@@ -31,6 +31,16 @@ Extended from a placeholder to a test exchange adapter with:
 - dry-run liquidation estimate for isolated linear contracts
 - funding fee fallback handling
 
+### 1b. `freqtrade/exchange/coinbase_advanced_compat.py`
+Added a project-local compatibility module to keep Coinbase Advanced / CCXT
+normalization logic in one place, including:
+
+- futures market detection
+- symbol candidate generation
+- position normalization
+- order param normalization
+- leverage inference from market metadata
+
 ### 2. `user_data/config.coinbase_advanced_futures.example.json`
 Added a futures-mode example config using CCXT-style linear symbols such as:
 

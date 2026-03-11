@@ -199,11 +199,20 @@ class Wallets:
         _parsed_positions = {}
         for position in positions:
             symbol = position["symbol"]
-            if position["side"] is None or position["collateral"] == 0.0:
-                # Position is not open ...
+            side = position.get("side")
+            collateral = safe_value_fallback(
+                position,
+                "initialMargin",
+                "collateral",
+                safe_value_fallback(position, "maintenanceMargin", "notional", 0.0),
+            )
+            contracts = abs(float(position.get("contracts") or 0.0))
+
+            if side is None or contracts == 0.0:
+                # Position is not open or could not be normalized.
                 continue
-            size = self._exchange._contracts_to_amount(symbol, position["contracts"])
-            collateral = safe_value_fallback(position, "initialMargin", "collateral", 0.0)
+
+            size = self._exchange._contracts_to_amount(symbol, contracts)
             leverage: float | None = position.get("leverage")
             if not leverage:
                 trade = Trade.get_trades_proxy(is_open=True, pair=symbol)
@@ -212,8 +221,8 @@ class Wallets:
                 symbol,
                 position=size,
                 leverage=leverage,
-                collateral=collateral,
-                side=position["side"],
+                collateral=float(collateral or 0.0),
+                side=side,
             )
         self._positions = _parsed_positions
         self._wallets = _wallets

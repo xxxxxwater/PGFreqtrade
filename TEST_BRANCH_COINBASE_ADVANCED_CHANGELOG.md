@@ -44,8 +44,10 @@ Source copy from:
 - Added this changelog file
 - Added reporting / probe scripts for test-branch validation
 - Added branch gap reporting script
+- Added environment audit script to distinguish missing tests vs missing environment
 - Tightened product schema parsing and close-position compatibility modeling
 - Added main order-path fallback from reduceOnly to close_position for Coinbase futures errors
+- Tightened wallet-side consumption of normalized Coinbase futures positions
 
 ### Tests
 - Added `tests/exchange/test_coinbase_advanced_testbranch.py`

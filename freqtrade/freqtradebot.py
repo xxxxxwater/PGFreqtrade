@@ -2136,7 +2136,10 @@ class FreqtradeBot(LoggingMixin):
                 return False
 
         try:
-            # Execute exit and update trade record
+            # Execute exit and update trade record.
+            # Coinbase Advanced futures may reject a standard reduceOnly exit on some venues.
+            # The Coinbase exchange subclass in the test branch can retry with explicit
+            # close_position semantics when it detects those venue restrictions.
             order = self.exchange.create_order(
                 pair=trade.pair,
                 ordertype=order_type,

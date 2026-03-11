@@ -39,3 +39,25 @@ services:
       --db-url sqlite:////freqtrade/user_data/tradesv3-futures.sqlite
       --config /freqtrade/user_data/config.coinbase_advanced_futures.example.json
       --strategy CoinbaseAdvancedFuturesVWAP
+
+  freqtrade_futures_directional_dev:
+    image: freqtradeorg/freqtrade:coinbase-advanced-trade
+    build:
+      context: .
+      dockerfile: "./Dockerfile"
+    container_name: Coinbase-Advanced-Futures-Directional-Dev
+    profiles: ["dev", "futures", "directional"]
+    stdin_open: true
+    tty: true
+    working_dir: /freqtrade
+    volumes:
+      - "./:/freqtrade"
+    ports:
+      - "127.0.0.1:8012:8012"
+      - "127.0.0.1:8084:8080"
+    command: >
+      trade
+      --logfile /freqtrade/user_data/logs/coinbase-futures-directional-dev.log
+      --db-url sqlite:////freqtrade/user_data/tradesv3-futures-directional.sqlite
+      --config /freqtrade/user_data/config.coinbase_advanced_futures.directional-template.json
+      --strategy CoinbaseAdvancedDirectionalFutures

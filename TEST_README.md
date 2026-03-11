@@ -21,6 +21,12 @@ This tree is the **experimental Coinbase Advanced integration branch**.
 
 - `scripts/coinbase_advanced_probe.py`
 - `scripts/coinbase_advanced_market_report.py`
+- `scripts/coinbase_advanced_config_audit.py`
+
+## Compose variants
+
+- root `docker-compose.yml` for spot + futures dev services
+- `docker/docker-compose-coinbase-advanced-futures-test.yml` for dedicated futures strategy tracks
 
 ## Important boundary
 

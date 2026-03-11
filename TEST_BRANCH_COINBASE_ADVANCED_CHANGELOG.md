@@ -32,10 +32,14 @@ Source copy from:
 - Reworked `docker-compose.yml` with:
   - spot service
   - futures dev service profile
+  - directional futures dev service profile
+- Added `docker/docker-compose-coinbase-advanced-futures-test.yml`
+  for dedicated futures strategy tracks
 - Updated `.devcontainer/devcontainer.json`
 
 ### Documentation
 - Added `docs/coinbase_advanced_futures_test.md`
+- Added `docs/coinbase_advanced_api_mapping.md`
 - Added this changelog file
 - Added reporting / probe scripts for test-branch validation
 

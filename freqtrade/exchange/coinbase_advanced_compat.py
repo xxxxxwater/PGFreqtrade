@@ -10,6 +10,13 @@ from freqtrade.exchange.coinbase_advanced_models import (
     CoinbaseAdvancedProductDetails,
 )
 
+_CLOSE_POSITION_FALLBACK_MARKERS = {
+    "PREVIEW_REDUCE_ONLY_NOT_ALLOWED_ON_VENUE",
+    "reduce_only_not_allowed",
+    "reduce only not allowed",
+    "close_position_required",
+}
+
 
 def is_coinbase_futures_market(market: dict[str, Any], stake_currency: str | None = None) -> bool:
     if not isinstance(market, dict):
@@ -142,3 +149,10 @@ def normalize_coinbase_close_order_side(is_short: bool) -> str:
 
 def normalize_coinbase_open_order_side(is_short: bool) -> str:
     return "sell" if is_short else "buy"
+
+
+def should_use_coinbase_close_position_fallback(message: str | Exception | None) -> bool:
+    if message is None:
+        return False
+    text = str(message).lower()
+    return any(marker.lower() in text for marker in _CLOSE_POSITION_FALLBACK_MARKERS)

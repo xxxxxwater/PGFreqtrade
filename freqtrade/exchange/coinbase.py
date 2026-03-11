@@ -10,11 +10,21 @@ import logging
 from datetime import datetime
 from typing import Any
 
+import ccxt
+
 from freqtrade.constants import BuySell
 from freqtrade.enums import MarginMode, TradingMode
-from freqtrade.exceptions import ExchangeError, OperationalException
+from freqtrade.exceptions import (
+    DDosProtection,
+    ExchangeError,
+    InsufficientFundsError,
+    InvalidOrderException,
+    OperationalException,
+    TemporaryError,
+)
 from freqtrade.exchange import Exchange
 from freqtrade.exchange.coinbase_advanced_compat import (
+    build_coinbase_close_position_params,
     build_coinbase_symbol_candidates,
     infer_coinbase_maintenance_ratio,
     infer_coinbase_max_leverage,
@@ -22,6 +32,7 @@ from freqtrade.exchange.coinbase_advanced_compat import (
     normalize_coinbase_balances,
     normalize_coinbase_order_params,
     normalize_coinbase_positions,
+    should_use_coinbase_close_position_fallback,
 )
 from freqtrade.exchange.exchange_types import CcxtBalances, CcxtPosition, FtHas
 from freqtrade.misc import deep_merge_dicts
@@ -201,6 +212,97 @@ class Coinbase(Exchange):
         maintenance_margin = position_value * mm_ratio
         liq_delta = (initial_margin - maintenance_margin) / amount
         return open_rate + liq_delta if is_short else open_rate - liq_delta
+
+    def create_order(
+        self,
+        *,
+        pair: str,
+        ordertype: str,
+        side: BuySell,
+        amount: float,
+        rate: float,
+        leverage: float,
+        time_in_force: str = "GTC",
+        reduceOnly: bool = False,
+        initial_order: bool = True,
+    ):
+        """Create order with Coinbase Advanced futures fallback behavior.
+
+        For some Coinbase Advanced venues/products, reduce-only exits may not be allowed via
+        the ordinary create-order path. In that case, retry once with explicit
+        `close_position` semantics.
+        """
+        if self._config["dry_run"]:
+            return super().create_order(
+                pair=pair,
+                ordertype=ordertype,
+                side=side,
+                amount=amount,
+                rate=rate,
+                leverage=leverage,
+                time_in_force=time_in_force,
+                reduceOnly=reduceOnly,
+                initial_order=initial_order,
+            )
+
+        pair = self.normalize_pair_for_trading(pair)
+        params = self._get_params(side, ordertype, leverage, reduceOnly, time_in_force)
+
+        try:
+            amount = self.amount_to_precision(pair, self._amount_to_contracts(pair, amount))
+            needs_price = self._order_needs_price(side, ordertype)
+            rate_for_order = self.price_to_precision(pair, rate) if needs_price else None
+            if not reduceOnly:
+                self._lev_prep(pair, leverage, side, accept_fail=not initial_order)
+            order = self._api.create_order(pair, ordertype, side, amount, rate_for_order, params)
+            if order.get("status") is None:
+                order["status"] = "open"
+            if order.get("type") is None:
+                order["type"] = ordertype
+            self._log_exchange_response("create_order", order)
+            return self._order_contracts_to_amount(order)
+        except ccxt.InsufficientFunds as e:
+            raise InsufficientFundsError(
+                f"Insufficient funds to create {ordertype} {side} order on market {pair}. Tried to {side} amount {amount} at rate {rate}. Message: {e}"
+            ) from e
+        except ccxt.InvalidOrder as e:
+            if self.trading_mode == TradingMode.FUTURES and reduceOnly and should_use_coinbase_close_position_fallback(e):
+                try:
+                    close_params = build_coinbase_close_position_params(side=side.upper())
+                    close_params.update(self._get_params(side, ordertype, leverage, False, time_in_force))
+                    order = self._api.create_order(pair, ordertype, side, amount, rate_for_order, close_params)
+                    if order.get("status") is None:
+                        order["status"] = "open"
+                    if order.get("type") is None:
+                        order["type"] = ordertype
+                    self._log_exchange_response("create_order_close_position_fallback", order)
+                    return self._order_contracts_to_amount(order)
+                except ccxt.BaseError:
+                    pass
+            raise InvalidOrderException(
+                f"Could not create {ordertype} {side} order on market {pair}. Tried to {side} amount {amount} at rate {rate}. Message: {e}"
+            ) from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            if self.trading_mode == TradingMode.FUTURES and reduceOnly and should_use_coinbase_close_position_fallback(e):
+                try:
+                    close_params = build_coinbase_close_position_params(side=side.upper())
+                    close_params.update(self._get_params(side, ordertype, leverage, False, time_in_force))
+                    order = self._api.create_order(pair, ordertype, side, amount, rate_for_order, close_params)
+                    if order.get("status") is None:
+                        order["status"] = "open"
+                    if order.get("type") is None:
+                        order["type"] = ordertype
+                    self._log_exchange_response("create_order_close_position_fallback", order)
+                    return self._order_contracts_to_amount(order)
+                except ccxt.BaseError:
+                    pass
+            raise TemporaryError(
+                f"Could not place {side} order due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
 
     def get_funding_fees(self, pair: str, amount: float, is_short: bool, open_date: datetime) -> float:
         if self.trading_mode != TradingMode.FUTURES:

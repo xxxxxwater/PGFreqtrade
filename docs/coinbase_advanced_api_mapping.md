@@ -191,6 +191,7 @@ Used for:
 ### Test-branch implementation
 Current status:
 - conservative dry-run liquidation estimate exists
+- maintenance ratio has a project-local fallback when leverage tiers are unavailable
 - funding fee helper falls back safely when data is unavailable
 - exact production-grade parity still requires live validation
 

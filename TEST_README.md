@@ -23,6 +23,7 @@ This tree is the **experimental Coinbase Advanced integration branch**.
 - `scripts/coinbase_advanced_market_report.py`
 - `scripts/coinbase_advanced_config_audit.py`
 - `scripts/coinbase_advanced_branch_report.py`
+- `scripts/coinbase_advanced_gap_check.py`
 
 ## Compose variants
 

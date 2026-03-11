@@ -39,6 +39,10 @@ def normalize_coinbase_position(position: dict[str, Any], default_margin_mode: s
     return CoinbaseAdvancedPositionView.from_ccxt(position, default_margin_mode).to_ccxt_position()
 
 
+def normalize_coinbase_positions(positions: list[dict[str, Any]], default_margin_mode: str) -> list[dict[str, Any]]:
+    return [normalize_coinbase_position(p, default_margin_mode) for p in positions]
+
+
 def normalize_coinbase_balances(raw_balances: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for currency, value in raw_balances.items():
@@ -75,6 +79,32 @@ def normalize_coinbase_order_params(
     return p
 
 
+def normalize_coinbase_entry_params(
+    *, margin_mode: str, leverage: float, time_in_force: str, params: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return normalize_coinbase_order_params(
+        trading_mode="futures",
+        margin_mode=margin_mode,
+        time_in_force=time_in_force,
+        leverage=leverage,
+        reduce_only=False,
+        params=params or {},
+    )
+
+
+def normalize_coinbase_exit_params(
+    *, margin_mode: str, leverage: float, time_in_force: str, params: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return normalize_coinbase_order_params(
+        trading_mode="futures",
+        margin_mode=margin_mode,
+        time_in_force=time_in_force,
+        leverage=leverage,
+        reduce_only=True,
+        params=params or {},
+    )
+
+
 def infer_coinbase_max_leverage(market: dict[str, Any], default: float = 3.0) -> float:
     limits = market.get("limits", {}) if isinstance(market, dict) else {}
     lev = (limits.get("leverage") or {}).get("max")
@@ -88,6 +118,18 @@ def infer_coinbase_max_leverage(market: dict[str, Any], default: float = 3.0) ->
                 if key == "intraday_margin_rate":
                     rate = float(val)
                     return round(1.0 / rate, 8) if rate > 0 else 1.0
+                return float(val)
+            except Exception:
+                continue
+    return default
+
+
+def infer_coinbase_maintenance_ratio(market: dict[str, Any], default: float = 0.02) -> float:
+    info = market.get("info", {}) if isinstance(market, dict) else {}
+    for key in ("maintenance_margin_rate", "maintenanceMarginRate", "mmr"):
+        val = info.get(key)
+        if val not in (None, ""):
+            try:
                 return float(val)
             except Exception:
                 continue

@@ -4,10 +4,11 @@ Test-branch implementation with extended Coinbase Advanced support for:
 - Spot mode (existing behaviour)
 - Futures mode scaffolding aligned with Coinbase Advanced Trade docs
 - Safer parameter normalization for CCXT unified methods
+- Symbol normalization helpers for Coinbase Advanced derivatives style markets
 
 This file intentionally keeps the implementation conservative: it enables
-Freqtrade's futures plumbing for Coinbase in the test tree without claiming
-feature parity with exchanges like Bybit / Binance yet.
+Freqtrade's futures plumbing in the test tree without claiming full production
+feature parity with more mature futures adapters like Bybit / Binance.
 """
 
 import logging
@@ -74,11 +75,7 @@ class Coinbase(Exchange):
         config: dict[str, Any] = {"options": {}}
 
         if self.trading_mode == TradingMode.SPOT:
-            config["options"].update(
-                {
-                    "defaultType": "spot",
-                }
-            )
+            config["options"].update({"defaultType": "spot"})
         elif self.trading_mode == TradingMode.FUTURES:
             # Coinbase Advanced derivatives in CCXT are generally exposed through
             # unified derivatives/swap style market typing.
@@ -113,6 +110,31 @@ class Coinbase(Exchange):
             self.trading_mode.value,
         )
 
+    def normalize_pair_for_trading(self, pair: str) -> str:
+        """Normalize incoming pair names to the closest Coinbase Advanced symbol.
+
+        Examples:
+        - Spot: BTC/USDC -> BTC/USDC
+        - Futures target style: BTC/USDC -> BTC/USDC:USDC (if such market exists)
+        - Already normalized: BTC/USDC:USDC -> BTC/USDC:USDC
+        """
+        if pair in self.markets:
+            return pair
+
+        if self.trading_mode == TradingMode.SPOT:
+            return pair
+
+        candidates = [pair]
+        if ":" not in pair and "/" in pair:
+            _, quote = pair.split("/")
+            candidates.append(f"{pair}:{quote}")
+            candidates.append(f"{pair}:{self._config.get('stake_currency', quote)}")
+
+        for candidate in candidates:
+            if candidate in self.markets:
+                return candidate
+        return pair
+
     def market_is_tradable(self, market: dict[str, Any]) -> bool:
         """Keep parent logic and filter obviously unsupported inverse contracts."""
         parent = super().market_is_tradable(market)
@@ -124,15 +146,23 @@ class Coinbase(Exchange):
                 return False
             if not (market.get("swap") or market.get("future") or market.get("contract")):
                 return False
+            settle = market.get("settle") or market.get("quote")
+            stake = self._config.get("stake_currency")
+            if settle and stake and settle != stake:
+                return False
 
         return True
 
-    def get_balances(self, params: dict | None = None) -> CcxtBalances:
-        """Fetch balances and normalize Coinbase Advanced style payloads.
+    def get_valid_pair_combination(self, curr_1: str, curr_2: str) -> str:
+        """Return valid spot/futures symbol combinations for Coinbase Advanced.
 
-        For futures mode we still use unified CCXT balance handling, but strip the
-        aggregate helper keys and keep only per-currency objects expected by Freqtrade.
+        This makes futures pair handling more explicit in the test tree.
         """
+        pair = super().get_valid_pair_combination(curr_1, curr_2)
+        return self.normalize_pair_for_trading(pair)
+
+    def get_balances(self, params: dict | None = None) -> CcxtBalances:
+        """Fetch balances and normalize Coinbase Advanced style payloads."""
         balances = super().get_balances(params=params)
         if not balances:
             return balances
@@ -149,17 +179,13 @@ class Coinbase(Exchange):
                 "total": float(value.get("total") or 0.0),
             }
 
-        if normalized:
-            return normalized
-        return balances
+        return normalized or balances
 
     def fetch_positions(
         self, pair: str | None = None, params: dict | None = None
     ) -> list[CcxtPosition]:
-        """Fetch and normalize futures positions.
-
-        In spot mode parent implementation already returns [].
-        """
+        """Fetch and normalize futures positions."""
+        pair = self.normalize_pair_for_trading(pair) if pair else pair
         positions = super().fetch_positions(pair, params=params)
         if self.trading_mode != TradingMode.FUTURES:
             return positions
@@ -184,6 +210,10 @@ class Coinbase(Exchange):
 
             margin_mode = p.get("marginMode") or p.get("info", {}).get("margin_mode")
             p["marginMode"] = margin_mode or self.margin_mode.value
+
+            side = p.get("side") or p.get("info", {}).get("side")
+            if side:
+                p["side"] = str(side).lower()
             normalized.append(p)
         return normalized
 
@@ -195,11 +225,7 @@ class Coinbase(Exchange):
         reduceOnly: bool,
         time_in_force: str = "GTC",
     ) -> dict:
-        """Build Coinbase Advanced compatible order params.
-
-        We keep params generic enough for CCXT unified create_order while exposing
-        additional futures hints where supported.
-        """
+        """Build Coinbase Advanced compatible order params."""
         params = super()._get_params(
             side=side,
             ordertype=ordertype,
@@ -209,7 +235,6 @@ class Coinbase(Exchange):
         )
 
         if time_in_force == "PO":
-            # Some CCXT exchanges map post-only using postOnly instead of TIF.
             params.pop("timeInForce", None)
             params["postOnly"] = True
 
@@ -218,18 +243,14 @@ class Coinbase(Exchange):
             params["marginMode"] = self.margin_mode.value
             if leverage and leverage > 1.0:
                 params["leverage"] = leverage
-
         return params
 
     def _lev_prep(self, pair: str, leverage: float, side: BuySell, accept_fail: bool = False):
-        """Prepare leverage / margin settings before order placement.
-
-        The parent class already no-ops on spot. For Coinbase futures we attempt to
-        set margin mode and leverage only when relevant methods exist in CCXT.
-        """
+        """Prepare leverage / margin settings before order placement."""
         if self.trading_mode == TradingMode.SPOT:
             return
 
+        pair = self.normalize_pair_for_trading(pair)
         try:
             self.set_margin_mode(pair, self.margin_mode, accept_fail=True)
         except Exception as exc:
@@ -243,14 +264,11 @@ class Coinbase(Exchange):
                 logger.info("Coinbase set_leverage skipped for %s: %s", pair, exc)
 
     def get_max_leverage(self, pair: str, stake_amount: float | None) -> float:
-        """Return a reasonable max leverage from market metadata.
-
-        Coinbase Advanced derivatives metadata is not guaranteed to expose full
-        leverage tiers through CCXT, so we fall back to limits/info where possible.
-        """
+        """Return a reasonable max leverage from market metadata."""
         if self.trading_mode == TradingMode.SPOT:
             return 1.0
 
+        pair = self.normalize_pair_for_trading(pair)
         market = self.markets.get(pair, {})
         limits = market.get("limits", {}) if isinstance(market, dict) else {}
         lev = (limits.get("leverage") or {}).get("max")
@@ -281,19 +299,7 @@ class Coinbase(Exchange):
         wallet_balance: float,
         open_trades: list,
     ) -> float | None:
-        """Approximate liquidation price for isolated linear futures.
-
-        Coinbase Advanced documentation does not currently expose a Freqtrade-ready,
-        unified formula through CCXT metadata. For this test branch we use a
-        conservative isolated-margin approximation similar to linear perpetuals:
-
-            initial_margin = position_value / leverage
-            maintenance_margin = position_value * mm_ratio
-            liq_delta = (initial_margin - maintenance_margin) / amount
-
-        This is suitable for testing / dry-run plumbing, not for risk-critical
-        production calculations.
-        """
+        """Approximate liquidation price for isolated linear futures."""
         if self.trading_mode != TradingMode.FUTURES:
             raise OperationalException(
                 "Freqtrade only supports liquidation price calculation in futures mode"
@@ -303,6 +309,7 @@ class Coinbase(Exchange):
                 "Test Coinbase futures support currently expects isolated margin mode"
             )
 
+        pair = self.normalize_pair_for_trading(pair)
         market = self.markets[pair]
         if market.get("inverse"):
             raise OperationalException("Inverse Coinbase contracts are not supported")
@@ -312,19 +319,15 @@ class Coinbase(Exchange):
         initial_margin = position_value / leverage
         maintenance_margin = position_value * mm_ratio
         liq_delta = (initial_margin - maintenance_margin) / amount
-
         return open_rate + liq_delta if is_short else open_rate - liq_delta
 
     def get_funding_fees(
         self, pair: str, amount: float, is_short: bool, open_date: datetime
     ) -> float:
-        """Funding fee wrapper.
-
-        If CCXT exposes funding history / mark history, reuse Freqtrade's generic
-        helper. Otherwise safely return 0 so the rest of the test stack can run.
-        """
+        """Funding fee wrapper."""
         if self.trading_mode != TradingMode.FUTURES:
             return 0.0
+        pair = self.normalize_pair_for_trading(pair)
         try:
             return self._fetch_and_calculate_funding_fees(pair, amount, is_short, open_date)
         except Exception as exc:

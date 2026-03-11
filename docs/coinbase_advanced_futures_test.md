@@ -39,8 +39,13 @@ Added a futures-mode example config using CCXT-style linear symbols such as:
 - `SOL/USDC:USDC`
 
 ### 3. `user_data/strategies/VWAP_V4_CoinbaseAdvancedFutures.py`
-Added a futures-compatible strategy wrapper which reuses the existing VWAP logic
-but changes runtime defaults to be more conservative for derivatives testing.
+Added a futures-oriented strategy layer which reuses the existing VWAP logic
+but also introduces:
+
+- more conservative derivatives defaults
+- optional short entries / short exits
+- explicit futures BTC reference pair handling
+- reduced capital amplification vs. the spot DCA profile
 
 ## Important limitations
 

@@ -19,7 +19,9 @@ Source copy from:
 
 ### User configs / strategies
 - Added `user_data/config.coinbase_advanced_futures.example.json`
+- Added `user_data/config.coinbase_advanced_futures.live-template.json`
 - Added `user_data/strategies/VWAP_V4_CoinbaseAdvancedFutures.py`
+- Extended futures strategy with optional short entries/exits
 
 ### Dev / runtime
 - Reworked `docker-compose.yml` with:
@@ -30,6 +32,7 @@ Source copy from:
 ### Documentation
 - Added `docs/coinbase_advanced_futures_test.md`
 - Added this changelog file
+- Added reporting / probe scripts for test-branch validation
 
 ### Tests
 - Added `tests/exchange/test_coinbase_advanced_testbranch.py`

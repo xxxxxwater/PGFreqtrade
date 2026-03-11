@@ -8,16 +8,20 @@ Compared with the VWAP wrapper, this version is more explicitly futures-oriented
 - no DCA
 - lower capital amplification
 - cleaner tags for later log / DB inspection
+- normalized Coinbase futures pair handling for informative data sync
 """
 
 import numpy as np
-import pandas as pd
 import talib.abstract as ta
 from pandas import DataFrame
 
 from freqtrade.strategy.interface import IStrategy
 from freqtrade.strategy import merge_informative_pair
-import freqtrade.vendor.qtpylib.indicators as qtpylib
+from coinbase_advanced_strategy_utils import (
+    default_coinbase_btc_reference_pair,
+    normalize_coinbase_futures_pair,
+    normalize_coinbase_futures_pairs,
+)
 
 
 class CoinbaseAdvancedDirectionalFutures(IStrategy):
@@ -54,6 +58,10 @@ class CoinbaseAdvancedDirectionalFutures(IStrategy):
     }
 
     @property
+    def btc_reference_pair(self) -> str:
+        return default_coinbase_btc_reference_pair('USDC')
+
+    @property
     def protections(self):
         return [
             {"method": "LowProfitPairs", "lookback_period": 60, "trade_limit": 1, "stop_duration": 60},
@@ -61,8 +69,8 @@ class CoinbaseAdvancedDirectionalFutures(IStrategy):
         ]
 
     def informative_pairs(self):
-        pairs = self.dp.current_whitelist()
-        btc_pair = "BTC/USDC:USDC"
+        pairs = normalize_coinbase_futures_pairs(self.dp.current_whitelist(), settle='USDC')
+        btc_pair = self.btc_reference_pair
         return list(dict.fromkeys([(p, "1h") for p in pairs] + [(btc_pair, "1h")]))
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -81,14 +89,15 @@ class CoinbaseAdvancedDirectionalFutures(IStrategy):
         dataframe["roc"] = ta.ROC(dataframe, timeperiod=9)
         dataframe["cti_proxy"] = ((dataframe["close"] - dataframe["close"].rolling(20).mean()) / dataframe["close"].rolling(20).std()).replace([np.inf, -np.inf], np.nan)
 
-        pair_1h = self.dp.get_pair_dataframe(metadata["pair"], timeframe="1h")
+        norm_pair = normalize_coinbase_futures_pair(metadata["pair"], settle='USDC')
+        pair_1h = self.dp.get_pair_dataframe(norm_pair, timeframe="1h")
         if not pair_1h.empty:
             pair_1h["ema_200"] = ta.EMA(pair_1h, timeperiod=200)
             pair_1h["rsi"] = ta.RSI(pair_1h, timeperiod=14)
             pair_1h["adx"] = ta.ADX(pair_1h, timeperiod=14)
             dataframe = merge_informative_pair(dataframe, pair_1h[["date", "ema_200", "rsi", "adx"]], self.timeframe, "1h", ffill=True)
 
-        btc_1h = self.dp.get_pair_dataframe("BTC/USDC:USDC", timeframe="1h")
+        btc_1h = self.dp.get_pair_dataframe(self.btc_reference_pair, timeframe="1h")
         if not btc_1h.empty:
             btc_1h["btc_close"] = btc_1h["close"]
             btc_1h["btc_ema_50"] = ta.EMA(btc_1h, timeperiod=50)
@@ -101,7 +110,7 @@ class CoinbaseAdvancedDirectionalFutures(IStrategy):
             dataframe["btc_bull_1h"] = 0
             dataframe["btc_bear_1h"] = 0
 
-        dataframe = dataframe.fillna(method="ffill")
+        dataframe = dataframe.ffill()
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -128,14 +137,8 @@ class CoinbaseAdvancedDirectionalFutures(IStrategy):
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        exit_long = (
-            (dataframe["rsi"] > 58)
-            | (dataframe["close"] > dataframe["bb_mid"])
-        )
-        exit_short = (
-            (dataframe["rsi"] < 42)
-            | (dataframe["close"] < dataframe["bb_mid"])
-        )
+        exit_long = ((dataframe["rsi"] > 58) | (dataframe["close"] > dataframe["bb_mid"]))
+        exit_short = ((dataframe["rsi"] < 42) | (dataframe["close"] < dataframe["bb_mid"]))
 
         dataframe.loc[exit_long, ["exit_long", "exit_tag"]] = (1, "cbadv_fut_exit_long")
         dataframe.loc[exit_short, ["exit_short", "exit_tag"]] = (1, "cbadv_fut_exit_short")

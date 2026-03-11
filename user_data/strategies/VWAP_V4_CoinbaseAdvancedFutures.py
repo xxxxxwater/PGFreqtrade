@@ -2,8 +2,7 @@ from __future__ import annotations
 
 """Coinbase Advanced futures strategy for the test tree.
 
-This is no longer only a thin wrapper.
-It keeps the original VWAP_V4 signal engine for long entries, but adds:
+This keeps the original VWAP_V4 signal engine for long entries, but adds:
 - CCXT futures pair normalization helpers
 - an optional short signal path
 - futures-friendly risk defaults
@@ -14,6 +13,10 @@ It keeps the original VWAP_V4 signal engine for long entries, but adds:
 from pandas import DataFrame
 
 from VWAP_V4 import SampleStrategy as SpotVWAPStrategy
+from coinbase_advanced_strategy_utils import (
+    default_coinbase_btc_reference_pair,
+    normalize_coinbase_futures_pairs,
+)
 
 
 class CoinbaseAdvancedFuturesVWAP(SpotVWAPStrategy):
@@ -26,12 +29,11 @@ class CoinbaseAdvancedFuturesVWAP(SpotVWAPStrategy):
     position_adjustment_enable = False
     use_custom_stoploss = True
 
-    # More conservative than the spot profile.
     minimal_roi = {
         "0": 0.015,
         "60": 0.01,
         "120": 0.005,
-        "180": 0
+        "180": 0,
     }
 
     order_types = {
@@ -57,18 +59,16 @@ class CoinbaseAdvancedFuturesVWAP(SpotVWAPStrategy):
 
     @property
     def btc_reference_pair(self) -> str:
-        return "BTC/USDC:USDC"
+        return default_coinbase_btc_reference_pair('USDC')
 
     def informative_pairs(self):
-        pairs = self.dp.current_whitelist()
+        pairs = normalize_coinbase_futures_pairs(self.dp.current_whitelist(), settle='USDC')
         btc_pair = self.btc_reference_pair
         informative_pairs = [(pair, "1h") for pair in pairs]
         informative_pairs += [(btc_pair, "5m"), (btc_pair, "1h")]
         return list(dict.fromkeys(informative_pairs))
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # Reuse parent implementation after temporarily swapping the BTC reference
-        # convention in-place by mapping symbol when needed.
         return super().populate_indicators(dataframe, metadata)
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:

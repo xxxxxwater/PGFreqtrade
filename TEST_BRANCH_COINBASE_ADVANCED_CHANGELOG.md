@@ -48,6 +48,7 @@ Source copy from:
 - Tightened product schema parsing and close-position compatibility modeling
 - Added main order-path fallback from reduceOnly to close_position for Coinbase futures errors
 - Tightened wallet-side consumption of normalized Coinbase futures positions
+- Added market-sync oriented strategy helpers and sync audit script for futures symbols
 
 ### Tests
 - Added `tests/exchange/test_coinbase_advanced_testbranch.py`

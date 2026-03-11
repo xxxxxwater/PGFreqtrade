@@ -13,6 +13,8 @@ This tree is the **experimental Coinbase Advanced integration branch**.
 4. `user_data/config.coinbase_advanced_futures.example.json`
 5. `user_data/config.coinbase_advanced_futures.live-template.json`
 6. `user_data/strategies/VWAP_V4_CoinbaseAdvancedFutures.py`
+7. `user_data/strategies/CoinbaseAdvancedDirectionalFutures.py`
+8. `user_data/config.coinbase_advanced_futures.directional-template.json`
 
 ## Helpful scripts
 

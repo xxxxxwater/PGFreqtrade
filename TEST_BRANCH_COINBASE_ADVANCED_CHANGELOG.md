@@ -20,8 +20,11 @@ Source copy from:
 ### User configs / strategies
 - Added `user_data/config.coinbase_advanced_futures.example.json`
 - Added `user_data/config.coinbase_advanced_futures.live-template.json`
+- Added `user_data/config.coinbase_advanced_futures.directional-template.json`
 - Added `user_data/strategies/VWAP_V4_CoinbaseAdvancedFutures.py`
+- Added `user_data/strategies/CoinbaseAdvancedDirectionalFutures.py`
 - Extended futures strategy with optional short entries/exits
+- Added a cleaner directional futures strategy for deeper test-branch experiments
 
 ### Dev / runtime
 - Reworked `docker-compose.yml` with:

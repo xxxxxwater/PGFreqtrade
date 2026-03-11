@@ -63,6 +63,16 @@ The biggest open items are:
    account responses.
 4. Adding short-entry logic if the strategy is intended to trade both sides.
 
+## Strategy tracks in this test tree
+
+### Track A: VWAP migration track
+- `user_data/strategies/VWAP_V4_CoinbaseAdvancedFutures.py`
+- Goal: port the existing live logic into a futures-compatible shell.
+
+### Track B: clean directional futures track
+- `user_data/strategies/CoinbaseAdvancedDirectionalFutures.py`
+- Goal: keep a simpler, more explainable derivatives-native strategy for experiments.
+
 ## Suggested next validation steps
 
 1. Install project dependencies inside the dev container.

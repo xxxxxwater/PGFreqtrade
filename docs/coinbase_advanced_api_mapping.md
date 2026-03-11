@@ -121,11 +121,12 @@ Freqtrade futures flow needs consistent position data to:
 - manage exits
 
 ### Test-branch implementation
-`CoinbaseAdvancedPositionView` / `normalize_coinbase_position()` attempt to normalize:
-- contracts from `contracts`, `contractSize`, `amount`, or `info.number_of_contracts`
+`CoinbaseAdvancedPositionView` / `normalize_coinbase_position()` now attempt to normalize:
+- contracts from `contracts`, `info.number_of_contracts`, `info.num_contracts`, `info.net_size`, or `amount`
 - leverage from `leverage` or `info.leverage`
 - margin mode from `marginMode` / `info.margin_mode`
-- side to lower-case string
+- side from `side`, `position_side`, or `net_size` sign
+- liquidation / margin-related fields from flattened or nested info payloads
 
 ---
 
@@ -163,7 +164,11 @@ Freqtrade needs exchange adapters to translate:
 - `marginMode` in futures mode
 - `leverage` if > 1
 
-This is an evolving mapping layer and should be validated against real account responses.
+In addition, the test branch now models a separate `close_position` parameter path,
+reflecting Coinbase Advanced's dedicated close-position flow instead of assuming
+all closes can always be expressed as ordinary reduce-only orders.
+
+This is still an evolving mapping layer and should be validated against real account responses.
 
 ---
 

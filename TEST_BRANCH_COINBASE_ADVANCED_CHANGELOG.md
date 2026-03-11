@@ -44,6 +44,7 @@ Source copy from:
 - Added this changelog file
 - Added reporting / probe scripts for test-branch validation
 - Added branch gap reporting script
+- Tightened product schema parsing and close-position compatibility modeling
 
 ### Tests
 - Added `tests/exchange/test_coinbase_advanced_testbranch.py`

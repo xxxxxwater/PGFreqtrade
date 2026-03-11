@@ -73,7 +73,9 @@ class Coinbase(Exchange):
             return
         market_count = len(self.markets or {})
         spot_count = len([m for m in (self.markets or {}).values() if m.get("spot")])
-        futures_count = len([m for m in (self.markets or {}).values() if is_coinbase_futures_market(m, self._config.get("stake_currency"))])
+        futures_count = len(
+            [m for m in (self.markets or {}).values() if is_coinbase_futures_market(m, self._config.get("stake_currency"))]
+        )
         logger.info(
             "Coinbase Advanced init complete. markets=%s spot=%s futures=%s trading_mode=%s",
             market_count,
@@ -192,8 +194,9 @@ class Coinbase(Exchange):
         market = self.markets[pair]
         if market.get("inverse"):
             raise OperationalException("Inverse Coinbase contracts are not supported")
-        mm_ratio, _ = self.get_maintenance_ratio_and_amt(pair, stake_amount)
+
         position_value = amount * open_rate
+        mm_ratio, _ = self.get_maintenance_ratio_and_amt(pair, position_value)
         initial_margin = position_value / leverage
         maintenance_margin = position_value * mm_ratio
         liq_delta = (initial_margin - maintenance_margin) / amount

@@ -5,7 +5,10 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from freqtrade.exchange.coinbase_advanced_models import CoinbaseAdvancedPositionView
+from freqtrade.exchange.coinbase_advanced_models import (
+    CoinbaseAdvancedPositionView,
+    CoinbaseAdvancedProductDetails,
+)
 
 
 def is_coinbase_futures_market(market: dict[str, Any], stake_currency: str | None = None) -> bool:
@@ -79,9 +82,14 @@ def normalize_coinbase_order_params(
     return p
 
 
-def normalize_coinbase_entry_params(
-    *, margin_mode: str, leverage: float, time_in_force: str, params: dict[str, Any] | None = None
-) -> dict[str, Any]:
+def build_coinbase_close_position_params(*, side: str | None = None) -> dict[str, Any]:
+    params: dict[str, Any] = {"close_position": True}
+    if side:
+        params["side"] = side
+    return params
+
+
+def normalize_coinbase_entry_params(*, margin_mode: str, leverage: float, time_in_force: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     return normalize_coinbase_order_params(
         trading_mode="futures",
         margin_mode=margin_mode,
@@ -92,17 +100,22 @@ def normalize_coinbase_entry_params(
     )
 
 
-def normalize_coinbase_exit_params(
-    *, margin_mode: str, leverage: float, time_in_force: str, params: dict[str, Any] | None = None
-) -> dict[str, Any]:
+def normalize_coinbase_exit_params(*, margin_mode: str, leverage: float, time_in_force: str, params: dict[str, Any] | None = None, allow_close_position: bool = False, side: str | None = None) -> dict[str, Any]:
+    merged = deepcopy(params or {})
+    if allow_close_position:
+        merged.update(build_coinbase_close_position_params(side=side))
     return normalize_coinbase_order_params(
         trading_mode="futures",
         margin_mode=margin_mode,
         time_in_force=time_in_force,
         leverage=leverage,
-        reduce_only=True,
-        params=params or {},
+        reduce_only=not allow_close_position,
+        params=merged,
     )
+
+
+def get_coinbase_product_details(market: dict[str, Any]) -> CoinbaseAdvancedProductDetails:
+    return CoinbaseAdvancedProductDetails.from_market(market)
 
 
 def infer_coinbase_max_leverage(market: dict[str, Any], default: float = 3.0) -> float:
@@ -110,29 +123,16 @@ def infer_coinbase_max_leverage(market: dict[str, Any], default: float = 3.0) ->
     lev = (limits.get("leverage") or {}).get("max")
     if lev:
         return float(lev)
-    info = market.get("info", {}) if isinstance(market, dict) else {}
-    for key in ("max_leverage", "maxLeverage", "intraday_margin_rate"):
-        val = info.get(key)
-        if val not in (None, ""):
-            try:
-                if key == "intraday_margin_rate":
-                    rate = float(val)
-                    return round(1.0 / rate, 8) if rate > 0 else 1.0
-                return float(val)
-            except Exception:
-                continue
+    details = get_coinbase_product_details(market)
+    if details.max_leverage:
+        return details.max_leverage
     return default
 
 
 def infer_coinbase_maintenance_ratio(market: dict[str, Any], default: float = 0.02) -> float:
-    info = market.get("info", {}) if isinstance(market, dict) else {}
-    for key in ("maintenance_margin_rate", "maintenanceMarginRate", "mmr"):
-        val = info.get(key)
-        if val not in (None, ""):
-            try:
-                return float(val)
-            except Exception:
-                continue
+    details = get_coinbase_product_details(market)
+    if details.maintenance_margin_rate is not None:
+        return details.maintenance_margin_rate
     return default
 
 

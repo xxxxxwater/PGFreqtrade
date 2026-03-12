@@ -2135,6 +2135,13 @@ class FreqtradeBot(LoggingMixin):
             if self.handle_similar_open_order(trade, limit, amount, trade.exit_side):
                 return False
 
+        exit_reduce_only = self.trading_mode == TradingMode.FUTURES
+        if exit_reduce_only and self.exchange.name.lower() == "coinbase":
+            logger.info(
+                "Coinbase futures exit path for %s: reduceOnly requested first; exchange adapter may fallback to close_position semantics if venue restrictions require it.",
+                trade.pair,
+            )
+
         try:
             # Execute exit and update trade record.
             # Coinbase Advanced futures may reject a standard reduceOnly exit on some venues.
@@ -2147,7 +2154,7 @@ class FreqtradeBot(LoggingMixin):
                 amount=amount,
                 rate=limit,
                 leverage=trade.leverage,
-                reduceOnly=self.trading_mode == TradingMode.FUTURES,
+                reduceOnly=exit_reduce_only,
                 time_in_force=time_in_force,
                 initial_order=False,
             )

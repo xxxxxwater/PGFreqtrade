@@ -207,12 +207,14 @@ class Wallets:
                 safe_value_fallback(position, "maintenanceMargin", "notional", 0.0),
             )
             contracts = abs(float(position.get("contracts") or 0.0))
+            net_size = abs(float(position.get("net_size") or 0.0))
 
-            if side is None or contracts == 0.0:
+            effective_contracts = contracts or net_size
+            if side is None or effective_contracts == 0.0:
                 # Position is not open or could not be normalized.
                 continue
 
-            size = self._exchange._contracts_to_amount(symbol, contracts)
+            size = self._exchange._contracts_to_amount(symbol, effective_contracts)
             leverage: float | None = position.get("leverage")
             if not leverage:
                 trade = Trade.get_trades_proxy(is_open=True, pair=symbol)
@@ -221,7 +223,7 @@ class Wallets:
                 symbol,
                 position=size,
                 leverage=leverage,
-                collateral=float(collateral or 0.0),
+                collateral=max(float(collateral or 0.0), 0.0),
                 side=side,
             )
         self._positions = _parsed_positions

@@ -52,6 +52,7 @@ If an exchange is supported by CCXT but not listed above, it may still work. Val
 - Hyperliquid
 - OKX
 - Bybit
+- Coinbase Advanced Trade (`coinbase`) — isolated futures mode with explicit portfolio configuration
 
 Refer to `docs/exchanges.md` and `docs/leverage.md` for futures-specific guidance.
 

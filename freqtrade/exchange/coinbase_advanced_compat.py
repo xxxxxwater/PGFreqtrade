@@ -15,6 +15,10 @@ _CLOSE_POSITION_FALLBACK_MARKERS = {
     "reduce_only_not_allowed",
     "reduce only not allowed",
     "close_position_required",
+    "close position required",
+    "close_position only",
+    "close position only",
+    "preview_invalid_base_size_too_large",
 }
 
 
@@ -36,13 +40,66 @@ def build_coinbase_symbol_candidates(pair: str, stake_currency: str | None = Non
     candidates: list[str] = []
     if not pair:
         return candidates
-    candidates.append(pair)
-    if ":" not in pair and "/" in pair:
-        _, quote = pair.split("/", 1)
-        candidates.append(f"{pair}:{quote}")
+    normalized_pair = str(pair).strip().upper()
+    candidates.append(normalized_pair)
+    if ":" not in normalized_pair and "/" in normalized_pair:
+        _, quote = normalized_pair.split("/", 1)
+        candidates.append(f"{normalized_pair}:{quote}")
         if stake_currency:
-            candidates.append(f"{pair}:{stake_currency}")
+            candidates.append(f"{normalized_pair}:{str(stake_currency).strip().upper()}")
     return list(dict.fromkeys(candidates))
+
+
+def _normalize_coinbase_portfolio_candidate(candidate: Any) -> str | None:
+    if candidate is None:
+        return None
+    value = str(candidate).strip()
+    return value or None
+
+
+
+def resolve_coinbase_portfolio(api: Any | None, config: dict[str, Any]) -> str | None:
+    exchange_conf = (config or {}).get("exchange", {}) if isinstance(config, dict) else {}
+    for candidate in (
+        exchange_conf.get("portfolio"),
+        ((exchange_conf.get("ccxt_config") or {}).get("options") or {}).get("portfolio"),
+        ((exchange_conf.get("ccxt_async_config") or {}).get("options") or {}).get("portfolio"),
+        getattr(api, "options", {}).get("portfolio") if api else None,
+    ):
+        normalized = _normalize_coinbase_portfolio_candidate(candidate)
+        if normalized:
+            return normalized
+
+    if not api or not hasattr(api, "fetch_portfolios"):
+        return None
+
+    try:
+        portfolios = api.fetch_portfolios()
+    except Exception:
+        return None
+
+    if not isinstance(portfolios, list):
+        return None
+
+    preferred_statuses = {"default", "active", "primary", "ready"}
+    fallback_portfolio: str | None = None
+
+    for item in portfolios:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("info") if isinstance(item.get("info"), dict) else {}
+        for source in (item, info):
+            for key in ("id", "portfolio_uuid", "uuid"):
+                value = _normalize_coinbase_portfolio_candidate(source.get(key))
+                if not value:
+                    continue
+                status = str(source.get("status") or item.get("status") or "").strip().lower()
+                if not fallback_portfolio:
+                    fallback_portfolio = value
+                if status in preferred_statuses:
+                    return value
+    return fallback_portfolio
+
 
 
 def normalize_coinbase_position(position: dict[str, Any], default_margin_mode: str) -> dict[str, Any]:
@@ -89,10 +146,21 @@ def normalize_coinbase_order_params(
     return p
 
 
+def normalize_coinbase_order_side(side: str | None) -> str | None:
+    if side is None:
+        return None
+    normalized = str(side).strip().lower()
+    if normalized in {"buy", "sell"}:
+        return normalized
+    return None
+
+
+
 def build_coinbase_close_position_params(*, side: str | None = None) -> dict[str, Any]:
     params: dict[str, Any] = {"close_position": True}
-    if side:
-        params["side"] = side
+    normalized_side = normalize_coinbase_order_side(side)
+    if normalized_side:
+        params["side"] = normalized_side
     return params
 
 

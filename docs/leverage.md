@@ -89,6 +89,16 @@ One account is used to share collateral between markets (trading pairs). Margin 
 
 Please read the [exchange specific notes](exchanges.md) for exchanges that support this mode and how they differ.
 
+### Coinbase Advanced futures notes
+
+When using Coinbase Advanced futures with PGFreqtrade:
+
+- Only **isolated** futures mode is supported.
+- Configure a dedicated Coinbase portfolio explicitly before live trading.
+- Use the ccxt futures symbol format `base/quote:settle` (for example `BTC/USDC:USDC`).
+- Reduce-only exits may be converted to `close_position` semantics when required by the venue.
+- Liquidation math and inferred leverage limits are guardrails, not a substitute for confirming exchange-side requirements.
+
 !!! Warning "Increased risk of liquidation"
     Cross margin mode increases the risk of full account liquidation, as all trades share the same collateral.
     A loss on one trade can affect the liquidation price of other trades.  

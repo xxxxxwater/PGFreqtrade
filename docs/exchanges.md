@@ -171,6 +171,38 @@ Use the exchange name `coinbase` in your configuration to connect via the Coinba
 }
 ```
 
+### Coinbase Advanced Futures
+
+Coinbase Advanced futures trading is supported in **isolated futures mode**.
+For production use, configure an explicit portfolio UUID in one of these locations:
+
+- `exchange.portfolio`
+- `exchange.ccxt_config.options.portfolio`
+- `exchange.ccxt_async_config.options.portfolio`
+
+If no portfolio is configured, the bot will fail fast on startup instead of attempting live futures execution with an incomplete account context.
+
+Example:
+
+```json
+"trading_mode": "futures",
+"margin_mode": "isolated",
+"exchange": {
+    "name": "coinbase",
+    "key": "your_exchange_key",
+    "secret": "your_exchange_secret",
+    "portfolio": "your_portfolio_uuid"
+}
+```
+
+#### Coinbase futures operational notes
+
+- Pair naming follows ccxt futures format: `BASE/QUOTE:SETTLE`.
+- The bot normalizes plain pairs such as `BTC/USDC` to `BTC/USDC:USDC` when an exact futures market is available.
+- Some Coinbase futures venues reject standard `reduceOnly` exits. In that case, the exchange adapter retries once with explicit `close_position` semantics.
+- Dry-run liquidation and leverage calculations are best-effort estimates and should be validated with exchange-side limits before increasing risk.
+- For live trading, start with small size and confirm entry, position sync, and exit behavior on your configured portfolio before scaling up.
+
 ## Kraken
 
 Kraken supports [time_in_force](configuration.md#understand-order_time_in_force) with settings "GTC" (good till cancelled), "IOC" (immediate-or-cancel) and "PO" (Post only) settings.

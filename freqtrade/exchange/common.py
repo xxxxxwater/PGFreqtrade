@@ -58,6 +58,7 @@ SUPPORTED_EXCHANGES = [
     "bingx",
     "bitmart",
     "bitget",
+    "coinbase",
     "bybit",
     "gate",
     "htx",

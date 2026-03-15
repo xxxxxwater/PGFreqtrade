@@ -1,0 +1,42 @@
+# PGFreqtrade Test Branch Notes
+
+Root:
+- `/data/test_coinbaseadvanced/PGFreqtrade`
+
+This tree is the **experimental Coinbase Advanced integration branch**.
+
+## What to read first
+
+1. `TEST_BRANCH_COINBASE_ADVANCED_CHANGELOG.md`
+2. `docs/coinbase_advanced_futures_test.md`
+3. `freqtrade/exchange/coinbase.py`
+4. `freqtrade/exchange/coinbase_advanced_compat.py`
+5. `user_data/config.coinbase_advanced_futures.example.json`
+5. `user_data/config.coinbase_advanced_futures.live-template.json`
+6. `user_data/strategies/VWAP_V4_CoinbaseAdvancedFutures.py`
+7. `user_data/strategies/CoinbaseAdvancedDirectionalFutures.py`
+8. `user_data/config.coinbase_advanced_futures.directional-template.json`
+
+## Helpful scripts
+
+- `scripts/coinbase_advanced_probe.py`
+- `scripts/coinbase_advanced_market_report.py`
+- `scripts/coinbase_advanced_config_audit.py`
+- `scripts/coinbase_advanced_branch_report.py`
+- `scripts/coinbase_advanced_gap_check.py`
+- `scripts/coinbase_advanced_env_check.py`
+- `scripts/coinbase_advanced_market_sync_check.py`
+
+## Compose variants
+
+- root `docker-compose.yml` for spot + futures dev services
+- `docker/docker-compose-coinbase-advanced-futures-test.yml` for dedicated futures strategy tracks
+
+## Important boundary
+
+Do **not** treat this tree as production-ready.
+This tree exists for:
+- interface extension
+- Coinbase Advanced futures adaptation
+- strategy migration experiments
+- test-only container/devcontainer work

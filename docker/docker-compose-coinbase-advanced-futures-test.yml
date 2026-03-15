@@ -1,0 +1,33 @@
+---
+services:
+  cbadv_futures_vwap:
+    image: freqtradeorg/freqtrade:coinbase-advanced-trade
+    build:
+      context: ..
+      dockerfile: ./Dockerfile
+    container_name: cbadv-futures-vwap-test
+    working_dir: /freqtrade
+    volumes:
+      - "../:/freqtrade"
+    command: >
+      trade
+      --logfile /freqtrade/user_data/logs/cbadv-futures-vwap.log
+      --db-url sqlite:////freqtrade/user_data/tradesv3-cbadv-vwap.sqlite
+      --config /freqtrade/user_data/config.coinbase_advanced_futures.example.json
+      --strategy CoinbaseAdvancedFuturesVWAP
+
+  cbadv_futures_directional:
+    image: freqtradeorg/freqtrade:coinbase-advanced-trade
+    build:
+      context: ..
+      dockerfile: ./Dockerfile
+    container_name: cbadv-futures-directional-test
+    working_dir: /freqtrade
+    volumes:
+      - "../:/freqtrade"
+    command: >
+      trade
+      --logfile /freqtrade/user_data/logs/cbadv-futures-directional.log
+      --db-url sqlite:////freqtrade/user_data/tradesv3-cbadv-directional.sqlite
+      --config /freqtrade/user_data/config.coinbase_advanced_futures.directional-template.json
+      --strategy CoinbaseAdvancedDirectionalFutures

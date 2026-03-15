@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.freqtrade.io/schema.json",
+  "bot_name": "PGTrading-Coinbase-Advanced-Futures-Directional",
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+  "stake_currency": "USDC",
+  "stake_amount": 40,
+  "tradable_balance_ratio": 0.9,
+  "max_open_trades": 2,
+  "fiat_display_currency": "USD",
+  "dry_run": true,
+  "dry_run_wallet": 10000,
+  "strategy": "CoinbaseAdvancedDirectionalFutures",
+  "strategy_path": "user_data/strategies",
+  "timeframe": "5m",
+  "exchange": {
+    "name": "coinbase",
+    "key": "organizations/REPLACE/apiKeys/REPLACE",
+    "secret": "-----BEGIN EC PRIVATE KEY-----\\nREPLACE\\n-----END EC PRIVATE KEY-----\\n",
+    "ccxt_config": {
+      "enableRateLimit": true,
+      "options": {
+        "defaultType": "swap",
+        "defaultSubType": "linear",
+        "adjustForTimeDifference": true
+      }
+    },
+    "ccxt_async_config": {
+      "enableRateLimit": true,
+      "rateLimit": 3000,
+      "options": {
+        "defaultType": "swap",
+        "defaultSubType": "linear"
+      }
+    },
+    "pair_whitelist": [
+      "BTC/USDC:USDC",
+      "ETH/USDC:USDC",
+      "SOL/USDC:USDC"
+    ],
+    "pair_blacklist": []
+  },
+  "pairlists": [{"method": "StaticPairList"}],
+  "order_types": {
+    "entry": "market",
+    "exit": "market",
+    "stoploss": "market",
+    "stoploss_on_exchange": false
+  },
+  "order_time_in_force": {
+    "entry": "GTC",
+    "exit": "GTC"
+  }
+}

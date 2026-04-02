@@ -1,0 +1,94 @@
+{
+  "$schema": "https://schema.freqtrade.io/schema.json",
+  "bot_name": "PGTrading-BingX-Futures-Live",
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+  "stake_currency": "USDT",
+  "stake_amount": 50,
+  "max_open_trades": 2,
+  "tradable_balance_ratio": 0.95,
+  "fiat_display_currency": "USD",
+  "dry_run": false,
+  "dry_run_wallet": 5000,
+  "cancel_open_orders_on_exit": false,
+  "liquidation_buffer": 0.05,
+  "strategy": "SampleStrategy",
+  "strategy_path": "user_data/strategies",
+  "timeframe": "5m",
+  "entry_pricing": {
+    "price_side": "other",
+    "use_order_book": false,
+    "order_book_top": 1
+  },
+  "exit_pricing": {
+    "price_side": "other",
+    "use_order_book": false,
+    "order_book_top": 1
+  },
+  "order_types": {
+    "entry": "market",
+    "exit": "market",
+    "stoploss": "market",
+    "stoploss_on_exchange": true,
+    "stoploss_price_type": "mark"
+  },
+  "order_time_in_force": {
+    "entry": "GTC",
+    "exit": "GTC"
+  },
+  "exchange": {
+    "name": "bingx",
+    "key": "your_bingx_api_key",
+    "secret": "your_bingx_api_secret",
+    "password": "",
+    "sandbox": false,
+    "ccxt_config": {
+      "enableRateLimit": true,
+      "options": {
+        "defaultType": "swap",
+        "defaultSubType": "linear",
+        "adjustForTimeDifference": true
+      }
+    },
+    "ccxt_async_config": {
+      "enableRateLimit": true,
+      "options": {
+        "defaultType": "swap",
+        "defaultSubType": "linear",
+        "adjustForTimeDifference": true
+      }
+    },
+    "pair_whitelist": [
+      "BTC/USDT:USDT",
+      "ETH/USDT:USDT"
+    ],
+    "pair_blacklist": [],
+    "markets_refresh_interval": 60,
+    "retries": 3
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "telegram": {
+    "enabled": false,
+    "token": "your_telegram_token",
+    "chat_id": "your_telegram_chat_id"
+  },
+  "api_server": {
+    "enabled": true,
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8080,
+    "verbosity": "error",
+    "enable_openapi": true,
+    "jwt_secret_key": "replace_with_a_random_secret",
+    "username": "freqtrader",
+    "password": "replace_with_a_strong_password"
+  },
+  "initial_state": "running",
+  "force_entry_enable": false,
+  "internals": {
+    "process_throttle_secs": 5
+  }
+}

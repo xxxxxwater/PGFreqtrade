@@ -159,6 +159,17 @@ BingX supports [time_in_force](configuration.md#understand-order_time_in_force) 
 !!! Tip "Stoploss on Exchange"
     Bingx supports `stoploss_on_exchange` and can use both stop-limit and stop-market orders. It provides great advantages, so we recommend to benefit from it by enabling stoploss on exchange.
 
+BingX futures trading is supported in both **isolated** and **cross** margin mode.
+Freqtrade operates BingX futures in **one-way mode**, matching the same net-position trading flow used on Binance futures.
+On startup, Freqtrade will switch the account to one-way mode automatically when running in futures mode.
+
+For futures stoploss orders, `stoploss_price_type` supports:
+
+- `"last"` mapped to BingX `CONTRACT_PRICE`
+- `"mark"` mapped to BingX `MARK_PRICE`
+
+`"index"` is not supported by BingX futures.
+
 ## Coinbase Advanced Trade
 
 Use the exchange name `coinbase` in your configuration to connect via the Coinbase Advanced Trade API.

@@ -4,6 +4,7 @@
 | [Binance](exchanges.md#binance) | spot | | limit |
 | [Binance](exchanges.md#binance) | futures | isolated, cross | market, limit |
 | [Bingx](exchanges.md#bingx) | spot | | market, limit |
+| [Bingx](exchanges.md#bingx) | futures | isolated, cross | market, limit |
 | [Bitmart](exchanges.md#bitmart) | spot | | ❌ (not supported) |
 | [Bitget](exchanges.md#bitget) | spot | | market, limit |
 | [Bitget](exchanges.md#bitget) | futures | isolated | market, limit |

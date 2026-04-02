@@ -55,6 +55,7 @@ Please read the [exchange specific notes](exchanges.md) to learn about eventual,
 ### Supported Futures Exchanges
 
 - [X] [Binance](https://www.binance.com/)
+- [X] [BingX](https://bingx.com/)
 - [X] [Bitget](https://www.bitget.com/)
 - [X] [Bybit](https://bybit.com/)
 - [X] [Gate.io](https://www.gate.io/ref/6266643)

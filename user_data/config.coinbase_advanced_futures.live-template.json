@@ -21,7 +21,8 @@
       "options": {
         "defaultType": "swap",
         "defaultSubType": "linear",
-        "adjustForTimeDifference": true
+        "adjustForTimeDifference": true,
+        "portfolio": "0195cbef-1284-7a43-8c98-9a0a1dcec6ff"
       }
     },
     "ccxt_async_config": {
@@ -29,7 +30,8 @@
       "rateLimit": 3000,
       "options": {
         "defaultType": "swap",
-        "defaultSubType": "linear"
+        "defaultSubType": "linear",
+        "portfolio": "0195cbef-1284-7a43-8c98-9a0a1dcec6ff"
       }
     },
     "pair_whitelist": [

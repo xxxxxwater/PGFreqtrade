@@ -58,6 +58,7 @@
     },
     "ccxt_async_config": {
       "enableRateLimit": true,
+      "rateLimit": 3000,
       "options": {
         "defaultType": "swap",
         "defaultSubType": "linear",
@@ -96,6 +97,6 @@
   "initial_state": "running",
   "force_entry_enable": false,
   "internals": {
-    "process_throttle_secs": 5
+    "process_throttle_secs": 15
   }
 }

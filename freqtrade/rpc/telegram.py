@@ -171,7 +171,8 @@ class Telegram(RPCHandler):
         self._keyboard: list[list[str | KeyboardButton]] = [
             ["/daily", "/profit", "/balance"],
             ["/status", "/status table", "/performance"],
-            ["/count", "/start", "/stop", "/help"],
+            ["/count", "/start", "/stop", "/reload_config"],
+            ["/logs", "/help"],
         ]
         # do not allow commands with mandatory arguments and critical cmds
         # TODO: DRY! - its not good to list all valid cmds here. But otherwise
@@ -365,6 +366,25 @@ class Telegram(RPCHandler):
                 timeout=20,
                 drop_pending_updates=True,
             )
+            try:
+                result = self._rpc._rpc_balance(
+                    self._config["stake_currency"], self._config.get("fiat_display_currency", "")
+                )
+                total_stake = fmt_coin(result["total_bot"], result["stake"], False)
+                starting_cap = fmt_coin(result["starting_capital"], self._config["stake_currency"])
+                stake_improve = (
+                    f" ({result['starting_capital_ratio']:.2%})" if result["trade_count"] > 0 else ""
+                )
+                message = (
+                    f"*Startup Balance:* Starting capital: {starting_cap}; "
+                    f"Bot managed assets: {total_stake} {result['stake']}{stake_improve}"
+                )
+                if result.get("symbol"):
+                    value = fmt_coin(result["value_bot"], result["symbol"], False)
+                    message += f"; Estimated account value: {value} {result['symbol']}"
+                await self._send_msg(message)
+            except Exception as ex:
+                logger.warning("Unable to send startup balance: %s", ex)
             while True:
                 await asyncio.sleep(10)
                 if not self._app.updater.running:

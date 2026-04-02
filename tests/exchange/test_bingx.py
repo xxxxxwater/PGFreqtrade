@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock
 
 from freqtrade.enums import MarginMode, TradingMode
@@ -86,3 +88,93 @@ def test_create_stoploss_order_bingx_futures(default_conf, mocker):
             "workingType": "MARK_PRICE",
         },
     )
+
+
+def test_bingx_get_funding_fees(default_conf, mocker):
+    now = datetime.now(UTC)
+    exchange = get_patched_exchange(mocker, default_conf, exchange="bingx")
+    exchange._fetch_and_calculate_funding_fees = MagicMock()
+
+    exchange.get_funding_fees("BTC/USDT:USDT", 1, False, now)
+    assert exchange._fetch_and_calculate_funding_fees.call_count == 0
+
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+
+    exchange = get_patched_exchange(mocker, default_conf, exchange="bingx")
+    exchange._fetch_and_calculate_funding_fees = MagicMock(return_value=1.23)
+
+    assert exchange.get_funding_fees("BTC/USDT:USDT", 1, False, now) == 1.23
+    assert exchange._fetch_and_calculate_funding_fees.call_count == 1
+
+
+def test_fetch_stoploss_order_bingx(default_conf, mocker):
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    exchange = get_patched_exchange(mocker, default_conf, exchange="bingx")
+    fetch_order_mock = mocker.patch.object(exchange, "fetch_order", return_value={"id": "1234"})
+
+    order = exchange.fetch_stoploss_order("1234", "ETH/USDT:USDT")
+
+    assert order == {"id": "1234"}
+    fetch_order_mock.assert_called_once_with("1234", "ETH/USDT:USDT", {"stop": True})
+
+
+def test_cancel_stoploss_order_bingx(default_conf, mocker):
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+    exchange = get_patched_exchange(mocker, default_conf, exchange="bingx")
+    cancel_order_mock = mocker.patch.object(
+        exchange, "cancel_order", return_value={"id": "1234", "status": "canceled"}
+    )
+
+    order = exchange.cancel_stoploss_order("1234", "ETH/USDT:USDT")
+
+    assert order == {"id": "1234", "status": "canceled"}
+    cancel_order_mock.assert_called_once_with("1234", "ETH/USDT:USDT", {"stop": True})
+
+
+def test_dry_run_liquidation_price_cross_bingx(default_conf, mocker):
+    default_conf["dry_run"] = True
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.CROSS
+
+    api_mock = MagicMock()
+    exchange = get_patched_exchange(mocker, default_conf, exchange="bingx", api_mock=api_mock)
+    mocker.patch(f"{EXMS}.get_maintenance_ratio_and_amt", MagicMock(return_value=(0.005, 0.0)))
+
+    price = exchange.dry_run_liquidation_price(
+        "BTC/USDT:USDT",
+        10_000,
+        False,
+        2,
+        2_000,
+        10,
+        5_000,
+        [],
+    )
+
+    assert price == 7550.0
+
+
+def test_dry_run_liquidation_price_isolated_bingx(default_conf, mocker):
+    default_conf["dry_run"] = True
+    default_conf["trading_mode"] = TradingMode.FUTURES
+    default_conf["margin_mode"] = MarginMode.ISOLATED
+
+    api_mock = MagicMock()
+    exchange = get_patched_exchange(mocker, default_conf, exchange="bingx", api_mock=api_mock)
+    mocker.patch(f"{EXMS}.get_maintenance_ratio_and_amt", MagicMock(return_value=(0.004, 0.0)))
+
+    price = exchange.dry_run_liquidation_price(
+        "ETH/USDT:USDT",
+        1_000,
+        False,
+        10,
+        1_000,
+        10,
+        1_100,
+        [SimpleNamespace(pair="BTC/USDT:USDT", open_rate=20_000, amount=0.1, stake_amount=200)],
+    )
+
+    assert price == 904.0

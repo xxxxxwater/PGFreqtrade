@@ -13,6 +13,16 @@
   "strategy": "CoinbaseAdvancedDirectionalFutures",
   "strategy_path": "user_data/strategies",
   "timeframe": "5m",
+  "entry_pricing": {
+    "price_side": "other",
+    "use_order_book": false,
+    "order_book_top": 1
+  },
+  "exit_pricing": {
+    "price_side": "other",
+    "use_order_book": false,
+    "order_book_top": 1
+  },
   "exchange": {
     "name": "coinbase",
     "key": "organizations/REPLACE/apiKeys/REPLACE",
@@ -22,7 +32,8 @@
       "options": {
         "defaultType": "swap",
         "defaultSubType": "linear",
-        "adjustForTimeDifference": true
+        "adjustForTimeDifference": true,
+        "portfolio": "0195cbef-1284-7a43-8c98-9a0a1dcec6ff"
       }
     },
     "ccxt_async_config": {
@@ -30,7 +41,8 @@
       "rateLimit": 3000,
       "options": {
         "defaultType": "swap",
-        "defaultSubType": "linear"
+        "defaultSubType": "linear",
+        "portfolio": "0195cbef-1284-7a43-8c98-9a0a1dcec6ff"
       }
     },
     "pair_whitelist": [

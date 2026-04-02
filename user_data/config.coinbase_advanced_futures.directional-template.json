@@ -8,21 +8,32 @@
   "tradable_balance_ratio": 0.9,
   "max_open_trades": 2,
   "fiat_display_currency": "USD",
-  "dry_run": true,
+  "dry_run": false,
   "dry_run_wallet": 10000,
   "strategy": "CoinbaseAdvancedDirectionalFutures",
   "strategy_path": "user_data/strategies",
   "timeframe": "5m",
+  "entry_pricing": {
+    "price_side": "other",
+    "use_order_book": false,
+    "order_book_top": 1
+  },
+  "exit_pricing": {
+    "price_side": "other",
+    "use_order_book": false,
+    "order_book_top": 1
+  },
   "exchange": {
     "name": "coinbase",
-    "key": "organizations/REPLACE/apiKeys/REPLACE",
-    "secret": "-----BEGIN EC PRIVATE KEY-----\\nREPLACE\\n-----END EC PRIVATE KEY-----\\n",
+    "key": "organizations/eda52ecf-a992-4bf9-94ab-9c3fc1740db6/apiKeys/3b5c8719-d26a-4742-9da5-8f4bf519d221",
+    "secret": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIG1jfkZK7zps7oFkYyfS4hLhtClxkEMIibI0ESBJxnNmoAoGCCqGSM49\nAwEHoUQDQgAEgFuK43crplEf3Ac/n/+pyN7QGc2SYK9iPPG8TTbWtQw9wE+0fp1h\nvEBlZrezGG/QV4icEE8iiR5pYC6dt2zSsQ==\n-----END EC PRIVATE KEY-----\n",
     "ccxt_config": {
       "enableRateLimit": true,
       "options": {
         "defaultType": "swap",
         "defaultSubType": "linear",
-        "adjustForTimeDifference": true
+        "adjustForTimeDifference": true,
+        "portfolio": "0195cbef-1284-7a43-8c98-9a0a1dcec6ff"
       }
     },
     "ccxt_async_config": {
@@ -30,7 +41,8 @@
       "rateLimit": 3000,
       "options": {
         "defaultType": "swap",
-        "defaultSubType": "linear"
+        "defaultSubType": "linear",
+        "portfolio": "0195cbef-1284-7a43-8c98-9a0a1dcec6ff"
       }
     },
     "pair_whitelist": [
@@ -50,5 +62,16 @@
   "order_time_in_force": {
     "entry": "GTC",
     "exit": "GTC"
+  },
+  "api_server": {
+    "enabled": true,
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8012,
+    "verbosity": "error",
+    "enable_openapi": true,
+    "jwt_secret_key": "2c48131c2f29b8ce4f40bce8d0ec62d04146e3e71e3e29c5a412858f448294e5",
+    "ws_token": "N_8E8TeMHHJyXB3w7aNqy1i5sBv5DQmlbg",
+    "username": "PGTrading",
+    "password": "xs2502741143"
   }
 }

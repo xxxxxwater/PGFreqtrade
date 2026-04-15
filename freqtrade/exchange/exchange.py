@@ -299,7 +299,11 @@ class Exchange:
             self.reload_markets(True, load_leverage_tiers=False)
             self.validate_config(self._config)
 
-        if self.trading_mode != TradingMode.SPOT and load_leverage_tiers:
+        if (
+            self.trading_mode != TradingMode.SPOT
+            and load_leverage_tiers
+            and self._ft_has.get("uses_leverage_tiers", True)
+        ):
             self.fill_leverage_tiers()
         self.ft_additional_exchange_init()
 
@@ -721,7 +725,11 @@ class Exchange:
             if is_initial and self._ft_has["needs_trading_fees"]:
                 self._trading_fees = self.fetch_trading_fees()
 
-            if load_leverage_tiers and self.trading_mode == TradingMode.FUTURES:
+            if (
+                load_leverage_tiers
+                and self.trading_mode == TradingMode.FUTURES
+                and self._ft_has.get("uses_leverage_tiers", True)
+            ):
                 self.fill_leverage_tiers()
         except (ccxt.BaseError, TemporaryError):
             logger.exception("Could not load markets.")

@@ -174,7 +174,7 @@ binance             Official     spot, isolated futures
 bitmart             Official     spot
 bybit                            spot, isolated futures
 gate                Official     spot, isolated futures
-htx                 Official     spot
+htx                 Official     spot, isolated futures
 huobi                            spot
 kraken              Official     spot
 okx                 Official     spot, isolated futures
@@ -198,7 +198,7 @@ bitflyer            False                 spot                    missing: fetch
 bitmart             True     Official     spot
 bybit               True                  spot, isolated futures
 gate                True     Official     spot, isolated futures
-htx                 True     Official     spot
+htx                 True     Official     spot, isolated futures
 kraken              True     Official     spot
 okx                 True     Official     spot, isolated futures
 ```

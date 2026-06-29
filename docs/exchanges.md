@@ -245,7 +245,7 @@ Kucoin accounts may use `KCS` for fees, and if a trade happens to be on `KCS`, f
 ## HTX
 
 !!! Tip "Stoploss on Exchange"
-    HTX supports `stoploss_on_exchange` and uses `stop-limit` orders. It provides great advantages, so we recommend to benefit from it by enabling stoploss on exchange.
+    HTX spot supports `stoploss_on_exchange` and uses `stop-limit` orders. HTX futures mode supports `stoploss_on_exchange` with both market and limit stoploss orders.
 
 ## OKX
 

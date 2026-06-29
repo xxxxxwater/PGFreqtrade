@@ -5132,6 +5132,7 @@ def test_set_margin_mode(mocker, default_conf, margin_mode):
         ("okx", TradingMode.FUTURES, MarginMode.CROSS, False, True),
         ("binance", TradingMode.FUTURES, MarginMode.ISOLATED, False, False),
         ("gate", TradingMode.FUTURES, MarginMode.ISOLATED, False, False),
+        ("htx", TradingMode.FUTURES, MarginMode.ISOLATED, False, False),
         ("okx", TradingMode.FUTURES, MarginMode.ISOLATED, False, False),
         # * Remove once implemented
         ("binance", TradingMode.MARGIN, MarginMode.CROSS, False, True),
@@ -5143,6 +5144,7 @@ def test_set_margin_mode(mocker, default_conf, margin_mode):
         ("kraken", TradingMode.FUTURES, MarginMode.CROSS, False, True),
         ("gate", TradingMode.MARGIN, MarginMode.CROSS, False, True),
         ("gate", TradingMode.FUTURES, MarginMode.CROSS, False, True),
+        ("htx", TradingMode.FUTURES, MarginMode.CROSS, False, True),
         # * Uncomment once implemented
         # ("binance", TradingMode.MARGIN, MarginMode.CROSS, False, False),
         # ("binance", TradingMode.FUTURES, MarginMode.CROSS, False, False),
@@ -5184,6 +5186,17 @@ def test_validate_trading_mode_and_margin_mode(
         ("bybit", "spot", {"options": {"defaultType": "spot"}}),
         ("bybit", "futures", {"options": {"defaultType": "swap", "defaultSettle": "USDT"}}),
         ("gate", "futures", {"options": {"defaultType": "swap"}}),
+        (
+            "htx",
+            "futures",
+            {
+                "options": {
+                    "defaultType": "swap",
+                    "defaultSubType": "linear",
+                    "defaultSettle": "USDT",
+                }
+            },
+        ),
         ("hitbtc", "futures", {"options": {"defaultType": "swap"}}),
         ("kraken", "futures", {"options": {"defaultType": "swap"}}),
         ("kucoin", "futures", {"options": {"defaultType": "swap"}}),

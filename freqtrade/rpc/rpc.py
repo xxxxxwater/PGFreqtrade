@@ -1112,6 +1112,199 @@ class RPC:
                 raise RPCException("Failed to exit trade.")
             return {"result": f"Created exit order for trade {trade_id}."}
 
+    def _select_trades_by_settlement(
+        self, trades: Sequence[Trade], target: str
+    ) -> tuple[list[Trade], list[str]]:
+        selected: list[Trade] = []
+        skipped: list[str] = []
+
+        for trade in trades:
+            market = self._freqtrade.exchange.markets.get(trade.pair, {})
+            settle = (market.get("settle") or market.get("quote") or "").upper()
+            if target == "ALL":
+                selected.append(trade)
+            elif settle == target:
+                selected.append(trade)
+            else:
+                skipped.append(f"{trade.id}:{trade.pair}:{settle or 'unknown'}")
+
+        return selected, skipped
+
+    def _rpc_pm_close(
+        self,
+        target_currency: str | None = None,
+        ordertype: str | None = "market",
+    ) -> dict[str, str]:
+        """
+        Close all open futures trades matching the requested contract settlement currency.
+
+        Binance PM may use BTC/ETH as collateral, but this adapter intentionally trades only
+        USDT/USDC linear perpetual contracts. Close filtering is therefore based on the
+        contract settlement currency: all, USDT or USDC.
+        """
+        if self._freqtrade.state == State.STOPPED:
+            raise RPCException("trader is not running")
+        if self._freqtrade.trading_mode != TradingMode.FUTURES:
+            raise RPCException("pm_close is only available in futures mode.")
+
+        target = (target_currency or "all").upper()
+        allowed_targets = {"ALL", "USDT", "USDC"}
+        if target not in allowed_targets:
+            raise RPCException("invalid settlement currency. Use one of: all, USDT, USDC.")
+
+        open_trades = Trade.get_open_trades()
+        if not open_trades:
+            raise RPCException("no active trade")
+
+        selected, skipped = self._select_trades_by_settlement(open_trades, target)
+        if not selected:
+            raise RPCException(
+                f"no open trades settle in {target}. "
+                f"Open settlements: {', '.join(skipped) if skipped else 'none'}"
+            )
+
+        closed_ids: list[str] = []
+        failed_ids: list[str] = []
+        with self._freqtrade._exit_lock:
+            for trade in selected:
+                if self.__exec_force_exit(trade, ordertype):
+                    closed_ids.append(str(trade.id))
+                else:
+                    failed_ids.append(str(trade.id))
+            Trade.commit()
+            self._freqtrade.wallets.update()
+
+        result = (
+            f"Created {ordertype or 'configured'} exit orders for {len(closed_ids)} "
+            f"trade(s), settlement={target}."
+        )
+        if closed_ids:
+            result += f" Closed ids: {', '.join(closed_ids)}."
+        if skipped and target != "ALL":
+            result += f" Skipped other settlements: {', '.join(skipped)}."
+        if failed_ids:
+            result += f" Failed ids: {', '.join(failed_ids)}."
+        return {"result": result}
+
+    def _rpc_pm_status(self) -> dict[str, Any]:
+        if self._freqtrade.trading_mode != TradingMode.FUTURES:
+            raise RPCException("pm_status is only available in futures mode.")
+        if not hasattr(self._freqtrade.exchange, "get_pm_risk_summary"):
+            raise RPCException("pm_status is only available for Binance PM mode.")
+
+        risk = self._freqtrade.exchange.get_pm_risk_summary()
+        if not risk.get("enabled"):
+            raise RPCException("Binance PM mode is not enabled.")
+
+        positions = self._freqtrade.exchange.fetch_positions()
+        balances = self._freqtrade.exchange.get_balances()
+        stream = (
+            self._freqtrade.exchange.get_pm_user_stream_stats()
+            if hasattr(self._freqtrade.exchange, "get_pm_user_stream_stats")
+            else {}
+        )
+        non_zero_balances = {
+            currency: balance
+            for currency, balance in balances.items()
+            if balance.get("total", 0) or balance.get("free", 0) or balance.get("used", 0)
+        }
+
+        return {
+            "account_status": risk.get("account_status") or "unknown",
+            "uni_mmr": risk.get("uni_mmr"),
+            "account_equity": risk.get("account_equity"),
+            "initial_margin": risk.get("initial_margin"),
+            "maintenance_margin": risk.get("maintenance_margin"),
+            "user_stream": stream,
+            "balances": non_zero_balances,
+            "positions": [
+                position
+                for position in positions
+                if position.get("contracts", 0) or position.get("collateral", 0)
+            ],
+        }
+
+    def _rpc_pm_risk(self) -> dict[str, Any]:
+        if self._freqtrade.trading_mode != TradingMode.FUTURES:
+            raise RPCException("pm_risk is only available in futures mode.")
+        if not hasattr(self._freqtrade.exchange, "get_pm_risk_summary"):
+            raise RPCException("pm_risk is only available for Binance PM mode.")
+
+        risk = self._freqtrade.exchange.get_pm_risk_summary()
+        if not risk.get("enabled"):
+            raise RPCException("Binance PM mode is not enabled.")
+
+        risk_cfg = self._config.get("exchange", {}).get("portfolio_margin_risk", {})
+        uni_mmr = risk.get("uni_mmr")
+        account_status = risk.get("account_status")
+        min_uni_mmr = risk_cfg.get("min_uni_mmr")
+        warning_uni_mmr = risk_cfg.get("warning_uni_mmr")
+
+        alerts: list[str] = []
+        if account_status and account_status != "NORMAL":
+            alerts.append(f"AccountStatus={account_status}")
+        if min_uni_mmr is not None and uni_mmr is not None and uni_mmr < float(min_uni_mmr):
+            alerts.append(f"uniMMR {uni_mmr} < min_uni_mmr {min_uni_mmr} (ORDERS BLOCKED)")
+        if warning_uni_mmr is not None and uni_mmr is not None and uni_mmr < float(warning_uni_mmr):
+            alerts.append(f"uniMMR {uni_mmr} < warning {warning_uni_mmr}")
+
+        return {
+            "enabled": True,
+            "account_status": risk.get("account_status") or "unknown",
+            "uni_mmr": uni_mmr,
+            "account_equity": risk.get("account_equity"),
+            "initial_margin": risk.get("initial_margin"),
+            "maintenance_margin": risk.get("maintenance_margin"),
+            "total_collateral_value": risk.get("total_collateral_value"),
+            "min_uni_mmr": min_uni_mmr,
+            "warning_uni_mmr": warning_uni_mmr,
+            "alerts": alerts,
+            "new_orders_allowed": (
+                account_status == "NORMAL"
+                and (min_uni_mmr is None or uni_mmr is None or uni_mmr >= float(min_uni_mmr))
+            ),
+        }
+
+    def _rpc_pm_recover(self) -> dict[str, Any]:
+        if self._freqtrade.trading_mode != TradingMode.FUTURES:
+            raise RPCException("pm_recover is only available in futures mode.")
+        if not hasattr(self._freqtrade.exchange, "_is_portfolio_margin"):
+            raise RPCException("pm_recover is only available for Binance PM mode.")
+        if not self._freqtrade.exchange._is_portfolio_margin():
+            raise RPCException("Binance PM mode is not enabled.")
+
+        open_trades = Trade.get_open_trades()
+        reconciled: list[str] = []
+        mismatches: list[str] = []
+        errors: list[str] = []
+
+        for trade in open_trades:
+            for order in trade.open_orders:
+                try:
+                    exchange_order = self._freqtrade.exchange.fetch_order(
+                        order.order_id, trade.pair
+                    )
+                    if exchange_order.get("status") != order.status:
+                        mismatches.append(
+                            f"{order.order_id}({trade.pair}): DB={order.status} "
+                            f"Exchange={exchange_order.get('status')}"
+                        )
+                        trade.update_order(exchange_order)
+                        reconciled.append(order.order_id)
+                except Exception as e:
+                    errors.append(f"{order.order_id}: {e}")
+
+        if reconciled:
+            Trade.commit()
+
+        return {
+            "open_trades": len(open_trades),
+            "reconciled_count": len(reconciled),
+            "reconciled": reconciled,
+            "mismatches": mismatches,
+            "errors": errors,
+        }
+
     def _force_entry_validations(self, pair: str, order_side: SignalDirection):
         if not self._freqtrade.config.get("force_entry_enable", False):
             raise RPCException("Force_entry not enabled.")

@@ -216,6 +216,11 @@ class Telegram(RPCHandler):
             r"/forceshort$",
             r"/forcesell$",
             r"/forceexit$",
+            r"/pm_close$",
+            r"/pm_close (all|USDT|USDC|usdt|usdc)$",
+            r"/pm_status$",
+            r"/pm_risk$",
+            r"/pm_recover$",
             r"/health$",
             r"/help$",
             r"/version$",
@@ -270,6 +275,10 @@ class Telegram(RPCHandler):
             CommandHandler("start", self._start),
             CommandHandler("stop", self._stop),
             CommandHandler(["forcesell", "forceexit", "fx"], self._force_exit),
+            CommandHandler("pm_close", self._pm_close),
+            CommandHandler("pm_status", self._pm_status),
+            CommandHandler("pm_risk", self._pm_risk),
+            CommandHandler("pm_recover", self._pm_recover),
             CommandHandler(
                 ["forcebuy", "forcelong"],
                 partial(self._force_enter, order_side=SignalDirection.LONG),
@@ -1446,6 +1455,136 @@ class Telegram(RPCHandler):
             except RPCException as e:
                 await self._send_msg(str(e))
 
+    @authorized_only
+    async def _pm_close(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /pm_close [all|USDT|USDC].
+        Creates market exit orders for all matching futures trades.
+        """
+        target_currency = context.args[0] if context.args else "all"
+        try:
+            loop = asyncio.get_running_loop()
+            msg = await loop.run_in_executor(
+                None,
+                safe_async_db(self._rpc._rpc_pm_close),
+                target_currency,
+                "market",
+            )
+            await self._send_msg(f"Status: `{msg['result']}`")
+        except RPCException as e:
+            await self._send_msg(str(e))
+
+    @authorized_only
+    async def _pm_status(self, update: Update, context: CallbackContext) -> None:
+        """Handler for /pm_status."""
+        try:
+            loop = asyncio.get_running_loop()
+            status = await loop.run_in_executor(None, safe_async_db(self._rpc._rpc_pm_status))
+        except RPCException as e:
+            await self._send_msg(str(e))
+            return
+
+        balances = status["balances"]
+        positions = status["positions"]
+        stream = status.get("user_stream") or {}
+
+        balance_lines = []
+        for currency, balance in sorted(balances.items()):
+            balance_lines.append(
+                f"{currency}: total={round_value(balance.get('total', 0), 8)}, "
+                f"free={round_value(balance.get('free', 0), 8)}, "
+                f"used={round_value(balance.get('used', 0), 8)}"
+            )
+        if not balance_lines:
+            balance_lines.append("none")
+
+        position_lines = []
+        for position in positions[:20]:
+            position_lines.append(
+                f"{position.get('symbol')}: {position.get('side')} "
+                f"contracts={round_value(position.get('contracts', 0), 8)} "
+                f"margin={round_value(position.get('initialMargin') or 0, 8)}"
+            )
+        if len(positions) > 20:
+            position_lines.append(f"... {len(positions) - 20} more")
+        if not position_lines:
+            position_lines.append("none")
+
+        message = (
+            "*Binance PM Status*\n"
+            f"Account: `{status['account_status']}`\n"
+            f"uniMMR: `{status['uni_mmr']}`\n"
+            f"Equity: `{status['account_equity']}`\n"
+            f"Initial margin: `{status['initial_margin']}`\n"
+            f"Maintenance margin: `{status['maintenance_margin']}`\n"
+            f"User stream: `enabled={stream.get('enabled')}, "
+            f"running={stream.get('running')}, connected={stream.get('connected')}, "
+            f"queued={stream.get('queued_events')}, last={stream.get('last_event_type')}`\n"
+            f"Stream health: `reconnects={stream.get('reconnects')}, "
+            f"dropped={stream.get('events_dropped')}, parse_errors={stream.get('parse_errors')}, "
+            f"last_error={stream.get('last_error')}`\n\n"
+            "*Balances:*\n"
+            f"`{chr(10).join(balance_lines)}`\n\n"
+            "*Positions:*\n"
+            f"`{chr(10).join(position_lines)}`"
+        )
+        await self._send_msg(message, ParseMode.MARKDOWN)
+
+    @authorized_only
+    async def _pm_risk(self, update: Update, context: CallbackContext) -> None:
+        """Handler for /pm_risk."""
+        try:
+            loop = asyncio.get_running_loop()
+            risk = await loop.run_in_executor(None, safe_async_db(self._rpc._rpc_pm_risk))
+        except RPCException as e:
+            await self._send_msg(str(e))
+            return
+
+        alerts_str = "\n".join(f"  - {a}" for a in risk["alerts"]) if risk["alerts"] else "none"
+        orders_ok = "YES" if risk["new_orders_allowed"] else "NO (BLOCKED)"
+
+        message = (
+            "*Binance PM Risk*\n"
+            f"Account: `{risk['account_status']}`\n"
+            f"uniMMR: `{risk['uni_mmr']}`\n"
+            f"Equity: `{risk['account_equity']}`\n"
+            f"Initial margin: `{risk['initial_margin']}`\n"
+            f"Maintenance margin: `{risk['maintenance_margin']}`\n"
+            f"Collateral: `{risk['total_collateral_value']}`\n"
+            f"min_uni_mmr: `{risk['min_uni_mmr']}`\n"
+            f"warning_uni_mmr: `{risk['warning_uni_mmr']}`\n"
+            f"New orders allowed: `{orders_ok}`\n\n"
+            f"*Alerts:*\n`{alerts_str}`"
+        )
+        await self._send_msg(message, ParseMode.MARKDOWN)
+
+    @authorized_only
+    async def _pm_recover(self, update: Update, context: CallbackContext) -> None:
+        """Handler for /pm_recover."""
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, safe_async_db(self._rpc._rpc_pm_recover))
+        except RPCException as e:
+            await self._send_msg(str(e))
+            return
+
+        mismatches_str = (
+            "\n".join(f"  - {m}" for m in result["mismatches"][:10])
+            if result["mismatches"]
+            else "none"
+        )
+        errors_str = (
+            "\n".join(f"  - {e}" for e in result["errors"][:10]) if result["errors"] else "none"
+        )
+        message = (
+            "*Binance PM Order Recovery*\n"
+            f"Open trades: `{result['open_trades']}`\n"
+            f"Orders reconciled: `{result['reconciled_count']}`\n\n"
+            f"*Mismatches:*\n`{mismatches_str}`\n\n"
+            f"*Errors:*\n`{errors_str}`"
+        )
+        await self._send_msg(message, ParseMode.MARKDOWN)
+
     async def _force_exit_inline(self, update: Update, _: CallbackContext) -> None:
         if update.callback_query:
             query = update.callback_query
@@ -1931,6 +2070,11 @@ class Telegram(RPCHandler):
             "*/forceexit <trade_id>|all:* `Instantly exits the given trade or all trades, "
             "regardless of profit`\n"
             "*/fx <trade_id>|all:* `Alias to /forceexit`\n"
+            "*/pm_close [all|USDT|USDC]:* `Market-closes all futures trades matching "
+            "the contract settlement currency. BTC/ETH in PM is collateral only.`\n"
+            "*/pm_status:* `Shows Binance PM account status, uniMMR, balances and positions.`\n"
+            "*/pm_risk:* `Quick Binance PM risk check with alerts and new-order block status.`\n"
+            "*/pm_recover:* `Reconciles PM order states between DB and exchange.`\n"
             f"{force_enter_text if self._config.get('force_entry_enable', False) else ''}"
             "*/delete <trade_id>:* `Instantly delete the given trade in the database`\n"
             "*/reload_trade <trade_id>:* `Reload trade from exchange Orders`\n"

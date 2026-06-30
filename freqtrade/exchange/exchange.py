@@ -28,6 +28,7 @@ from freqtrade.constants import (
     BidAsk,
     BuySell,
     Config,
+    EntryExecuteMode,
     EntryExit,
     ExchangeConfig,
     ListPairsWithTimeframes,
@@ -1411,6 +1412,7 @@ class Exchange:
         time_in_force: str = "GTC",
         reduceOnly: bool = False,
         initial_order: bool = True,
+        entry_mode: EntryExecuteMode = "initial",
     ) -> CcxtOrder:
         if self._config["dry_run"]:
             dry_order = self.create_dry_run_order(

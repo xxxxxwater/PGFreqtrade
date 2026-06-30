@@ -12,6 +12,7 @@ from time import sleep
 from typing import Any
 
 from schedule import Scheduler
+from sqlalchemy import func, select
 
 from freqtrade import constants
 from freqtrade.configuration import remove_exchange_credentials, validate_config_consistency
@@ -172,6 +173,17 @@ class FreqtradeBot(LoggingMixin):
                     self._schedule.every().day.at(t).do(update)
 
         self._schedule.every().day.at("00:02").do(self.exchange.ws_connection_reset)
+        if hasattr(self.wallets, "record_wallet_state"):
+            self._schedule.every().day.at("00:07").do(self.wallets.record_wallet_state)
+
+        if (
+            self.trading_mode == TradingMode.FUTURES
+            and not self.config["dry_run"]
+            and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+        ):
+            self._pm_listen_key: str = ""
+            self._pm_init_user_stream_state()
+            self._init_pm_schedule()
 
         self.strategy.ft_bot_start()
         # Initialize protections AFTER bot start - otherwise parameters are not loaded.
@@ -193,6 +205,554 @@ class FreqtradeBot(LoggingMixin):
         via RPC about changes in the bot status.
         """
         self.rpc.send_msg({"type": msg_type, "status": msg})
+
+    def _init_pm_schedule(self) -> None:
+        if not hasattr(self, "_pm_listen_key"):
+            self._pm_listen_key = ""
+        self._pm_create_listen_key()
+
+        self._schedule.every(30).minutes.do(self._pm_keepalive_listen_key)
+
+        pm_risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
+        risk_interval = pm_risk_cfg.get("monitor_interval_minutes", 5)
+        self._schedule.every(risk_interval).minutes.do(self._pm_risk_monitor)
+
+        recovery_interval = pm_risk_cfg.get("order_recovery_interval_minutes", 5)
+        self._schedule.every(recovery_interval).minutes.do(self._pm_order_recovery)
+
+        health_interval = pm_risk_cfg.get("user_stream_health_interval_minutes", 1)
+        self._schedule.every(health_interval).minutes.do(self._pm_user_stream_health_monitor)
+
+        logger.info(
+            f"Binance PM scheduled tasks registered: listenKey keepalive (30min), "
+            f"risk monitor ({risk_interval}min), "
+            f"order recovery ({recovery_interval}min), "
+            f"user stream health ({health_interval}min)"
+        )
+
+    def _pm_create_listen_key(self) -> None:
+        try:
+            if hasattr(self.exchange, "create_pm_listen_key"):
+                self._pm_listen_key = self.exchange.create_pm_listen_key()
+                if self._pm_listen_key:
+                    logger.info("Binance PM listenKey created successfully.")
+                    if hasattr(self.exchange, "start_pm_user_stream"):
+                        self.exchange.start_pm_user_stream(self._pm_listen_key)
+                else:
+                    logger.debug("Binance PM listenKey creation skipped (dry_run or not PM).")
+        except Exception as e:
+            logger.warning(f"Failed to create Binance PM listenKey: {e}")
+
+    def _pm_keepalive_listen_key(self) -> None:
+        if not self._pm_listen_key:
+            return
+        try:
+            if hasattr(self.exchange, "keepalive_pm_listen_key"):
+                self.exchange.keepalive_pm_listen_key(self._pm_listen_key)
+        except Exception as e:
+            logger.warning(f"Failed to keepalive Binance PM listenKey: {e}")
+            if hasattr(self.exchange, "stop_pm_user_stream"):
+                self.exchange.stop_pm_user_stream()
+            self._pm_listen_key = ""
+            self._pm_create_listen_key()
+
+    def _pm_init_user_stream_state(self) -> None:
+        if not hasattr(self, "_pm_user_stream_restarts"):
+            self._pm_user_stream_restarts: list[datetime] = []
+        if not hasattr(self, "_pm_user_stream_last_events_dropped"):
+            self._pm_user_stream_last_events_dropped = 0
+        if not hasattr(self, "_pm_user_stream_last_parse_errors"):
+            self._pm_user_stream_last_parse_errors = 0
+        if not hasattr(self, "_pm_user_stream_queue_warning_active"):
+            self._pm_user_stream_queue_warning_active = False
+        if not hasattr(self, "_pm_user_stream_restart_limit_warning_sent"):
+            self._pm_user_stream_restart_limit_warning_sent = False
+        if not hasattr(self, "_pm_unmatched_stream_order_ids"):
+            self._pm_unmatched_stream_order_ids: set[str] = set()
+
+    def _pm_pair_from_exchange_symbol(self, symbol_id: str | None) -> str | None:
+        if not symbol_id:
+            return None
+
+        for pair, market in self.exchange.markets.items():
+            if market.get("id") == symbol_id:
+                return pair
+
+        api = getattr(self.exchange, "_api", None)
+        if api and hasattr(api, "safe_symbol"):
+            try:
+                pair = api.safe_symbol(symbol_id, None, None, "contract")
+                if pair in self.exchange.markets:
+                    return pair
+            except Exception:
+                logger.debug(f"Could not map PM stream symbol {symbol_id} to a freqtrade pair.")
+        return None
+
+    def _pm_handle_order_trade_update(
+        self, event: dict[str, Any], order_index: dict[str, tuple[Any, Any]]
+    ) -> bool:
+        order_data = event.get("o", {})
+        order_id = str(order_data.get("i") or order_data.get("orderId") or "")
+        if not order_id:
+            return False
+
+        pair = self._pm_pair_from_exchange_symbol(order_data.get("s"))
+        if not pair:
+            logger.debug(f"Skipping PM order event for unknown symbol {order_data.get('s')}.")
+            return False
+
+        entry = order_index.get(order_id)
+        if entry is None:
+            self._pm_init_user_stream_state()
+            if len(self._pm_unmatched_stream_order_ids) > 1000:
+                self._pm_unmatched_stream_order_ids.clear()
+            if order_id not in self._pm_unmatched_stream_order_ids:
+                self._pm_unmatched_stream_order_ids.add(order_id)
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM User Stream WARNING: order event {order_id} on {pair} "
+                            "did not match a local open order. Running PM order recovery."
+                        ),
+                    }
+                )
+            if (
+                self.config.get("exchange", {})
+                .get("portfolio_margin_risk", {})
+                .get("user_stream_recover_unmatched_orders", True)
+            ):
+                self._pm_order_recovery()
+            return False
+
+        trade, order = entry
+        with self._exit_lock:
+            exchange_order = self.exchange.fetch_order(order_id, trade.pair)
+            self.update_trade_state(
+                trade,
+                order_id,
+                exchange_order,
+                stoploss_order=order.ft_order_side == "stoploss",
+            )
+        logger.info(
+            f"PM user stream reconciled order {order_id} on {trade.pair}: "
+            f"{exchange_order.get('status')}."
+        )
+        return True
+
+    @staticmethod
+    def _pm_stream_time(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    def _pm_restart_user_stream(self, reason: str) -> None:
+        self._pm_init_user_stream_state()
+        risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
+        max_restarts = int(risk_cfg.get("user_stream_max_restarts_per_hour", 3))
+        now = datetime.now(UTC)
+        self._pm_user_stream_restarts = [
+            restart
+            for restart in self._pm_user_stream_restarts
+            if restart > now - timedelta(hours=1)
+        ]
+        if len(self._pm_user_stream_restarts) >= max_restarts:
+            if not self._pm_user_stream_restart_limit_warning_sent:
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            "PM User Stream CRITICAL: restart limit reached "
+                            f"({max_restarts}/hour). Reason: {reason}. "
+                            "REST recovery remains active, but live event sync is degraded."
+                        ),
+                    }
+                )
+                self._pm_user_stream_restart_limit_warning_sent = True
+            return
+
+        self._pm_user_stream_restart_limit_warning_sent = False
+        self._pm_user_stream_restarts.append(now)
+        self.rpc.send_msg(
+            {
+                "type": RPCMessageType.WARNING,
+                "status": f"PM User Stream restart: {reason}",
+            }
+        )
+        if hasattr(self.exchange, "stop_pm_user_stream"):
+            self.exchange.stop_pm_user_stream()
+        if self._pm_listen_key and hasattr(self.exchange, "start_pm_user_stream"):
+            self.exchange.start_pm_user_stream(self._pm_listen_key)
+        else:
+            self._pm_create_listen_key()
+        self._pm_order_recovery()
+
+    def _pm_user_stream_health_monitor(self) -> None:
+        try:
+            self._pm_init_user_stream_state()
+            if (
+                self.config["dry_run"]
+                or not hasattr(self.exchange, "get_pm_user_stream_stats")
+                or not getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+            ):
+                return
+            stats = self.exchange.get_pm_user_stream_stats()
+            if not stats.get("enabled"):
+                return
+
+            risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
+            queued = int(stats.get("queued_events") or 0)
+            queue_warning_size = int(risk_cfg.get("user_stream_queue_warning_size", 500))
+            if queued >= queue_warning_size and not self._pm_user_stream_queue_warning_active:
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM User Stream WARNING: {queued} queued events are waiting "
+                            f"(threshold={queue_warning_size})."
+                        ),
+                    }
+                )
+                self._pm_user_stream_queue_warning_active = True
+            elif queued < queue_warning_size:
+                self._pm_user_stream_queue_warning_active = False
+
+            dropped = int(stats.get("events_dropped") or 0)
+            if dropped > self._pm_user_stream_last_events_dropped:
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM User Stream CRITICAL: dropped events increased from "
+                            f"{self._pm_user_stream_last_events_dropped} to {dropped}. "
+                            "Running order recovery."
+                        ),
+                    }
+                )
+                self._pm_user_stream_last_events_dropped = dropped
+                self._pm_order_recovery()
+
+            parse_errors = int(stats.get("parse_errors") or 0)
+            if parse_errors > self._pm_user_stream_last_parse_errors:
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM User Stream WARNING: parse errors increased from "
+                            f"{self._pm_user_stream_last_parse_errors} to {parse_errors}."
+                        ),
+                    }
+                )
+                self._pm_user_stream_last_parse_errors = parse_errors
+
+            if not stats.get("running"):
+                self._pm_restart_user_stream("stream thread is not running")
+                return
+
+            disconnected_at = self._pm_stream_time(stats.get("last_disconnected_at"))
+            max_disconnected_seconds = int(
+                risk_cfg.get("user_stream_disconnected_restart_seconds", 120)
+            )
+            if (
+                not stats.get("connected")
+                and disconnected_at
+                and datetime.now(UTC) - disconnected_at
+                > timedelta(seconds=max_disconnected_seconds)
+            ):
+                self._pm_restart_user_stream(
+                    "stream has been disconnected for "
+                    f">{max_disconnected_seconds}s; last_error={stats.get('last_error')}"
+                )
+        except Exception as e:
+            logger.warning(f"PM user stream health check failed: {e}")
+
+    def _pm_rebuild_user_stream(self) -> None:
+        self.rpc.send_msg(
+            {
+                "type": RPCMessageType.WARNING,
+                "status": "PM user data stream listenKey expired; rebuilding stream.",
+            }
+        )
+        if hasattr(self.exchange, "stop_pm_user_stream"):
+            self.exchange.stop_pm_user_stream()
+        self._pm_listen_key = ""
+        self._pm_create_listen_key()
+
+    def _pm_process_user_stream_event(
+        self, event: dict[str, Any], order_index: dict[str, tuple[Any, Any]]
+    ) -> tuple[bool, bool, bool]:
+        event_type = event.get("e")
+        if event_type == "ORDER_TRADE_UPDATE":
+            order_updated = self._pm_handle_order_trade_update(event, order_index)
+            return order_updated, order_updated, False
+        if event_type == "ACCOUNT_UPDATE":
+            return False, True, True
+        if event_type == "riskLevelChange":
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM Risk Stream ALERT: state={event.get('s')}, "
+                        f"uniMMR={event.get('u')}, equity={event.get('eq')}."
+                    ),
+                }
+            )
+            return False, True, True
+        if event_type in {
+            "ACCOUNT_CONFIG_UPDATE",
+            "balanceUpdate",
+            "outboundAccountPosition",
+            "liabilityChange",
+            "openOrderLoss",
+            "MARGIN_CALL",
+            "POSITION_HISTORY_UPDATE",
+        }:
+            return False, True, True
+        if event_type == "listenKeyExpired":
+            self._pm_rebuild_user_stream()
+            return False, False, False
+
+        logger.debug(f"Unhandled Binance PM user stream event type: {event_type}")
+        return False, False, False
+
+    def _pm_consume_user_stream_events(self) -> None:
+        if (
+            self.trading_mode != TradingMode.FUTURES
+            or self.config["dry_run"]
+            or not hasattr(self.exchange, "pop_pm_user_stream_events")
+        ):
+            return
+
+        try:
+            events = self.exchange.pop_pm_user_stream_events()
+        except Exception as e:
+            logger.warning(f"Could not read Binance PM user stream events: {e}")
+            return
+
+        if not events:
+            return
+
+        order_index: dict[str, tuple[Any, Any]] = {}
+        for trade in Trade.get_open_trades():
+            for order in trade.open_orders:
+                order_index[str(order.order_id)] = (trade, order)
+
+        order_updates = 0
+        account_updates = 0
+        errors = 0
+        needs_wallet_update = False
+        needs_risk_check = False
+
+        for event in events:
+            event_type = event.get("e")
+            try:
+                order_updated, wallet_update, risk_check = self._pm_process_user_stream_event(
+                    event, order_index
+                )
+                order_updates += int(order_updated)
+                account_updates += int(event_type == "ACCOUNT_UPDATE")
+                needs_wallet_update = needs_wallet_update or wallet_update
+                needs_risk_check = needs_risk_check or risk_check
+            except Exception as e:
+                errors += 1
+                logger.warning(f"Failed to process Binance PM user stream event {event_type}: {e}")
+
+        if needs_wallet_update:
+            self.wallets.update(require_update=True)
+        if needs_risk_check:
+            self._pm_risk_monitor()
+        Trade.commit()
+
+        logger.info(
+            f"Processed {len(events)} Binance PM stream event(s): "
+            f"orders={order_updates}, account={account_updates}, errors={errors}."
+        )
+
+    def _pm_risk_monitor(self) -> None:
+        try:
+            if not hasattr(self.exchange, "get_pm_risk_summary"):
+                return
+            risk = self.exchange.get_pm_risk_summary()
+            if not risk.get("enabled"):
+                return
+
+            risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
+            uni_mmr = risk.get("uni_mmr")
+            account_status = risk.get("account_status")
+
+            if account_status and account_status != "NORMAL":
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM Risk ALERT: account status is {account_status}. "
+                            f"uniMMR={uni_mmr}, equity={risk.get('account_equity')}. "
+                            "Bot will refuse new orders."
+                        ),
+                    }
+                )
+
+            warning_mmr = risk_cfg.get("warning_uni_mmr")
+            if warning_mmr is not None and uni_mmr is not None and uni_mmr < float(warning_mmr):
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM Risk WARNING: uniMMR {uni_mmr} is below warning threshold "
+                            f"{warning_mmr}. Equity={risk.get('account_equity')}, "
+                            f"Maintenance margin={risk.get('maintenance_margin')}."
+                        ),
+                    }
+                )
+
+            critical_mmr = risk_cfg.get("min_uni_mmr")
+            if critical_mmr is not None and uni_mmr is not None and uni_mmr < float(critical_mmr):
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM Risk CRITICAL: uniMMR {uni_mmr} is below min_uni_mmr "
+                            f"{critical_mmr}. New orders are BLOCKED. "
+                            f"Equity={risk.get('account_equity')}."
+                        ),
+                    }
+                )
+
+            emergency_stop_mmr = risk_cfg.get("emergency_stop_uni_mmr")
+            if (
+                emergency_stop_mmr is not None
+                and uni_mmr is not None
+                and uni_mmr < float(emergency_stop_mmr)
+            ):
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM EMERGENCY STOP: uniMMR {uni_mmr} is below emergency stop "
+                            f"{emergency_stop_mmr}. FORCE-CLOSING ALL POSITIONS. "
+                            f"Equity={risk.get('account_equity')}."
+                        ),
+                    }
+                )
+                self._pm_emergency_close_all()
+
+            max_daily_loss = risk_cfg.get("max_daily_loss")
+            if max_daily_loss is not None:
+                today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+                try:
+                    daily_pnl = (
+                        Trade.session.execute(
+                            select(func.sum(Trade.close_profit_abs)).filter(
+                                Trade.is_open.is_(False), Trade.close_date >= today_start
+                            )
+                        ).scalar_one()
+                        or 0.0
+                    )
+                except Exception:
+                    daily_pnl = 0.0
+                if daily_pnl < -float(max_daily_loss):
+                    self.rpc.send_msg(
+                        {
+                            "type": RPCMessageType.WARNING,
+                            "status": (
+                                f"PM MAX DAILY LOSS EXCEEDED: daily PnL={daily_pnl:.2f} "
+                                f"exceeds max_daily_loss={max_daily_loss}. "
+                                "Stopping trader and closing all positions."
+                            ),
+                        }
+                    )
+                    self._pm_emergency_close_all()
+                    self.state = State.STOPPED
+
+        except Exception as e:
+            logger.warning(f"PM risk monitor check failed: {e}")
+
+    def _pm_emergency_close_all(self) -> None:
+        open_trades = Trade.get_open_trades()
+        if not open_trades:
+            return
+        closed = 0
+        failed = 0
+        for trade in open_trades:
+            try:
+                if self._safe_force_exit(trade):
+                    closed += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+        Trade.commit()
+        logger.warning(
+            f"PM emergency close: {closed} positions closed, {failed} failed, "
+            f"out of {len(open_trades)} total."
+        )
+
+    def _safe_force_exit(self, trade) -> bool:
+        try:
+            current_rate = self.exchange.get_rate(
+                trade.pair, side="exit", is_short=trade.is_short, refresh=True
+            )
+            return self.execute_trade_exit(
+                trade,
+                limit=current_rate,
+                exit_check=ExitCheckTuple(exit_type=ExitType.EMERGENCY_EXIT),
+                ordertype=self.strategy.order_types.get("emergency_exit", "market"),
+            )
+        except Exception as e:
+            logger.exception(f"PM emergency exit failed for {trade.pair}: {e}")
+            return False
+
+    def _pm_order_recovery(self) -> None:
+        try:
+            if (
+                not hasattr(self.exchange, "_is_portfolio_margin")
+                or not self.exchange._is_portfolio_margin()
+            ):
+                return
+            open_trades = Trade.get_open_trades()
+            mismatch_count = 0
+            for trade in open_trades:
+                for order in trade.open_orders:
+                    try:
+                        exchange_order = self.exchange.fetch_order(order.order_id, trade.pair)
+                        if exchange_order.get("status") != order.status:
+                            logger.warning(
+                                f"PM order state mismatch for {order.order_id} "
+                                f"({trade.pair}): DB={order.status}, "
+                                f"Exchange={exchange_order.get('status')}"
+                            )
+                            trade.update_order(exchange_order)
+                            mismatch_count += 1
+                    except Exception as e:
+                        logger.debug(f"PM order recovery check failed for {order.order_id}: {e}")
+            Trade.commit()
+            if mismatch_count > 0:
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM Order Recovery: {mismatch_count} order state "
+                            f"mismatch(es) reconciled across {len(open_trades)} open trades."
+                        ),
+                    }
+                )
+        except Exception as e:
+            logger.warning(f"PM order recovery check failed: {e}")
+
+    def _pm_cleanup_stream_and_listen_key(self) -> None:
+        if hasattr(self.exchange, "stop_pm_user_stream"):
+            self.exchange.stop_pm_user_stream()
+        if not getattr(self, "_pm_listen_key", ""):
+            return
+        try:
+            if hasattr(self.exchange, "delete_pm_listen_key"):
+                self.exchange.delete_pm_listen_key(self._pm_listen_key)
+                logger.info("Binance PM listenKey deleted.")
+        except Exception as e:
+            logger.warning(f"Failed to delete Binance PM listenKey: {e}")
 
     def cleanup(self) -> None:
         """
@@ -216,7 +776,9 @@ class FreqtradeBot(LoggingMixin):
         self.rpc.cleanup()
         if self.emc:
             self.emc.shutdown()
-        self.exchange.close()
+        if getattr(self, "exchange", None):
+            self._pm_cleanup_stream_and_listen_key()
+            self.exchange.close()
         try:
             Trade.commit()
         except Exception:
@@ -244,6 +806,14 @@ class FreqtradeBot(LoggingMixin):
         self.update_all_liquidation_prices()
         self.update_funding_fees()
 
+        if (
+            self.trading_mode == TradingMode.FUTURES
+            and not self.config["dry_run"]
+            and getattr(self, "_pm_listen_key", None) is not None
+            and not self._pm_listen_key
+        ):
+            self._pm_create_listen_key()
+
     def process(self) -> None:
         """
         Queries the persistence layer for open trades and handles them,
@@ -253,6 +823,7 @@ class FreqtradeBot(LoggingMixin):
 
         # Check whether markets have to be reloaded and reload them when it's needed
         self.exchange.reload_markets()
+        self._pm_consume_user_stream_events()
 
         self.update_trades_without_assigned_fees()
 
@@ -938,6 +1509,7 @@ class FreqtradeBot(LoggingMixin):
             time_in_force=time_in_force,
             leverage=leverage,
             initial_order=trade is None,
+            entry_mode=mode,
         )
         order_obj = Order.parse_from_ccxt_object(order, pair, side, amount, enter_limit_requested)
         order_obj.ft_order_tag = enter_tag

@@ -1099,6 +1099,13 @@ def test_load_config_stoploss_exchange_limit_ratio(all_conf) -> None:
         validate_config_schema(all_conf)
 
 
+def test_load_config_binance_pm_risk_rejects_unknown_key(all_conf) -> None:
+    all_conf["exchange"]["portfolio_margin_risk"] = {"min_unimmr": 1.5}
+
+    with pytest.raises(ConfigurationError, match=r"Additional properties are not allowed"):
+        validate_config_schema(all_conf)
+
+
 @pytest.mark.parametrize(
     "keys",
     [

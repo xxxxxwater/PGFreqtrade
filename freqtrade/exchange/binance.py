@@ -3,21 +3,30 @@
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import RLock
+from typing import Any
 
 import ccxt
 from pandas import DataFrame
 
-from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS
+from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS, EntryExecuteMode
 from freqtrade.enums import TRADE_MODES, CandleType, MarginMode, PriceType, RunMode, TradingMode
-from freqtrade.exceptions import DDosProtection, OperationalException, TemporaryError
+from freqtrade.exceptions import (
+    DDosProtection,
+    InsufficientFundsError,
+    InvalidOrderException,
+    OperationalException,
+    TemporaryError,
+)
 from freqtrade.exchange import Exchange
+from freqtrade.exchange.binance_pm_user_stream import BinancePMUserStream
 from freqtrade.exchange.binance_public_data import (
     concat_safe,
     download_archive_ohlcv,
     download_archive_trades,
 )
 from freqtrade.exchange.common import retrier
-from freqtrade.exchange.exchange_types import FtHas, Tickers
+from freqtrade.exchange.exchange_types import CcxtBalances, CcxtOrder, CcxtPosition, FtHas, Tickers
 from freqtrade.exchange.exchange_utils_timeframe import timeframe_to_msecs
 from freqtrade.misc import deep_merge_dicts, json_load
 from freqtrade.util import FtTTLCache
@@ -69,6 +78,41 @@ class Binance(Exchange):
         },
     }
     _can_use_data_download_fast = True
+    _pm_risk_allowed_config_keys = {
+        "min_uni_mmr",
+        "warning_uni_mmr",
+        "emergency_stop_uni_mmr",
+        "user_stream_enabled",
+        "user_stream_health_interval_minutes",
+        "user_stream_queue_warning_size",
+        "user_stream_disconnected_restart_seconds",
+        "user_stream_max_restarts_per_hour",
+        "user_stream_recover_unmatched_orders",
+        "monitor_interval_minutes",
+        "order_recovery_interval_minutes",
+        "heartbeat_risk_cache_seconds",
+        "max_leverage",
+        "max_total_notional",
+        "max_position_notional",
+        "max_daily_loss",
+    }
+    _pm_risk_positive_number_keys = {
+        "min_uni_mmr",
+        "warning_uni_mmr",
+        "emergency_stop_uni_mmr",
+        "max_leverage",
+        "max_total_notional",
+        "max_daily_loss",
+    }
+    _pm_risk_positive_integer_keys = {
+        "user_stream_health_interval_minutes",
+        "user_stream_queue_warning_size",
+        "user_stream_disconnected_restart_seconds",
+        "user_stream_max_restarts_per_hour",
+        "monitor_interval_minutes",
+        "order_recovery_interval_minutes",
+        "heartbeat_risk_cache_seconds",
+    }
 
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
         (TradingMode.SPOT, MarginMode.NONE),
@@ -78,8 +122,474 @@ class Binance(Exchange):
     ]
 
     def __init__(self, *args, **kwargs) -> None:
+        config = args[0] if args else kwargs.get("config", {})
+        exchange_conf = config.get("exchange", {}) if isinstance(config, dict) else {}
+        self._portfolio_margin = bool(
+            exchange_conf.get("portfolio_margin")
+            or exchange_conf.get("binance_portfolio_margin")
+            or str(exchange_conf.get("account_type", "")).lower() in {"pm", "portfolio_margin"}
+        )
+        self._pm_user_stream: BinancePMUserStream | None = None
+        self._pm_user_stream_lock = RLock()
         super().__init__(*args, **kwargs)
         self._spot_delist_schedule_cache: FtTTLCache = FtTTLCache(maxsize=100, ttl=300)
+
+    def _is_portfolio_margin(self) -> bool:
+        return bool(getattr(self, "_portfolio_margin", False))
+
+    def _papi_request(
+        self, path: str, method: str = "GET", params: dict[str, Any] | None = None
+    ) -> Any:
+        """
+        Signed Binance Portfolio Margin request.
+
+        ccxt exposes Binance PAPI raw endpoints inconsistently across releases.  Using request()
+        keeps this adapter compatible with older ccxt builds while still reusing ccxt signing,
+        throttling and error mapping.
+        """
+        return self._api.request(path, "papiPrivate", method, params or {})
+
+    def _pm_namespace_for_pair(self, pair: str) -> str:
+        return "um"
+
+    def _pm_risk_config(self) -> dict[str, Any]:
+        return self._config.get("exchange", {}).get("portfolio_margin_risk", {})
+
+    def _pm_user_stream_enabled(self) -> bool:
+        return bool(self._pm_risk_config().get("user_stream_enabled", True))
+
+    def _pm_symbol_for_pair(self, pair: str) -> str:
+        return self.markets[pair]["id"]
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        return float(value)
+
+    @classmethod
+    def _float_or_zero(cls, value: Any) -> float:
+        return cls._float_or_none(value) or 0.0
+
+    @staticmethod
+    def _pm_order_status(status: str | None) -> str | None:
+        if status is None:
+            return None
+        return {
+            "NEW": "open",
+            "PARTIALLY_FILLED": "open",
+            "FILLED": "closed",
+            "CANCELED": "canceled",
+            "CANCELLED": "canceled",
+            "EXPIRED": "expired",
+            "REJECTED": "rejected",
+        }.get(status.upper(), status.lower())
+
+    def _parse_pm_order(self, order: dict[str, Any], pair: str | None = None) -> CcxtOrder:
+        symbol_id = order.get("symbol")
+        symbol = pair or self._api.safe_symbol(symbol_id, None, None, "contract")
+        amount = self._float_or_none(order.get("origQty"))
+        filled = self._float_or_zero(order.get("executedQty"))
+        price = self._float_or_none(order.get("price"))
+        average = self._float_or_none(order.get("avgPrice"))
+        cost = self._float_or_none(order.get("cumQuote"))
+        remaining = max(amount - filled, 0.0) if amount is not None else None
+        timestamp = self._float_or_none(order.get("updateTime") or order.get("time"))
+
+        return {
+            "id": str(order.get("orderId") or order.get("clientOrderId")),
+            "clientOrderId": order.get("clientOrderId"),
+            "timestamp": int(timestamp) if timestamp else None,
+            "datetime": dt_from_ts(int(timestamp)) if timestamp else None,
+            "lastTradeTimestamp": int(timestamp) if timestamp else None,
+            "symbol": symbol,
+            "type": str(order.get("type", "")).lower() or None,
+            "timeInForce": order.get("timeInForce"),
+            "side": str(order.get("side", "")).lower() or None,
+            "price": price,
+            "average": average,
+            "amount": amount,
+            "filled": filled,
+            "remaining": remaining,
+            "cost": cost,
+            "status": self._pm_order_status(order.get("status")),
+            "fee": None,
+            "trades": [],
+            "info": order,
+        }
+
+    def _parse_pm_position(self, position: dict[str, Any]) -> CcxtPosition | None:
+        pair = self._api.safe_symbol(position.get("symbol"), None, None, "contract")
+        if not pair or pair not in self.markets:
+            return None
+
+        position_amount = self._float_or_zero(position.get("positionAmt"))
+        if position_amount == 0:
+            side = None
+        else:
+            side = "long" if position_amount > 0 else "short"
+
+        notional = self._float_or_zero(position.get("notional"))
+        leverage = self._float_or_none(position.get("leverage")) or 1.0
+        collateral = abs(notional) / leverage if notional and leverage else 0.0
+        return {
+            "symbol": pair,
+            "side": side,
+            "contracts": abs(position_amount),
+            "leverage": self._float_or_none(position.get("leverage")) or 1.0,
+            "collateral": collateral,
+            "initialMargin": collateral,
+            "liquidationPrice": self._float_or_none(position.get("liquidationPrice")),
+            "info": position,
+        }
+
+    def _pm_order_params(
+        self,
+        pair: str,
+        ordertype: str,
+        side: str,
+        amount: float,
+        rate: float | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        request = {
+            "symbol": self._pm_symbol_for_pair(pair),
+            "side": side.upper(),
+            "type": ordertype.upper(),
+            "quantity": amount,
+        }
+        if rate is not None:
+            request["price"] = rate
+        request.update(params)
+        return request
+
+    def _pm_account_float(self, account: dict[str, Any], *keys: str) -> float | None:
+        for key in keys:
+            if key in account:
+                value = self._float_or_none(account.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    @retrier
+    def fetch_pm_account_information(self) -> dict[str, Any]:
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return {}
+        try:
+            account = self._papi_request("account", "GET")
+            self._log_exchange_response("papi_account", account)
+            return account
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get Binance PM account due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    def get_pm_risk_summary(self) -> dict[str, Any]:
+        account = self.fetch_pm_account_information()
+        if not account:
+            return {"enabled": False}
+
+        return {
+            "enabled": True,
+            "account_status": account.get("accountStatus"),
+            "uni_mmr": self._pm_account_float(account, "uniMMR"),
+            "account_equity": self._pm_account_float(
+                account, "accountEquity", "actualEquity", "totalEquity"
+            ),
+            "total_collateral_value": self._pm_account_float(
+                account, "totalCollateralValue", "accountMaintMargin"
+            ),
+            "initial_margin": self._pm_account_float(
+                account, "accountInitialMargin", "totalInitialMargin"
+            ),
+            "maintenance_margin": self._pm_account_float(
+                account, "accountMaintMargin", "totalMaintMargin"
+            ),
+            "raw": account,
+        }
+
+    def assert_pm_risk_allows_order(
+        self,
+        pair: str | None = None,
+        amount: float = 0.0,
+        leverage: float | None = None,
+        entry_mode: EntryExecuteMode = "initial",
+    ) -> None:
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return
+
+        risk_config = self._pm_risk_config()
+        risk = self.get_pm_risk_summary()
+        account_status = risk.get("account_status")
+        if account_status and account_status != "NORMAL":
+            raise OperationalException(
+                f"Binance PM account status is {account_status}; refusing to open a new order."
+            )
+
+        min_uni_mmr = risk_config.get("min_uni_mmr")
+        uni_mmr = risk.get("uni_mmr")
+        if min_uni_mmr is not None and uni_mmr is not None and uni_mmr < float(min_uni_mmr):
+            raise OperationalException(
+                f"Binance PM uniMMR {uni_mmr} is below configured minimum {min_uni_mmr}; "
+                "refusing to open a new order."
+            )
+
+        max_leverage = risk_config.get("max_leverage")
+        if max_leverage is not None and leverage is not None and leverage > float(max_leverage):
+            raise OperationalException(
+                f"Requested leverage {leverage} exceeds max_leverage {max_leverage}; "
+                "refusing to open a new order."
+            )
+
+        positions: list[dict[str, Any]] | None = None
+
+        max_total_notional = risk_config.get("max_total_notional")
+        max_position_notional_match = risk_config.get("max_position_notional") or {}
+        counts_new_notional = entry_mode != "replace" and amount > 0.0
+        needs_positions = counts_new_notional and (
+            (max_total_notional is not None)
+            or (max_position_notional_match and pair in max_position_notional_match)
+        )
+        if needs_positions and pair is not None:
+            positions = self.fetch_positions()
+
+        if max_total_notional is not None and pair is not None and counts_new_notional:
+            current_total = (
+                sum(
+                    self._float_or_zero(p.get("initialMargin", 0))
+                    * self._float_or_zero(p.get("leverage", 1))
+                    for p in positions or []
+                )
+                if positions is not None
+                else 0.0
+            )
+            price = self._float_or_zero(self.get_rate(pair, side="entry", refresh=True))
+            new_notional = amount * (price or 0.0)
+            projected_total = current_total + new_notional
+
+            if projected_total > float(max_total_notional):
+                raise OperationalException(
+                    f"Projected total notional {projected_total:.2f} exceeds "
+                    f"max_total_notional {max_total_notional}; "
+                    f"current={current_total:.2f}, new={new_notional:.2f}, "
+                    f"entry_mode={entry_mode}. Refusing to open a new order."
+                )
+
+        if max_position_notional_match and pair is not None and counts_new_notional:
+            pair_cap = max_position_notional_match.get(pair)
+            if pair_cap is not None:
+                current_pair_notional = (
+                    sum(
+                        self._float_or_zero(p.get("initialMargin", 0))
+                        * self._float_or_zero(p.get("leverage", 1))
+                        for p in (positions or [])
+                        if p.get("symbol") == pair
+                    )
+                    if positions is not None
+                    else 0.0
+                )
+                price = self._float_or_zero(self.get_rate(pair, side="entry", refresh=True))
+                new_notional = amount * (price or 0.0)
+                projected_pair = current_pair_notional + new_notional
+                if projected_pair > float(pair_cap):
+                    raise OperationalException(
+                        f"Projected {pair} notional {projected_pair:.2f} exceeds "
+                        f"per-pair max {pair_cap} "
+                        f"(current={current_pair_notional:.2f}, new={new_notional:.2f}, "
+                        f"entry_mode={entry_mode}). Refusing order."
+                    )
+
+    def _validate_pm_risk_config(self, config: dict[str, Any]) -> None:
+        risk_config = config.get("exchange", {}).get("portfolio_margin_risk", {})
+        if risk_config is None:
+            return
+        if not isinstance(risk_config, dict):
+            raise OperationalException("exchange.portfolio_margin_risk must be an object.")
+
+        unknown_keys = sorted(set(risk_config) - self._pm_risk_allowed_config_keys)
+        if unknown_keys:
+            raise OperationalException(
+                "Unknown Binance PM risk config key(s): "
+                f"{', '.join(unknown_keys)}. Fix the spelling or remove unsupported keys."
+            )
+
+        self._validate_pm_risk_positive_values(risk_config)
+        self._validate_pm_risk_threshold_order(risk_config)
+        self._validate_pm_risk_boolean_keys(risk_config)
+
+    def _validate_pm_risk_positive_values(self, risk_config: dict[str, Any]) -> None:
+        for key in self._pm_risk_positive_number_keys:
+            value = risk_config.get(key)
+            if value is not None and float(value) <= 0:
+                raise OperationalException(f"exchange.portfolio_margin_risk.{key} must be > 0.")
+
+        for key in self._pm_risk_positive_integer_keys:
+            value = risk_config.get(key)
+            if value is not None and int(value) < 1:
+                raise OperationalException(f"exchange.portfolio_margin_risk.{key} must be >= 1.")
+
+        max_position_notional = risk_config.get("max_position_notional")
+        if max_position_notional is not None:
+            if not isinstance(max_position_notional, dict):
+                raise OperationalException(
+                    "exchange.portfolio_margin_risk.max_position_notional must be an object."
+                )
+            invalid_caps = [
+                pair
+                for pair, value in max_position_notional.items()
+                if value is None or float(value) <= 0
+            ]
+            if invalid_caps:
+                raise OperationalException(
+                    "exchange.portfolio_margin_risk.max_position_notional values must be > 0 "
+                    f"for: {', '.join(sorted(invalid_caps))}."
+                )
+
+    @staticmethod
+    def _validate_pm_risk_threshold_order(risk_config: dict[str, Any]) -> None:
+        warning_mmr = risk_config.get("warning_uni_mmr")
+        min_mmr = risk_config.get("min_uni_mmr")
+        emergency_mmr = risk_config.get("emergency_stop_uni_mmr")
+        if warning_mmr is not None and min_mmr is not None and float(warning_mmr) < float(min_mmr):
+            raise OperationalException(
+                "exchange.portfolio_margin_risk.warning_uni_mmr must be >= min_uni_mmr."
+            )
+        if (
+            emergency_mmr is not None
+            and min_mmr is not None
+            and float(emergency_mmr) > float(min_mmr)
+        ):
+            raise OperationalException(
+                "exchange.portfolio_margin_risk.emergency_stop_uni_mmr must be <= min_uni_mmr."
+            )
+
+    @staticmethod
+    def _validate_pm_risk_boolean_keys(risk_config: dict[str, Any]) -> None:
+        for key in ("user_stream_enabled", "user_stream_recover_unmatched_orders"):
+            if not isinstance(risk_config.get(key, True), bool):
+                raise OperationalException(
+                    f"exchange.portfolio_margin_risk.{key} must be a boolean."
+                )
+
+    @retrier
+    def create_pm_listen_key(self) -> str:
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return ""
+        try:
+            response = self._papi_request("listenKey", "POST")
+            self._log_exchange_response("papi_create_listen_key", response)
+            return response.get("listenKey", "")
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not create Binance PM listenKey due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier
+    def keepalive_pm_listen_key(self, listen_key: str) -> None:
+        if not self._is_portfolio_margin() or self._config["dry_run"] or not listen_key:
+            return
+        try:
+            self._papi_request("listenKey", "PUT", {"listenKey": listen_key})
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not keepalive Binance PM listenKey due to {e.__class__.__name__}. "
+                f"Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier
+    def delete_pm_listen_key(self, listen_key: str) -> None:
+        if not self._is_portfolio_margin() or self._config["dry_run"] or not listen_key:
+            return
+        try:
+            self._papi_request("listenKey", "DELETE", {"listenKey": listen_key})
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not delete Binance PM listenKey due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    def start_pm_user_stream(self, listen_key: str) -> None:
+        if (
+            not self._is_portfolio_margin()
+            or self._config["dry_run"]
+            or not self._pm_user_stream_enabled()
+            or not listen_key
+        ):
+            return
+
+        with self._pm_user_stream_lock:
+            if (
+                self._pm_user_stream
+                and self._pm_user_stream.listen_key == listen_key
+                and self._pm_user_stream.stats().get("running")
+            ):
+                return
+
+            if self._pm_user_stream:
+                self._pm_user_stream.stop()
+            self._pm_user_stream = BinancePMUserStream(listen_key)
+            self._pm_user_stream.start()
+
+    def stop_pm_user_stream(self) -> None:
+        with self._pm_user_stream_lock:
+            stream = self._pm_user_stream
+            self._pm_user_stream = None
+        if stream:
+            stream.stop()
+
+    def pop_pm_user_stream_events(self, max_events: int = 1000) -> list[dict[str, Any]]:
+        with self._pm_user_stream_lock:
+            stream = self._pm_user_stream
+        if not stream:
+            return []
+        return stream.pop_events(max_events)
+
+    def get_pm_user_stream_stats(self) -> dict[str, Any]:
+        with self._pm_user_stream_lock:
+            stream = self._pm_user_stream
+        if stream:
+            return stream.stats()
+        return {
+            "enabled": (
+                self._is_portfolio_margin()
+                and not self._config["dry_run"]
+                and self._pm_user_stream_enabled()
+            ),
+            "running": False,
+            "connected": False,
+            "listen_key_set": False,
+            "queued_events": 0,
+            "events_received": 0,
+            "events_dropped": 0,
+            "reconnects": 0,
+            "next_reconnect_delay": None,
+            "last_reconnect_delay": None,
+            "parse_errors": 0,
+            "last_event_type": None,
+            "last_event_time": None,
+            "last_connected_at": None,
+            "last_disconnected_at": None,
+            "last_error": None,
+        }
+
+    def close(self):
+        self.stop_pm_user_stream()
+        super().close()
 
     def get_proxy_coin(self) -> str:
         """
@@ -93,6 +603,16 @@ class Binance(Exchange):
                 self._config["stake_currency"],
             )  # type: ignore[return-value]
         return self._config["stake_currency"]
+
+    def market_is_future(self, market: dict[str, Any]) -> bool:
+        if self._is_portfolio_margin():
+            return (
+                market.get(self._ft_has["ccxt_futures_name"], False) is True
+                and market.get("type", False) == "swap"
+                and market.get("linear", False) is True
+                and market.get("settle") in {"USDT", "USDC"}
+            )
+        return super().market_is_future(market)
 
     def get_tickers(
         self,
@@ -117,7 +637,11 @@ class Binance(Exchange):
         Must be overridden in child methods if required.
         """
         try:
-            if self.trading_mode == TradingMode.FUTURES and not self._config["dry_run"]:
+            if (
+                self.trading_mode == TradingMode.FUTURES
+                and not self._config["dry_run"]
+                and not self._is_portfolio_margin()
+            ):
                 position_side = self._api.fapiPrivateGetPositionSideDual()
                 self._log_exchange_response("position_side_setting", position_side)
                 assets_margin = self._api.fapiPrivateGetMultiAssetsMargin()
@@ -145,6 +669,267 @@ class Binance(Exchange):
                 f"Error in additional_exchange_init due to {e.__class__.__name__}. Message: {e}"
             ) from e
 
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    def validate_config(self, config) -> None:
+        super().validate_config(config)
+        if not self._is_portfolio_margin():
+            return
+        self._validate_pm_risk_config(config)
+        if self.trading_mode != TradingMode.FUTURES or self.margin_mode != MarginMode.CROSS:
+            raise OperationalException(
+                "Binance Portfolio Margin requires trading_mode='futures' and margin_mode='cross'."
+            )
+        invalid_pairs = [
+            pair
+            for pair in config.get("exchange", {}).get("pair_whitelist", [])
+            if self.markets.get(pair, {}).get("inverse")
+            or self.markets.get(pair, {}).get("settle") not in {"USDT", "USDC"}
+        ]
+        if invalid_pairs:
+            raise OperationalException(
+                "This Binance PM adapter supports only USDT/USDC linear perpetual contracts. "
+                f"Blocked pairs: {', '.join(invalid_pairs)}"
+            )
+
+    def get_balances(self, params: dict | None = None) -> CcxtBalances:
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super().get_balances(params)
+        return self._get_pm_balances(params)
+
+    @retrier
+    def _get_pm_balances(self, params: dict | None = None) -> CcxtBalances:
+        try:
+            balances_raw = self._papi_request("balance", "GET", params)
+            balances: CcxtBalances = {}
+            for balance in balances_raw:
+                currency = balance.get("asset")
+                if not currency:
+                    continue
+                total = self._float_or_zero(balance.get("totalWalletBalance"))
+                free = self._float_or_zero(balance.get("crossMarginFree"))
+                used = (
+                    self._float_or_zero(balance.get("crossMarginLocked"))
+                    + self._float_or_zero(balance.get("crossMarginBorrowed"))
+                    + self._float_or_zero(balance.get("crossMarginInterest"))
+                )
+                balances[currency] = {
+                    "free": free,
+                    "used": used,
+                    "total": total,
+                }
+            self._log_exchange_response("papi_balance", balances, add_info=params)
+            return balances
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get Binance PM balance due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    def fetch_positions(
+        self, pair: str | None = None, params: dict | None = None
+    ) -> list[CcxtPosition]:
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super().fetch_positions(pair, params)
+        return self._fetch_pm_positions(pair, params)
+
+    @retrier
+    def _fetch_pm_positions(
+        self, pair: str | None = None, params: dict | None = None
+    ) -> list[CcxtPosition]:
+        try:
+            pairs = [pair] if pair else list(self.markets.keys())
+            namespaces = {
+                self._pm_namespace_for_pair(ft_pair)
+                for ft_pair in pairs
+                if ft_pair in self.markets and self.markets[ft_pair].get("swap")
+            }
+            positions: list[CcxtPosition] = []
+            for namespace in sorted(namespaces):
+                raw_positions = self._papi_request(f"{namespace}/positionRisk", "GET", params)
+                for raw_position in raw_positions:
+                    parsed = self._parse_pm_position(raw_position)
+                    if parsed and (pair is None or parsed["symbol"] == pair):
+                        positions.append(parsed)
+            self._log_exchange_response("papi_positions", positions, add_info=params)
+            return positions
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get Binance PM positions due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    def create_order(
+        self,
+        *,
+        pair: str,
+        ordertype: str,
+        side: str,
+        amount: float,
+        rate: float,
+        leverage: float,
+        time_in_force: str = "GTC",
+        reduceOnly: bool = False,
+        initial_order: bool = True,
+        entry_mode: EntryExecuteMode = "initial",
+    ) -> CcxtOrder:
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super().create_order(
+                pair=pair,
+                ordertype=ordertype,
+                side=side,
+                amount=amount,
+                rate=rate,
+                leverage=leverage,
+                time_in_force=time_in_force,
+                reduceOnly=reduceOnly,
+                initial_order=initial_order,
+                entry_mode=entry_mode,
+            )
+
+        params = self._get_params(side, ordertype, leverage, reduceOnly, time_in_force)
+        try:
+            amount_contracts = self.amount_to_precision(
+                pair, self._amount_to_contracts(pair, amount)
+            )
+            needs_price = self._order_needs_price(side, ordertype)
+            rate_for_order = self.price_to_precision(pair, rate) if needs_price else None
+            if not reduceOnly:
+                self.assert_pm_risk_allows_order(
+                    pair=pair, amount=amount, leverage=leverage, entry_mode=entry_mode
+                )
+                self._lev_prep(pair, leverage, side, accept_fail=not initial_order)
+            raw_order = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/order",
+                "POST",
+                self._pm_order_params(
+                    pair, ordertype, side, amount_contracts, rate_for_order, params
+                ),
+            )
+            self._log_exchange_response("papi_create_order", raw_order)
+            return self._order_contracts_to_amount(self._parse_pm_order(raw_order, pair))
+        except ccxt.InsufficientFunds as e:
+            raise InsufficientFundsError(
+                f"Insufficient funds to create {ordertype} {side} PM order on {pair}. "
+                f"Tried amount {amount} at rate {rate}. Message: {e}"
+            ) from e
+        except ccxt.InvalidOrder as e:
+            raise InvalidOrderException(
+                f"Could not create {ordertype} {side} PM order on {pair}. "
+                f"Tried amount {amount} at rate {rate}. Message: {e}"
+            ) from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not place Binance PM order due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier(retries=0)
+    def fetch_order(self, order_id: str, pair: str, params: dict | None = None) -> CcxtOrder:
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super().fetch_order(order_id, pair, params)
+        try:
+            request = {"symbol": self._pm_symbol_for_pair(pair), "orderId": order_id}
+            request.update(params or {})
+            raw_order = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/order", "GET", request
+            )
+            self._log_exchange_response("papi_fetch_order", raw_order)
+            return self._order_contracts_to_amount(self._parse_pm_order(raw_order, pair))
+        except ccxt.OrderNotFound as e:
+            raise TemporaryError(
+                f"Order not found (pair: {pair} id: {order_id}). Message: {e}"
+            ) from e
+        except ccxt.InvalidOrder as e:
+            raise InvalidOrderException(
+                f"Tried to get an invalid PM order (pair: {pair} id: {order_id}). Message: {e}"
+            ) from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get Binance PM order due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    def cancel_order(self, order_id: str, pair: str, params: dict | None = None) -> dict[str, Any]:
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super().cancel_order(order_id, pair, params)
+        return self._cancel_pm_order(order_id, pair, params)
+
+    @retrier
+    def _cancel_pm_order(
+        self, order_id: str, pair: str, params: dict | None = None
+    ) -> dict[str, Any]:
+        try:
+            request = {"symbol": self._pm_symbol_for_pair(pair), "orderId": order_id}
+            request.update(params or {})
+            raw_order = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/order", "DELETE", request
+            )
+            self._log_exchange_response("papi_cancel_order", raw_order)
+            return self._order_contracts_to_amount(self._parse_pm_order(raw_order, pair))
+        except ccxt.InvalidOrder as e:
+            raise InvalidOrderException(f"Could not cancel Binance PM order. Message: {e}") from e
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not cancel Binance PM order due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    def _set_leverage(
+        self,
+        leverage: float,
+        pair: str | None = None,
+        accept_fail: bool = False,
+    ):
+        if not self._is_portfolio_margin():
+            return super()._set_leverage(leverage, pair, accept_fail)
+        return self._set_pm_leverage(leverage, pair, accept_fail)
+
+    @retrier
+    def _set_pm_leverage(
+        self,
+        leverage: float,
+        pair: str | None = None,
+        accept_fail: bool = False,
+    ):
+        if self._config["dry_run"] or pair is None:
+            return
+        if self._ft_has.get("floor_leverage", False) is True:
+            leverage = int(leverage)
+        try:
+            res = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/leverage",
+                "POST",
+                {"symbol": self._pm_symbol_for_pair(pair), "leverage": leverage},
+            )
+            self._log_exchange_response("papi_set_leverage", res)
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.BadRequest, ccxt.OperationRejected, ccxt.InsufficientFunds) as e:
+            if not accept_fail:
+                raise TemporaryError(
+                    f"Could not set Binance PM leverage due to {e.__class__.__name__}. Message: {e}"
+                ) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not set Binance PM leverage due to {e.__class__.__name__}. Message: {e}"
+            ) from e
         except ccxt.BaseError as e:
             raise OperationalException(e) from e
 

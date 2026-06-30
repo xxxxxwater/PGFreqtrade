@@ -2,7 +2,7 @@
 
 import logging
 
-from freqtrade.constants import BuySell
+from freqtrade.constants import BuySell, EntryExecuteMode
 from freqtrade.exchange import Exchange
 from freqtrade.exchange.exchange_types import CcxtOrder, FtHas
 
@@ -47,6 +47,7 @@ class Kucoin(Exchange):
         time_in_force: str = "GTC",
         reduceOnly: bool = False,
         initial_order: bool = True,
+        entry_mode: EntryExecuteMode = "initial",
     ) -> CcxtOrder:
         res = super().create_order(
             pair=pair,
@@ -58,6 +59,7 @@ class Kucoin(Exchange):
             reduceOnly=reduceOnly,
             time_in_force=time_in_force,
             initial_order=initial_order,
+            entry_mode=entry_mode,
         )
         # Kucoin returns only the order-id.
         # ccxt returns status = 'closed' at the moment - which is information ccxt invented.

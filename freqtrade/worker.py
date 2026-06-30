@@ -18,6 +18,7 @@ from freqtrade.enums import RPCMessageType, State
 from freqtrade.exceptions import OperationalException, TemporaryError
 from freqtrade.exchange import timeframe_to_next_date
 from freqtrade.freqtradebot import FreqtradeBot
+from freqtrade.util import PeriodicCache
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,14 @@ class Worker:
         internals_config = self._config.get("internals", {})
         self._throttle_secs = internals_config.get("process_throttle_secs", PROCESS_THROTTLE_SECS)
         self._heartbeat_interval = internals_config.get("heartbeat_interval", 60)
+        risk_cfg = self._config.get("exchange", {}).get("portfolio_margin_risk", {})
+        heartbeat_interval = int(self._heartbeat_interval or 60)
+        heartbeat_risk_cache_seconds = int(
+            risk_cfg.get("heartbeat_risk_cache_seconds", max(heartbeat_interval, 300))
+        )
+        self._pm_heartbeat_risk_cache = PeriodicCache(
+            maxsize=1, ttl=max(heartbeat_risk_cache_seconds, 1)
+        )
 
         self._sd_notify = (
             sdnotify.SystemdNotifier()
@@ -73,12 +82,46 @@ class Worker:
             logger.debug(f"sd_notify: {message}")
             self._sd_notify.notify(message)
 
+    def _pm_cached_heartbeat_risk(self) -> dict[str, Any]:
+        cache_key = "risk"
+        if cache_key in self._pm_heartbeat_risk_cache:
+            return self._pm_heartbeat_risk_cache[cache_key]
+
+        risk = self.freqtrade.exchange.get_pm_risk_summary()
+        self._pm_heartbeat_risk_cache[cache_key] = risk
+        return risk
+
     def run(self) -> None:
         state = None
         while True:
             state = self._worker(old_state=state)
             if state == State.RELOAD_CONFIG:
                 self._reconfigure()
+
+    def _pm_heartbeat_suffix(self) -> str:
+        try:
+            if getattr(
+                self.freqtrade.exchange, "_is_portfolio_margin", lambda: False
+            )() and not self.freqtrade.config.get("dry_run", True):
+                risk = self._pm_cached_heartbeat_risk()
+                if risk.get("enabled"):
+                    stream_suffix = ""
+                    if hasattr(self.freqtrade.exchange, "get_pm_user_stream_stats"):
+                        stream = self.freqtrade.exchange.get_pm_user_stream_stats()
+                        stream_suffix = (
+                            f", stream_connected={stream.get('connected')}, "
+                            f"stream_queue={stream.get('queued_events')}, "
+                            f"stream_dropped={stream.get('events_dropped')}"
+                        )
+                    return (
+                        f", uniMMR={risk.get('uni_mmr')}, "
+                        f"equity={risk.get('account_equity')}, "
+                        f"status={risk.get('account_status')}"
+                        f"{stream_suffix}"
+                    )
+        except Exception as e:
+            logger.debug(f"PM heartbeat risk fetch failed: {e}")
+        return ""
 
     def _worker(self, old_state: State | None) -> State:
         """
@@ -135,9 +178,11 @@ class Worker:
                 strategy_version = self.freqtrade.strategy.version()
                 if strategy_version is not None:
                     version += ", strategy_version: " + strategy_version
-                logger.info(
+                heartbeat_msg = (
                     f"Bot heartbeat. PID={getpid()}, version='{version}', state='{state.name}'"
                 )
+                heartbeat_msg += self._pm_heartbeat_suffix()
+                logger.info(heartbeat_msg)
                 self._heartbeat_msg = now
 
         return state

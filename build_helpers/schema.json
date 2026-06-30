@@ -1313,6 +1313,108 @@
           "type": "integer",
           "default": 60
         },
+        "portfolio_margin": {
+          "description": "Enable Binance Portfolio Margin adapter mode. Only supported for Binance futures with cross margin and USDT/USDC linear perpetual contracts.",
+          "type": "boolean",
+          "default": false
+        },
+        "portfolio_margin_risk": {
+          "description": "Portfolio Margin risk controls.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "min_uni_mmr": {
+              "description": "Minimum Binance Portfolio Margin uniMMR required before opening new non-reduce-only orders.",
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "warning_uni_mmr": {
+              "description": "Binance Portfolio Margin uniMMR warning threshold for RPC alerts.",
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "emergency_stop_uni_mmr": {
+              "description": "Binance Portfolio Margin uniMMR threshold that force-closes all open trades and stops the bot.",
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "user_stream_enabled": {
+              "description": "Enable Binance Portfolio Margin user data stream for account and order events.",
+              "type": "boolean",
+              "default": true
+            },
+            "user_stream_health_interval_minutes": {
+              "description": "Interval in minutes for Binance Portfolio Margin user stream health monitoring.",
+              "type": "integer",
+              "minimum": 1,
+              "default": 1
+            },
+            "user_stream_queue_warning_size": {
+              "description": "Queued Binance Portfolio Margin user stream event count that triggers an RPC warning.",
+              "type": "integer",
+              "minimum": 1,
+              "default": 500
+            },
+            "user_stream_disconnected_restart_seconds": {
+              "description": "Seconds a Binance Portfolio Margin user stream may remain disconnected before the bot restarts it.",
+              "type": "integer",
+              "minimum": 1,
+              "default": 120
+            },
+            "user_stream_max_restarts_per_hour": {
+              "description": "Maximum Binance Portfolio Margin user stream restarts per rolling hour before restart attempts are suppressed.",
+              "type": "integer",
+              "minimum": 1,
+              "default": 3
+            },
+            "user_stream_recover_unmatched_orders": {
+              "description": "Run PM order recovery when a user stream order event does not match a local open order.",
+              "type": "boolean",
+              "default": true
+            },
+            "monitor_interval_minutes": {
+              "description": "Interval in minutes for scheduled Binance Portfolio Margin risk monitoring.",
+              "type": "integer",
+              "minimum": 1,
+              "default": 5
+            },
+            "order_recovery_interval_minutes": {
+              "description": "Interval in minutes for scheduled Binance Portfolio Margin order-state reconciliation.",
+              "type": "integer",
+              "minimum": 1,
+              "default": 5
+            },
+            "heartbeat_risk_cache_seconds": {
+              "description": "Minimum seconds to cache Binance Portfolio Margin account risk data used by worker heartbeat logs.",
+              "type": "integer",
+              "minimum": 1,
+              "default": 300
+            },
+            "max_leverage": {
+              "description": "Maximum leverage allowed for Binance Portfolio Margin non-reduce-only orders.",
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "max_total_notional": {
+              "description": "Maximum total notional value allowed across all open Binance Portfolio Margin positions.",
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "max_position_notional": {
+              "description": "Per-pair maximum notional value for Binance Portfolio Margin positions.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            },
+            "max_daily_loss": {
+              "description": "Maximum realized loss per UTC day before force-closing all positions and stopping the bot.",
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
         "ccxt_config": {
           "description": "CCXT configuration settings.",
           "type": "object"

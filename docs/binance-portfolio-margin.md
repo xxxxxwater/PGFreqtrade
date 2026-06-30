@@ -42,6 +42,24 @@ During market reload, the adapter skips ccxt's Binance `fetch_currencies()` boot
 PM mode. This prevents PM-only keys from failing on `GET /sapi/v1/capital/config/getall`
 with `-2015 Invalid API-key, IP, or permissions`.
 
+If `GET /papi/v1/account` itself returns `-2015`, the failure is no longer caused by
+ccxt Spot/SAPI currency bootstrap. Check the exact API key loaded by the container,
+the Binance API IP whitelist for the request IP shown in the error body, and whether
+the account is standard Portfolio Margin or Portfolio Margin Pro. This adapter uses
+standard PM PAPI endpoints for USDT/USDC UM perpetual trading.
+
+For Docker Compose deployments, set credentials through environment variables or a
+`.env` file:
+
+```bash
+BINANCE_PM_API_KEY="..."
+BINANCE_PM_API_SECRET="..."
+docker compose -f docker-compose-pm.yml up -d
+```
+
+The compose file intentionally fails fast when these variables are missing so empty
+environment variables cannot silently override the config file credentials.
+
 ## Configuration
 
 ```json

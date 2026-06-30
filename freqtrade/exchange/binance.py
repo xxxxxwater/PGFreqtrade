@@ -1,6 +1,14 @@
 """Binance exchange subclass"""
 
+import hashlib
+import hmac
+import json
 import logging
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -140,17 +148,154 @@ class Binance(Exchange):
     def _skip_fetch_currencies_on_markets_reload(self) -> bool:
         return self._is_portfolio_margin()
 
+    async def _api_reload_markets(self, reload: bool = False) -> None:
+        if not self._is_portfolio_margin():
+            return await super()._api_reload_markets(reload=reload)
+
+        async def _empty_list(*a, **kw) -> list:
+            return []
+
+        original_margin_all = getattr(self._api_async, "sapiGetMarginAllPairs", None)
+        original_margin_iso = getattr(self._api_async, "sapiGetMarginIsolatedAllPairs", None)
+        try:
+            self._api_async.sapiGetMarginAllPairs = _empty_list
+            self._api_async.sapiGetMarginIsolatedAllPairs = _empty_list
+            await super()._api_reload_markets(reload=reload)
+        except Exception:
+            if self._api_async.markets:
+                logger.warning(
+                    "PM: load_markets had errors on SAPI endpoints; "
+                    "futures markets populated successfully."
+                )
+            else:
+                raise
+        finally:
+            if original_margin_all is not None:
+                self._api_async.sapiGetMarginAllPairs = original_margin_all
+            if original_margin_iso is not None:
+                self._api_async.sapiGetMarginIsolatedAllPairs = original_margin_iso
+
     def _papi_request(
         self, path: str, method: str = "GET", params: dict[str, Any] | None = None
     ) -> Any:
         """
         Signed Binance Portfolio Margin request.
 
-        ccxt exposes Binance PAPI raw endpoints inconsistently across releases.  Using request()
-        keeps this adapter compatible with older ccxt builds while still reusing ccxt signing,
-        throttling and error mapping.
+        ccxt exposes Binance PAPI under the ``papi`` namespace (not ``papiPrivate``).
+        Use ccxt first so we keep its signing, throttling and error mapping. Keep a
+        small raw-HTTP fallback for ccxt builds where PAPI is missing or incomplete.
         """
-        return self._api.request(path, "papiPrivate", method, params or {})
+        path = self._normalize_papi_path(path)
+        method = method.upper()
+        request_params = dict(params or {})
+        try:
+            return self._api.request(path, "papi", method, request_params)
+        except (ccxt.AuthenticationError, ccxt.PermissionDenied, ccxt.OperationRejected) as e:
+            if isinstance(e, ccxt.OperationRejected) and self._extract_binance_error_code(
+                str(e)
+            ) not in {-2015, -2014}:
+                raise
+            raise self._pm_auth_exception(path, method, str(e)) from e
+        except ccxt.NotSupported:
+            return self._raw_papi_request(path, method, request_params)
+        except ccxt.BaseError:
+            raise
+
+    @staticmethod
+    def _normalize_papi_path(path: str) -> str:
+        path = path.strip().lstrip("/")
+        for prefix in ("papi/v1/", "papi/"):
+            if path.startswith(prefix):
+                path = path[len(prefix) :]
+        return path
+
+    def _raw_papi_request(self, path: str, method: str, params: dict[str, Any]) -> Any:
+        url_base = (
+            self._config.get("exchange", {})
+            .get("portfolio_margin_base_url", "https://papi.binance.com/papi/v1")
+            .rstrip("/")
+        )
+        api_key = getattr(self._api, "apiKey", "")
+        secret = getattr(self._api, "secret", "")
+        if not api_key or not secret:
+            raise OperationalException("Binance PM API key/secret not configured.")
+
+        payload = {
+            "recvWindow": self._pm_recv_window(),
+            "timestamp": int(time.time() * 1000),
+        }
+        payload.update(params)
+        query = urllib.parse.urlencode(payload)
+        signature = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        url = f"{url_base}/{path}?{query}&signature={signature}"
+        req = urllib.request.Request(  # noqa: S310 - fixed HTTPS Binance PM endpoint.
+            url, headers={"X-MBX-APIKEY": api_key}, method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
+                raw = resp.read().decode()
+                if not raw:
+                    return {}
+                return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            if e.code == 429:
+                raise TemporaryError(f"Binance PM rate limit: {body}") from e
+            if e.code in (400, 401, 403):
+                raise self._pm_auth_exception(path, method, body) from e
+            raise OperationalException(
+                f"Binance PM API error HTTP {e.code} on {method} /papi/v1/{path}: {body[:300]}"
+            ) from e
+        except urllib.error.URLError as e:
+            raise TemporaryError(f"Binance PM API network error on {method} {path}: {e}") from e
+
+    def _pm_recv_window(self) -> int:
+        return int(
+            self._config.get("exchange", {}).get(
+                "portfolio_margin_recv_window",
+                getattr(self._api, "options", {}).get("recvWindow", 10000),
+            )
+        )
+
+    def _pm_auth_exception(self, path: str, method: str, message: str) -> OperationalException:
+        code = self._extract_binance_error_code(message)
+        request_ip = self._extract_binance_request_ip(message)
+        endpoint = f"/papi/v1/{path}"
+        hints = [
+            "confirm the bot is using the intended Binance API key/secret",
+            "confirm the key is enabled for Portfolio Margin PAPI endpoints",
+            "confirm Binance API IP restrictions include this machine/container egress IP",
+            "confirm this is a standard Portfolio Margin account; PM Pro account queries use "
+            "Binance portfolio SAPI endpoints, while this adapter trades standard PM UM futures",
+            "confirm Docker Compose is not overriding exchange.key/secret with empty "
+            "FREQTRADE__EXCHANGE__KEY or FREQTRADE__EXCHANGE__SECRET values",
+        ]
+        if request_ip:
+            hints.insert(2, f"Binance saw request IP {request_ip}")
+        code_part = f" code {code}" if code is not None else ""
+        return OperationalException(
+            f"Binance PM authentication failed on {method} {endpoint}{code_part}: "
+            f"{message[:300]}. Checks: {'; '.join(hints)}."
+        )
+
+    @staticmethod
+    def _extract_binance_error_code(message: str) -> int | None:
+        try:
+            body = json.loads(message)
+            code = body.get("code")
+            return int(code) if code is not None else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            match = re.search(r'"code"\s*:\s*(-?\d+)|code(?:=|:)\s*(-?\d+)', message)
+            if not match:
+                return None
+            return int(next(group for group in match.groups() if group is not None))
+
+    @staticmethod
+    def _extract_binance_request_ip(message: str) -> str | None:
+        match = re.search(r"request ip:\s*([0-9a-fA-F:.]+)", message)
+        if match:
+            return match.group(1)
+        return None
 
     def _pm_namespace_for_pair(self, pair: str) -> str:
         return "um"
@@ -1165,7 +1310,7 @@ class Binance(Exchange):
 
     def load_leverage_tiers(self) -> dict[str, list[dict]]:
         if self.trading_mode == TradingMode.FUTURES:
-            if self._config["dry_run"]:
+            if self._config["dry_run"] or self._is_portfolio_margin():
                 leverage_tiers_path = Path(__file__).parent / "binance_leverage_tiers.json"
                 with leverage_tiers_path.open() as json_file:
                     return json_load(json_file)

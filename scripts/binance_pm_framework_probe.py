@@ -20,6 +20,11 @@ from pathlib import Path
 from typing import Any
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
 class FrameworkProbeError(RuntimeError):
     pass
 
@@ -55,8 +60,11 @@ def nonzero_positions(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def build_config(args: argparse.Namespace) -> dict[str, Any]:
+    from freqtrade.enums import RunMode
+
     return {
         "dry_run": False,
+        "runmode": RunMode.LIVE,
         "trading_mode": "futures",
         "margin_mode": "cross",
         "stake_currency": args.stake_currency,
@@ -83,6 +91,7 @@ def build_config(args: argparse.Namespace) -> dict[str, Any]:
 
 def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     try:
+        from freqtrade.exceptions import OperationalException, TemporaryError
         from freqtrade.exchange.binance import Binance
     except ModuleNotFoundError as exc:
         raise FrameworkProbeError(
@@ -90,7 +99,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "Install project requirements before running this framework probe."
         ) from exc
 
-    exchange = Binance(build_config(args), validate=False, load_leverage_tiers=False)
+    try:
+        exchange = Binance(build_config(args), validate=False, load_leverage_tiers=False)
+    except (OperationalException, TemporaryError) as exc:
+        raise FrameworkProbeError(str(exc)) from exc
+
     try:
         result: dict[str, Any] = {
             "adapter": "freqtrade.exchange.binance.Binance",
@@ -136,6 +149,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             result["assert_risk_allows_order"] = True
 
         return result
+    except (OperationalException, TemporaryError) as exc:
+        raise FrameworkProbeError(str(exc)) from exc
     finally:
         exchange.close()
 

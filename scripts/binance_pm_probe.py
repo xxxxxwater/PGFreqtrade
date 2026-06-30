@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -51,6 +52,29 @@ def sign_params(secret: str, params: dict[str, Any]) -> str:
     return f"{query}&signature={signature}"
 
 
+def _request_ip_from_body(body: str) -> str | None:
+    match = re.search(r"request ip:\s*([0-9a-fA-F:.]+)", body)
+    return match.group(1) if match else None
+
+
+def _format_http_error(path: str, method: str, status: int, body: str) -> ProbeError:
+    hints: list[str] = []
+    if status in (401, 403) or '"code":-2015' in body or '"code": -2015' in body:
+        request_ip = _request_ip_from_body(body)
+        if request_ip:
+            hints.append(f"Binance saw request IP {request_ip}; verify API IP whitelist.")
+        hints.extend(
+            [
+                "verify this exact key/secret pair is loaded",
+                "verify Portfolio Margin/PAPI permission is enabled for this key",
+                "verify this is a standard Portfolio Margin account for /papi/v1/*; "
+                "Portfolio Margin Pro account queries use Binance portfolio SAPI endpoints",
+            ]
+        )
+    suffix = f" Checks: {'; '.join(hints)}." if hints else ""
+    return ProbeError(f"{path} {method} failed with HTTP {status}: {body}{suffix}")
+
+
 def signed_get(path: str, params: dict[str, Any] | None = None) -> Any:
     api_key = env_required("BINANCE_PM_API_KEY")
     secret = env_required("BINANCE_PM_API_SECRET")
@@ -70,7 +94,7 @@ def signed_get(path: str, params: dict[str, Any] | None = None) -> Any:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")
-        raise ProbeError(f"{path} failed with HTTP {exc.code}: {body}") from exc
+        raise _format_http_error(path, "GET", exc.code, body) from exc
     except urllib.error.URLError as exc:
         raise ProbeError(f"{path} failed: {exc}") from exc
 
@@ -94,7 +118,7 @@ def signed_post(path: str, params: dict[str, Any] | None = None) -> Any:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")
-        raise ProbeError(f"{path} POST failed with HTTP {exc.code}: {body}") from exc
+        raise _format_http_error(path, "POST", exc.code, body) from exc
     except urllib.error.URLError as exc:
         raise ProbeError(f"{path} POST failed: {exc}") from exc
 
@@ -118,7 +142,7 @@ def signed_put(path: str, params: dict[str, Any] | None = None) -> Any:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")
-        raise ProbeError(f"{path} PUT failed with HTTP {exc.code}: {body}") from exc
+        raise _format_http_error(path, "PUT", exc.code, body) from exc
     except urllib.error.URLError as exc:
         raise ProbeError(f"{path} PUT failed: {exc}") from exc
 
@@ -142,7 +166,7 @@ def signed_delete(path: str, params: dict[str, Any] | None = None) -> Any:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")
-        raise ProbeError(f"{path} DELETE failed with HTTP {exc.code}: {body}") from exc
+        raise _format_http_error(path, "DELETE", exc.code, body) from exc
     except urllib.error.URLError as exc:
         raise ProbeError(f"{path} DELETE failed: {exc}") from exc
 

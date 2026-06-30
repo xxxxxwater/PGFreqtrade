@@ -2,6 +2,7 @@ import asyncio
 from threading import RLock
 from unittest.mock import MagicMock
 
+import ccxt
 import pytest
 
 from freqtrade.exceptions import OperationalException
@@ -149,3 +150,65 @@ def test_non_pm_reload_markets_keeps_ccxt_fetch_currencies():
 
     assert exchange._api_async.fetch_currencies_values == [True]
     assert exchange._api_async.has["fetchCurrencies"] is True
+
+
+def test_pm_papi_request_uses_ccxt_papi_namespace():
+    exchange = Binance.__new__(Binance)
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._config = {"exchange": {}}
+    exchange._api = MagicMock()
+    exchange._api.request.return_value = {"accountStatus": "NORMAL"}
+
+    assert exchange._papi_request("account", "GET") == {"accountStatus": "NORMAL"}
+
+    exchange._api.request.assert_called_once_with("account", "papi", "GET", {})
+
+
+def test_pm_papi_request_normalizes_full_path():
+    exchange = Binance.__new__(Binance)
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._config = {"exchange": {}}
+    exchange._api = MagicMock()
+    exchange._api.request.return_value = []
+
+    exchange._papi_request("/papi/v1/um/positionRisk", "GET", {"symbol": "BTCUSDT"})
+
+    exchange._api.request.assert_called_once_with(
+        "um/positionRisk", "papi", "GET", {"symbol": "BTCUSDT"}
+    )
+
+
+def test_pm_papi_auth_error_includes_request_ip_hint():
+    exchange = Binance.__new__(Binance)
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._config = {"exchange": {}}
+    exchange._api = MagicMock()
+    exchange._api.request.side_effect = ccxt.AuthenticationError(
+        'binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action, '
+        'request ip: 43.212.29.197"}'
+    )
+
+    with pytest.raises(OperationalException, match=r"43\.212\.29\.197"):
+        exchange._papi_request("account", "GET")
+
+
+def test_pm_papi_operation_rejected_auth_error_is_not_retried():
+    exchange = Binance.__new__(Binance)
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._config = {"exchange": {}}
+    exchange._api = MagicMock()
+    exchange._api.request.side_effect = ccxt.OperationRejected(
+        'binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action, '
+        'request ip: 43.212.29.197"}'
+    )
+
+    with pytest.raises(OperationalException, match="Binance PM authentication failed"):
+        exchange._papi_request("account", "GET")

@@ -1,3 +1,4 @@
+import asyncio
 from threading import RLock
 from unittest.mock import MagicMock
 
@@ -106,3 +107,45 @@ def test_pm_risk_config_rejects_unknown_keys():
         exchange._validate_pm_risk_config(
             {"exchange": {"portfolio_margin_risk": {"min_unimmr": 1.5}}}
         )
+
+
+class _MarketsApi:
+    def __init__(self) -> None:
+        self.has = {"fetchCurrencies": True}
+        self.session = None
+        self.fetch_currencies_values: list[bool] = []
+
+    async def load_markets(self, reload=False, params=None):
+        self.fetch_currencies_values.append(self.has["fetchCurrencies"])
+        return {}
+
+    async def close(self):
+        return None
+
+
+def test_pm_reload_markets_skips_ccxt_fetch_currencies():
+    exchange = Binance.__new__(Binance)
+    exchange._portfolio_margin = True
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._api_async = _MarketsApi()
+
+    asyncio.run(exchange._api_reload_markets(reload=True))
+
+    assert exchange._api_async.fetch_currencies_values == [False]
+    assert exchange._api_async.has["fetchCurrencies"] is True
+
+
+def test_non_pm_reload_markets_keeps_ccxt_fetch_currencies():
+    exchange = Binance.__new__(Binance)
+    exchange._portfolio_margin = False
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._api_async = _MarketsApi()
+
+    asyncio.run(exchange._api_reload_markets(reload=True))
+
+    assert exchange._api_async.fetch_currencies_values == [True]
+    assert exchange._api_async.has["fetchCurrencies"] is True

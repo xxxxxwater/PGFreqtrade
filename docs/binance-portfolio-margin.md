@@ -32,6 +32,16 @@ Not supported:
 - Treating USDT/USDC contracts as BTC/ETH-settled contracts
 - Automatic collateral transfer or borrowing workflows
 
+## API Key Permissions
+
+PM mode is designed to work with Binance API keys that are enabled for Portfolio Margin
+PAPI endpoints. Spot/SAPI permissions are not required for the USDT/USDC perpetual
+workflow documented here.
+
+During market reload, the adapter skips ccxt's Binance `fetch_currencies()` bootstrap in
+PM mode. This prevents PM-only keys from failing on `GET /sapi/v1/capital/config/getall`
+with `-2015 Invalid API-key, IP, or permissions`.
+
 ## Configuration
 
 ```json

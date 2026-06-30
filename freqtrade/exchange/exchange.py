@@ -665,8 +665,16 @@ class Exchange:
         if self._exchange_ws:
             self._exchange_ws.reset_connections()
 
+    def _skip_fetch_currencies_on_markets_reload(self) -> bool:
+        return False
+
     async def _api_reload_markets(self, reload: bool = False) -> None:
+        original_fetch_currencies = None
+        skip_fetch_currencies = self._skip_fetch_currencies_on_markets_reload()
         try:
+            if skip_fetch_currencies:
+                original_fetch_currencies = self._api_async.has.get("fetchCurrencies")
+                self._api_async.has["fetchCurrencies"] = False
             await self._api_async.load_markets(reload=reload, params={})
         except ccxt.DDoSProtection as e:
             raise DDosProtection(e) from e
@@ -676,6 +684,12 @@ class Exchange:
             ) from e
         except ccxt.BaseError as e:
             raise TemporaryError(e) from e
+        finally:
+            if skip_fetch_currencies:
+                if original_fetch_currencies is None:
+                    self._api_async.has.pop("fetchCurrencies", None)
+                else:
+                    self._api_async.has["fetchCurrencies"] = original_fetch_currencies
 
     def _load_async_markets(self, reload: bool = False) -> None:
         try:

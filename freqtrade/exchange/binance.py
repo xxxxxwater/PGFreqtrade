@@ -137,6 +137,9 @@ class Binance(Exchange):
     def _is_portfolio_margin(self) -> bool:
         return bool(getattr(self, "_portfolio_margin", False))
 
+    def _skip_fetch_currencies_on_markets_reload(self) -> bool:
+        return self._is_portfolio_margin()
+
     def _papi_request(
         self, path: str, method: str = "GET", params: dict[str, Any] | None = None
     ) -> Any:

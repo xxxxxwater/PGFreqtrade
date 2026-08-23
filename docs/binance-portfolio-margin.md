@@ -406,6 +406,10 @@ and not recommended as the only copy for a live bot. Recommended:
   python scripts/backup_db.py --db-url sqlite:///user_data/tradesv3.sqlite \
       --backup-dir user_data/backups --keep 7
   ```
+  The backup is a full database copy and therefore includes the
+  `pm_order_intents` table. After a restore, unresolved intents (PENDING/UNKNOWN)
+  are re-resolved against the exchange at startup via the same client id - a
+  restore can never cause a duplicate order.
 - **PostgreSQL (recommended for live):** migrate once, then run with `--db-url`:
   ```bash
   freqtrade convert-db --db-url sqlite:///user_data/tradesv3.sqlite \
@@ -413,9 +417,49 @@ and not recommended as the only copy for a live bot. Recommended:
   # consistent dumps:
   pg_dump 'postgresql://user:pass@localhost:5432/freqtrade' > backup.sql
   ```
+  `pg_dump` includes `pm_order_intents` (same database). The unique
+  `client_id` constraint is enforced by PostgreSQL, so a duplicate intent can
+  never be inserted even under a concurrent retry.
+- **Fail-closed behavior:** if the database becomes unreadable/unwritable at any
+  time, exposure-increasing orders are refused, the bot pauses/blocks with an
+  `intent_store_unavailable` alert, and live startup fails when no `db_url` is
+  configured (live PM never runs without database persistence).
 - Keep a kill-switch: a separate process/alert that can stop the bot container
   independently of the bot's own risk checks (e.g. `docker stop freqtrade-pm`),
   since RPC notifications are best-effort and must never be the only emergency path.
+
+## Production Deployment (PostgreSQL stack)
+
+`docker-compose-pm-prod.yml` provides the production stack:
+
+| Concern | Implementation |
+|---------|----------------|
+| Database | PostgreSQL 17 with healthcheck + persistent volume. Live PM refuses to start without a database (`db_url` check) and fails closed when the intent store is unreadable. |
+| Single instance | The bot entrypoint runs `scripts/pm_single_instance.py` before `freqtrade trade`. A second process against the same account/database exits with code 1 (cross-platform file lock). |
+| Auto restart | `restart: unless-stopped` on db, bot and backup services. |
+| Log rotation | Docker `json-file` driver with `max-size`/`max-file` caps (bot: 10m × 10; db/backup: capped). |
+| Database backup | Hourly `pg_dump` sidecar with rotation (10 kept) into `user_data/backups`. Restore: `psql -f user_data/backups/pg_<stamp>.sql`. Backups include `pm_order_intents`. |
+| NTP | Run chrony/systemd-timesynced on the host; `/etc/localtime` is mounted read-only into the bot container (PAPI `recvWindow` and intent timestamps depend on clock accuracy). |
+| API key IP whitelist | Configure on Binance (API Management) to the fixed public egress IP of this host. The bot refuses to start when the key is rejected (`-2015`) and prints the request IP hint. |
+| Secrets | `.env` (git-ignored) holds `BINANCE_PM_API_KEY`/`SECRET` and `PG_PASSWORD`; `.env.pm.example` is the template. freqtrade redacts exchange.key/secret from `/show_config` and logs - never paste secrets into Telegram. |
+
+Bring-up:
+
+```bash
+cp .env.pm.example .env          # fill secrets + PG_PASSWORD
+cp user_data/config_pm_live.example.json user_data/config_pm_live.json
+docker compose -f docker-compose-pm-prod.yml --env-file .env up -d
+docker compose -f docker-compose-pm-prod.yml logs -f freqtrade-pm
+```
+
+Pre-flight before live (fail-fast checks built into startup):
+
+```bash
+# credentials + risk config + db_url + stake_currency + account type are
+# validated at startup; the bot refuses to start when any is missing.
+freqtrade trade --config user_data/config_pm_live.json --strategy BtcUsdtPmStrategy  # dry-run
+curl -s http://127.0.0.1:8080/api/v1/ping && curl -s http://127.0.0.1:8080/api/v1/health
+```
 
 ## Production Notes
 

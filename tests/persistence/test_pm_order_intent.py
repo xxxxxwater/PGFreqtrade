@@ -6,7 +6,6 @@ unique client_id constraint, backup/restore round-trips and the fail-closed
 behavior when the store is unavailable.
 """
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,7 +22,10 @@ def intent_count() -> int:
 
 def test_init_db_creates_pm_order_intents_table(default_conf):
     init_db(default_conf["db_url"])
-    assert PMOrderIntent.__tablename__ in inspect(PMOrderIntent.session.get_bind()).get_table_names()
+    assert (
+        PMOrderIntent.__tablename__
+        in inspect(PMOrderIntent.session.get_bind()).get_table_names()
+    )
 
 
 @pytest.mark.usefixtures("init_persistence")
@@ -322,3 +324,166 @@ def test_live_pm_with_db_url_passes_credential_gate(mocker):
         exchange.validate_config(config)
     except OperationalException as e:
         assert "persistent database" not in str(e)
+
+
+# ---------------------------------------------------------------------------
+# Readonly / corrupted database fail-closed behavior
+# ---------------------------------------------------------------------------
+
+
+def test_readonly_db_blocks_intent_write(tmp_path):
+    """
+    A read-only SQLite database must make intent writes fail, so the order POST
+    is refused (fail-closed). Verified with a real read-only SQLite connection.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    db_file = tmp_path / "readonly.sqlite"
+    engine = create_engine(f"sqlite:///{db_file}")
+    PMOrderIntent.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        session.add(
+            PMOrderIntent(
+                client_id="ft-ro",
+                kind="order",
+                pair="BTC/USDT:USDT",
+                reduce_only=False,
+                state="PENDING",
+            )
+        )
+        session.commit()
+
+    # Open the SAME database read-only.
+    ro_engine = create_engine(f"sqlite:///file:{db_file}?mode=ro", future=True)
+    ro_session = sessionmaker(bind=ro_engine)()
+    try:
+        ro_session.add(
+            PMOrderIntent(
+                client_id="ft-ro-2",
+                kind="order",
+                pair="BTC/USDT:USDT",
+                reduce_only=False,
+                state="PENDING",
+            )
+        )
+        from sqlalchemy.exc import DatabaseError
+
+        with pytest.raises(DatabaseError):
+            ro_session.commit()
+    finally:
+        ro_session.close()
+
+
+def test_corrupted_db_read_fails_closed(tmp_path):
+    """
+    A corrupted (non-SQLite) database file must surface read errors, which the
+    intent gate treats as unresolved (block) - never as "no intents".
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.exc import DatabaseError
+    from sqlalchemy.orm import sessionmaker
+
+    db_file = tmp_path / "corrupted.sqlite"
+    db_file.write_text("this is not a sqlite database at all" * 10)
+
+    engine = create_engine(f"sqlite:///{db_file}")
+    PMOrderIntent.session = sessionmaker(bind=engine)()
+
+    with pytest.raises(DatabaseError):
+        PMOrderIntent.has_unresolved()
+
+    # The exchange-level gate must translate store errors into "unresolved" (block).
+    from threading import RLock
+
+    exchange = Binance.__new__(Binance)
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    exchange._exchange_ws = None
+    exchange._api_async = None
+    exchange._ws_async = None
+    exchange.loop = None
+    assert exchange.pm_has_unresolved_intents() is True
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL DDL / optional integration
+# ---------------------------------------------------------------------------
+
+
+def test_postgresql_ddl_has_unique_client_id():
+    """
+    The PostgreSQL DDL for pm_order_intents must enforce a UNIQUE client_id.
+
+    SQLAlchemy renders ``unique=True + index=True`` as a standalone
+    ``CREATE UNIQUE INDEX`` on client_id - verified without a server.
+    """
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateIndex, CreateTable
+
+    ddl = str(
+        CreateTable(PMOrderIntent.__table__).compile(dialect=postgresql.dialect())
+    ).upper()
+    assert "PM_ORDER_INTENTS" in ddl
+    assert "CLIENT_ID" in ddl
+    assert "REDUCE_ONLY" in ddl
+
+    index_ddls = [
+        str(CreateIndex(idx).compile(dialect=postgresql.dialect())).upper()
+        for idx in PMOrderIntent.__table__.indexes
+    ]
+    assert any(
+        "UNIQUE" in ddl_stmt and "CLIENT_ID" in ddl_stmt for ddl_stmt in index_ddls
+    ), "PostgreSQL must enforce the unique client_id constraint via a UNIQUE index"
+
+
+@pytest.mark.skipif(
+    not __import__("os").environ.get("FREQTRADE_TEST_PG_URL"),
+    reason="Set FREQTRADE_TEST_PG_URL to a scratch PostgreSQL URL to run this integration test",
+)
+def test_postgresql_init_and_unique_constraint(tmp_path):
+    """
+    Real PostgreSQL integration (opt-in): init_db creates pm_order_intents, the
+    unique client_id constraint is enforced by the server, and data survives a
+    second init_db on the same URL.
+    """
+    import os
+
+    pg_url = os.environ["FREQTRADE_TEST_PG_URL"]
+    pytest.importorskip("psycopg2")
+
+    init_db(pg_url)
+    names = inspect(PMOrderIntent.session.get_bind()).get_table_names()
+    assert "pm_order_intents" in names
+
+    PMOrderIntent.session.add(
+        PMOrderIntent(
+            client_id=f"ft-pg-{__import__('uuid').uuid4().hex[:8]}",
+            kind="order",
+            pair="BTC/USDT:USDT",
+            reduce_only=False,
+            state="PENDING",
+        )
+    )
+    PMOrderIntent.session.commit()
+
+    from sqlalchemy.exc import IntegrityError
+
+    row = PMOrderIntent.get_unresolved()[0]
+    PMOrderIntent.session.add(
+        PMOrderIntent(
+            client_id=row.client_id,  # duplicate
+            kind="order",
+            pair="ETH/USDT:USDT",
+            reduce_only=False,
+            state="PENDING",
+        )
+    )
+    with pytest.raises(IntegrityError):
+        PMOrderIntent.session.commit()
+    PMOrderIntent.session.rollback()
+
+    # Second init on the same URL keeps data intact.
+    init_db(pg_url)
+    assert len(PMOrderIntent.get_unresolved()) == 1

@@ -1,0 +1,105 @@
+---
+# PRODUCTION deployment for Binance Standard Portfolio Margin (USDT/USDC UM).
+#
+# Stack:
+#   db            - PostgreSQL 17 (the ONLY supported live PM database).
+#   freqtrade-pm  - the bot. Fails fast without keys/secret; single-instance
+#                   lock prevents two bots on the same account/database.
+#   backup        - hourly pg_dump sidecar with rotation (10 kept).
+#
+# Single-instance lock: the bot entrypoint runs scripts/pm_single_instance.py
+# first; a second container/process can never place orders on the same account.
+#
+# Log rotation: the bot uses the Docker json-file driver with size/count caps.
+# NTP: run chrony/systemd-timesyncd on the HOST and mount /etc/localtime
+# read-only; the bot timestamps (recvWindow, intent created_at) depend on it.
+#
+# API key IP whitelist: configure on Binance (API Management) to the FIXED
+# public egress IP of this host. Never commit secrets: values come from .env
+# (git-ignored); .env.pm.example is the documented template.
+#
+# Secrets hygiene: exchange keys and Telegram tokens are passed ONLY through
+# environment variables. freqtrade redacts exchange.key/secret from /show_config
+# and logs; do not echo them in Telegram commands.
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-freqtrade}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?Set PG_PASSWORD in .env}
+      POSTGRES_DB: ${PG_DB:-freqtrade}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-freqtrade} -d ${PG_DB:-freqtrade}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  freqtrade-pm:
+    image: pgresearchchris/pgfreqtrade:pm-binance
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - "./user_data:/freqtrade/user_data"
+      - "/etc/localtime:/etc/localtime:ro"  # NTP-synced host clock
+    environment:
+      - FREQTRADE__EXCHANGE__KEY=${BINANCE_PM_API_KEY:?Set BINANCE_PM_API_KEY in .env}
+      - FREQTRADE__EXCHANGE__SECRET=${BINANCE_PM_API_SECRET:?Set BINANCE_PM_API_SECRET in .env}
+    # Single-instance gate FIRST, then the bot.
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "python /freqtrade/scripts/pm_single_instance.py
+      --lock-file /freqtrade/user_data/.pm_instance.lock
+      --exec freqtrade trade
+      --logfile /freqtrade/user_data/logs/freqtrade.log
+      --db-url postgresql://${PG_USER:-freqtrade}:${PG_PASSWORD}@db:5432/${PG_DB:-freqtrade}
+      --config /freqtrade/user_data/config_pm_live.json
+      --strategy BtcUsdtPmStrategy"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "10"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  backup:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${PG_PASSWORD:?Set PG_PASSWORD in .env}
+    volumes:
+      - ./user_data/backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "while true; do
+        STAMP=$$(date -u +%Y%m%dT%H%M%SZ);
+        pg_dump -h db -U ${PG_USER:-freqtrade} -d ${PG_DB:-freqtrade} > /backups/pg_$$STAMP.sql \
+          && ls -1t /backups/pg_*.sql | tail -n +11 | xargs -r rm -f;
+        sleep 3600;
+      done"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  pgdata:

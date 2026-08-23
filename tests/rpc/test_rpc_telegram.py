@@ -1605,6 +1605,8 @@ async def test_force_exit_no_pair(default_conf, update, ticker, fee, mocker) -> 
     assert keyboard[1][0].callback_data == "force_exit__2 "
     update = MagicMock()
     update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = 1235
+    update.effective_user.id = 5432
     update.callback_query.data = keyboard[1][0].callback_data
     await telegram._force_exit_inline(update, None)
     assert update.callback_query.answer.call_count == 1
@@ -1685,18 +1687,95 @@ async def test_force_enter_no_pair(default_conf, update, mocker) -> None:
     assert reduce(lambda acc, x: acc + len(x), keyboard, 0) == 5
     update = MagicMock()
     update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = 1235
+    update.effective_user.id = 5432
     update.callback_query.data = "force_enter__XRP/USDT_||_long"
     await telegram._force_enter_inline(update, None)
     assert fbuy_mock.call_count == 1
 
     fbuy_mock.reset_mock()
     update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = 1235
+    update.effective_user.id = 5432
     update.callback_query.data = "force_enter__cancel"
     await telegram._force_enter_inline(update, None)
     assert fbuy_mock.call_count == 0
     query = update.callback_query
     assert query.edit_message_text.call_count == 1
     assert query.edit_message_text.call_args_list[-1][1]["text"] == "Force enter canceled."
+
+
+async def test_force_exit_inline_unauthorized_chat(default_conf, mocker) -> None:
+    """
+    Unauthorized chat clicking the force-exit inline button must be rejected and
+    must not call the RPC force-exit.
+    """
+    femock = mocker.patch("freqtrade.rpc.rpc.RPC._rpc_force_exit")
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf)
+
+    update = MagicMock()
+    update.callback_query = AsyncMock()
+    # chat_id 999 does not match configured chat_id 1235
+    update.callback_query.message.chat_id = 999
+    update.effective_user.id = 5432
+    update.callback_query.data = "force_exit__1 "
+    await telegram._force_exit_inline(update, None)
+    assert femock.call_count == 0
+    assert update.callback_query.answer.call_count == 0
+
+
+async def test_force_exit_inline_unauthorized_user(default_conf, mocker) -> None:
+    """
+    A user not listed in authorized_users clicking the force-exit inline button
+    must be rejected and must not call the RPC force-exit.
+    """
+    default_conf["telegram"]["authorized_users"] = ["1234"]
+    femock = mocker.patch("freqtrade.rpc.rpc.RPC._rpc_force_exit")
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf)
+
+    update = MagicMock()
+    update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = 1235
+    # 5432 is not in authorized_users ["1234"]
+    update.effective_user.id = 5432
+    update.callback_query.data = "force_exit__1 "
+    await telegram._force_exit_inline(update, None)
+    assert femock.call_count == 0
+
+
+async def test_force_enter_inline_unauthorized_chat(default_conf, mocker) -> None:
+    """
+    Unauthorized chat clicking the force-enter inline button must be rejected and
+    must not call the RPC force-entry.
+    """
+    fbuy_mock = mocker.patch("freqtrade.rpc.rpc.RPC._rpc_force_entry")
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf)
+
+    update = MagicMock()
+    update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = 999
+    update.effective_user.id = 5432
+    update.callback_query.data = "force_enter__XRP/USDT_||_long"
+    await telegram._force_enter_inline(update, None)
+    assert fbuy_mock.call_count == 0
+
+
+async def test_force_enter_inline_unauthorized_user(default_conf, mocker) -> None:
+    """
+    A user not listed in authorized_users clicking the force-enter inline button
+    must be rejected and must not call the RPC force-entry.
+    """
+    default_conf["telegram"]["authorized_users"] = ["1234"]
+    fbuy_mock = mocker.patch("freqtrade.rpc.rpc.RPC._rpc_force_entry")
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf)
+
+    update = MagicMock()
+    update.callback_query = AsyncMock()
+    update.callback_query.message.chat_id = 1235
+    update.effective_user.id = 5432
+    update.callback_query.data = "force_enter__XRP/USDT_||_long"
+    await telegram._force_enter_inline(update, None)
+    assert fbuy_mock.call_count == 0
 
 
 async def test_telegram_performance_handle(default_conf_usdt, update, ticker, fee, mocker) -> None:
@@ -3065,3 +3144,31 @@ async def test__tg_info(default_conf_usdt, mocker, update):
     content = context.bot.send_message.call_args[1]["text"]
     assert "Freqtrade Bot Info:\n" in content
     assert '"chat_id": "1235"' in content
+
+
+async def test_pm_close_requires_confirm(default_conf_usdt, mocker, update):
+    """pm_close must not market-close without the explicit CONFIRM token."""
+    (telegram, ftbot, msg_mock) = get_telegram_testobject(mocker, default_conf_usdt)
+    close_mock = mocker.patch("freqtrade.rpc.rpc.RPC._rpc_pm_close", return_value={"result": "ok"})
+
+    context = MagicMock()
+    context.args = ["all"]
+    await telegram._pm_close(update=update, context=context)
+
+    # No CONFIRM -> no close executed, a confirmation prompt is sent instead.
+    close_mock.assert_not_called()
+    assert msg_mock.call_count == 1
+    assert "CONFIRM" in msg_mock.call_args[0][0]
+
+
+async def test_pm_close_executes_with_confirm(default_conf_usdt, mocker, update):
+    """pm_close with CONFIRM executes the market close."""
+    (telegram, ftbot, msg_mock) = get_telegram_testobject(mocker, default_conf_usdt)
+    close_mock = mocker.patch("freqtrade.rpc.rpc.RPC._rpc_pm_close", return_value={"result": "ok"})
+
+    context = MagicMock()
+    context.args = ["all", "CONFIRM"]
+    await telegram._pm_close(update=update, context=context)
+
+    close_mock.assert_called_once()
+    assert close_mock.call_args[0][0] == "all"

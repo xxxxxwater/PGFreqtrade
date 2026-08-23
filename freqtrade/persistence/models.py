@@ -19,6 +19,7 @@ from freqtrade.persistence.custom_data import _CustomData
 from freqtrade.persistence.key_value_store import _KeyValueStoreModel
 from freqtrade.persistence.migrations import check_migrate
 from freqtrade.persistence.pairlock import PairLock
+from freqtrade.persistence.pm_order_intent import PMOrderIntent
 from freqtrade.persistence.trade_model import Order, Trade
 
 
@@ -88,6 +89,7 @@ def init_db(db_url: str) -> None:
     Order.session = Trade.session
     PairLock.session = Trade.session
     _KeyValueStoreModel.session = Trade.session
+    PMOrderIntent.session = Trade.session
     _CustomData.session = scoped_session(
         sessionmaker(bind=engine, autoflush=True), scopefunc=get_request_or_thread_id
     )

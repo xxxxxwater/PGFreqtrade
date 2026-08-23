@@ -607,3 +607,45 @@ def test_dry_run_wallet_initialization(mocker, default_conf_usdt, config, wallet
             pytest.approx(freqtrade.wallets._wallets[stake_currency].free)
             == wallets[stake_currency]["free"] - 100.0
         )
+
+
+def test_wallets_pm_collateral_haircut(mocker, default_conf_usdt):
+    """PM_COLLATERAL_HAIRCUT derives stake from PAPI available balance * haircut."""
+    from freqtrade.wallets import Wallets
+
+    conf = default_conf_usdt.copy()
+    conf["stake_currency"] = "USDT"
+    conf["exchange"] = conf["exchange"].copy()
+    conf["exchange"]["portfolio_margin_risk"] = {
+        "wallet_mode": "PM_COLLATERAL_HAIRCUT",
+        "collateral_haircut": 0.8,
+    }
+
+    exchange = MagicMock()
+    exchange.get_proxy_coin.return_value = "USDT"
+    exchange._is_portfolio_margin.return_value = True
+    exchange.get_pm_risk_summary.return_value = {"enabled": True, "available_balance": 100.0}
+
+    wallets = Wallets(conf, exchange)
+
+    assert wallets.get_free("USDT") == 80.0
+
+
+def test_wallets_pm_usdt_only_falls_back_to_free_balance(mocker, default_conf_usdt):
+    """USDT_ONLY (default) must never convert PM collateral into available stake."""
+    from freqtrade.wallets import Wallets
+
+    conf = default_conf_usdt.copy()
+    conf["stake_currency"] = "USDT"
+    conf["exchange"] = conf["exchange"].copy()
+    conf["exchange"]["portfolio_margin_risk"] = {"wallet_mode": "USDT_ONLY"}
+
+    exchange = MagicMock()
+    exchange.get_proxy_coin.return_value = "USDT"
+    exchange._is_portfolio_margin.return_value = True
+    exchange.get_pm_risk_summary.return_value = {"enabled": True, "available_balance": 100.0}
+
+    wallets = Wallets(conf, exchange)
+
+    # USDT_ONLY mode must not use the PAPI available balance.
+    assert wallets._get_pm_available_stake() is None

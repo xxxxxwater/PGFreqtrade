@@ -295,18 +295,52 @@ class ApiServer(RPCHandler):
                 "e.g 127.0.0.1 in config.json"
             )
 
-        if not self._config["api_server"].get("password"):
+        jwt_secret = self._config["api_server"].get("jwt_secret_key", "")
+        password = self._config["api_server"].get("password", "")
+        cors_origins = self._config["api_server"].get("CORS_origins", []) or []
+
+        default_jwt_secrets = {
+            "super-secret",
+            "somethingrandom",
+            "super-secret, somethingrandom",
+            "CHANGE_ME_AT_LEAST_32_CHARS_RANDOM",
+        }
+        weak_passwords = {"CHANGE_ME", "password", "changeme", "admin", "freqtrade"}
+        problems: list[str] = []
+        if not jwt_secret or jwt_secret in default_jwt_secrets:
+            problems.append("jwt_secret_key is empty/default")
+        elif len(jwt_secret) < 32:
+            problems.append("jwt_secret_key is shorter than 32 characters")
+        if not password or password in weak_passwords:
+            problems.append("password is empty/default")
+        if "*" in cors_origins:
+            problems.append("CORS_origins contains wildcard '*'")
+
+        is_live = not self._config.get("dry_run", True)
+
+        # Fail-closed for live trading: refuse insecure API configuration.
+        if problems and is_live:
+            raise OperationalException(
+                "SECURITY - api_server config is insecure: "
+                + "; ".join(problems)
+                + ". Refusing to start. Set a strong random jwt_secret_key (>= 32 chars), "
+                "a password, loopback listen address and explicit (non-wildcard) CORS origins."
+            )
+
+        if not password:
             logger.warning(
                 "SECURITY WARNING - No password for local REST Server defined. "
                 "Please make sure that this is intentional!"
             )
-
-        if self._config["api_server"].get("jwt_secret_key", "super-secret") in (
-            "super-secret, somethingrandom"
-        ):
+        if not jwt_secret or jwt_secret in default_jwt_secrets:
             logger.warning(
-                "SECURITY WARNING - `jwt_secret_key` seems to be default."
+                "SECURITY WARNING - `jwt_secret_key` seems to be default. "
                 "Others may be able to log into your bot."
+            )
+        if "*" in cors_origins:
+            logger.warning(
+                "SECURITY WARNING - CORS_origins contains a wildcard '*'. "
+                "Any website could call this API."
             )
 
         logger.info("Starting Local Rest Server.")

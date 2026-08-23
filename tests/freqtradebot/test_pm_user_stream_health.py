@@ -47,6 +47,11 @@ def test_pm_user_stream_health_recovers_after_dropped_events(mocker):
             "parse_errors": 0,
         },
     )
+    # Round-4: unblocking requires a clean reconcile; stub a successful one.
+    bot._pm_reconcile_open_orders = mocker.Mock(
+        return_value={"errors": [], "unresolved_intents": 0}
+    )
+    bot._pm_has_unresolved_intents = mocker.Mock(return_value=False)
 
     bot._pm_user_stream_health_monitor()
 
@@ -93,6 +98,26 @@ def test_pm_unmatched_order_event_warns_and_recovers_once(mocker):
     assert bot._pm_handle_order_trade_update(event, {}) is False
     assert bot._pm_handle_order_trade_update(event, {}) is False
 
-    bot.rpc.send_msg.assert_called_once()
-    assert "did not match a local open order" in bot.rpc.send_msg.call_args.args[0]["status"]
-    assert bot._pm_order_recovery.call_count == 2
+    # Foreign order (no client id): warn only, never alert, never recover.
+    bot.rpc.send_msg.assert_not_called()
+    bot._pm_order_recovery.assert_not_called()
+
+
+def test_pm_unmatched_own_order_event_blocks_and_alerts(mocker):
+    """An order carrying our client id that has no local match must fail closed."""
+    bot = FreqtradeBot.__new__(FreqtradeBot)
+    bot.config = {"exchange": {"portfolio_margin_risk": {}}}
+    bot.rpc = mocker.Mock()
+    bot._pm_order_recovery = mocker.Mock()
+    bot.exchange = mocker.Mock()
+    bot.exchange.markets = {"BTC/USDT:USDT": {"id": "BTCUSDT"}}
+    bot._pm_init_user_stream_state()
+
+    event = {"e": "ORDER_TRADE_UPDATE", "o": {"i": 12345, "s": "BTCUSDT", "c": "ftabcd"}}
+
+    assert bot._pm_handle_order_trade_update(event, {}) is False
+
+    assert "unmatched_stream_order" in bot._pm_blocked_order_reasons()
+    assert bot.rpc.send_msg.call_count == 1
+    assert "FAIL-CLOSED" in bot.rpc.send_msg.call_args.args[0]["status"]
+    bot._pm_order_recovery.assert_called_once()

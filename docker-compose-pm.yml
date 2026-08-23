@@ -1,4 +1,20 @@
 ---
+# Binance Portfolio Margin (standard PM) freqtrade deployment.
+#
+# BEFORE FIRST START:
+#   1. cp user_data/config_pm_live.example.json user_data/config_pm_live.json
+#      then edit it (dry_run defaults to true - keep it true until you have verified
+#      /pm_status, /pm_risk and /pm_recover, then switch to false deliberately).
+#   2. cp .env.pm.example .env and fill BINANCE_PM_API_KEY / BINANCE_PM_API_SECRET
+#      (keys must be enabled for Binance PM PAPI endpoints).
+#   3. The example strategy is user_data/strategies/BtcUsdtPmStrategy.py.
+#
+# The environment variables below intentionally fail fast when unset so empty env
+# vars cannot silently override the config-file credentials.
+#
+# Pre-flight checks (run from the repo root, using your python env):
+#   python scripts/binance_pm_probe.py --all --pretty
+#   freqtrade trade --config user_data/config_pm_live.json --dry-run
 services:
   freqtrade-pm:
     image: pgresearchchris/pgfreqtrade:pm-binance

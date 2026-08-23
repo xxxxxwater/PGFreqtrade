@@ -4,6 +4,7 @@ This module contains class to manage RPC communications (Telegram, API, ...)
 
 import logging
 from collections import deque
+from typing import Any
 
 from freqtrade.constants import Config
 from freqtrade.enums import NO_ECHO_MESSAGES, RPCMessageType
@@ -53,6 +54,23 @@ class RPCManager:
             apiserver = ApiServer(config)
             apiserver.add_rpc_handler(self._rpc)
             self.registered_modules.append(apiserver)
+
+    def health(self) -> list[dict[str, Any]]:
+        """
+        Collect health/status from all registered RPC modules (Telegram, Webhook,
+        Discord, ...). Exposes init failures, consecutive send failures and queue
+        backlog so operators can react via the API.
+        """
+        result: list[dict[str, Any]] = []
+        for mod in self.registered_modules:
+            h = getattr(mod, "health", None)
+            if callable(h):
+                try:
+                    result.append(h())
+                except Exception:
+                    logger.exception("Health check failed for rpc.%s", mod.name)
+                    result.append({"module": mod.name, "health_error": True})
+        return result
 
     def cleanup(self) -> None:
         """Stops all enabled rpc modules"""

@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -17,7 +18,7 @@ from typing import Any
 import ccxt
 from pandas import DataFrame
 
-from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS, EntryExecuteMode
+from freqtrade.constants import DEFAULT_DATAFRAME_COLUMNS, BuySell, EntryExecuteMode
 from freqtrade.enums import TRADE_MODES, CandleType, MarginMode, PriceType, RunMode, TradingMode
 from freqtrade.exceptions import (
     DDosProtection,
@@ -35,6 +36,7 @@ from freqtrade.exchange.binance_public_data import (
 )
 from freqtrade.exchange.common import retrier
 from freqtrade.exchange.exchange_types import CcxtBalances, CcxtOrder, CcxtPosition, FtHas, Tickers
+from freqtrade.exchange.exchange_utils import ROUND_DOWN, ROUND_UP
 from freqtrade.exchange.exchange_utils_timeframe import timeframe_to_msecs
 from freqtrade.misc import deep_merge_dicts, json_load
 from freqtrade.util import FtTTLCache
@@ -90,6 +92,8 @@ class Binance(Exchange):
         "min_uni_mmr",
         "warning_uni_mmr",
         "emergency_stop_uni_mmr",
+        "wallet_mode",
+        "collateral_haircut",
         "user_stream_enabled",
         "user_stream_health_interval_minutes",
         "user_stream_queue_warning_size",
@@ -103,6 +107,12 @@ class Binance(Exchange):
         "max_total_notional",
         "max_position_notional",
         "max_daily_loss",
+        "risk_api_failure_action",
+        "user_stream_fail_closed",
+        "allow_degraded_rest_recovery",
+        "max_daily_loss_include_unrealized",
+        "startup_consistency_mode",
+        "emergency_close_retries",
     }
     _pm_risk_positive_number_keys = {
         "min_uni_mmr",
@@ -120,6 +130,7 @@ class Binance(Exchange):
         "monitor_interval_minutes",
         "order_recovery_interval_minutes",
         "heartbeat_risk_cache_seconds",
+        "emergency_close_retries",
     }
 
     _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
@@ -189,7 +200,7 @@ class Binance(Exchange):
         method = method.upper()
         request_params = dict(params or {})
         try:
-            return self._api.request(path, "papi", method, request_params)
+            result = self._api.request(path, "papi", method, request_params)
         except (ccxt.AuthenticationError, ccxt.PermissionDenied, ccxt.OperationRejected) as e:
             if isinstance(e, ccxt.OperationRejected) and self._extract_binance_error_code(
                 str(e)
@@ -197,9 +208,13 @@ class Binance(Exchange):
                 raise
             raise self._pm_auth_exception(path, method, str(e)) from e
         except ccxt.NotSupported:
-            return self._raw_papi_request(path, method, request_params)
+            result = self._raw_papi_request(path, method, request_params)
         except ccxt.BaseError:
             raise
+
+        # Track the last successful PAPI request for the API health endpoint.
+        self._last_papi_success_time = datetime.now(UTC).isoformat()
+        return result
 
     @staticmethod
     def _normalize_papi_path(path: str) -> str:
@@ -239,15 +254,68 @@ class Binance(Exchange):
                 return json.loads(raw)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")
-            if e.code == 429:
-                raise TemporaryError(f"Binance PM rate limit: {body}") from e
-            if e.code in (400, 401, 403):
-                raise self._pm_auth_exception(path, method, body) from e
-            raise OperationalException(
-                f"Binance PM API error HTTP {e.code} on {method} /papi/v1/{path}: {body[:300]}"
-            ) from e
+            # Never treat all 4xx as auth errors: classify by the Binance error code.
+            raise self._papi_http_exception(path, method, body, e.code) from e
         except urllib.error.URLError as e:
             raise TemporaryError(f"Binance PM API network error on {method} {path}: {e}") from e
+
+    @staticmethod
+    def _binance_error_category(code: int | None) -> str:
+        """Classify a Binance error code so raw HTTP failures map to the right exception."""
+        if code is None:
+            return "unknown"
+        if code in {-1002, -1022, -2014, -2015}:
+            return "auth"
+        if code in {-1001, -1003, -1015}:
+            return "rate_limit"
+        if code in {-2018, -2019}:
+            return "insufficient_funds"
+        if code in {
+            -2010,
+            -2011,
+            -2012,
+            -2013,  # "No such order" in PM/futures.
+            -2020,
+            -2021,
+            -2022,
+            -2024,
+            -2025,
+            -2026,
+            -2027,
+            -2028,
+        }:
+            return "order_rejected"
+        if code == -1021 or (-1131 <= code <= -1100):
+            return "invalid_request"
+        return "other"
+
+    def _papi_http_exception(
+        self, path: str, method: str, body: str, http_code: int
+    ) -> Exception:
+        code = self._extract_binance_error_code(body)
+        category = self._binance_error_category(code)
+        endpoint = f"{method} /papi/v1/{path}"
+        snippet = body[:300]
+        if category == "auth":
+            return self._pm_auth_exception(path, method, body)
+        if category == "rate_limit":
+            return TemporaryError(f"Binance PM rate limit (code {code}) on {endpoint}: {snippet}")
+        if category == "insufficient_funds":
+            return InsufficientFundsError(
+                f"Binance PM insufficient funds (code {code}) on {endpoint}: {snippet}"
+            )
+        if category == "order_rejected":
+            return InvalidOrderException(
+                f"Binance PM order rejected (code {code}) on {endpoint}: {snippet}"
+            )
+        if category == "invalid_request":
+            return InvalidOrderException(
+                f"Binance PM rejected request (code {code}) on {endpoint}: {snippet}"
+            )
+        # Unknown codes and generic HTTP errors must never be reported as auth failures.
+        return OperationalException(
+            f"Binance PM API error (code {code}) HTTP {http_code} on {endpoint}: {snippet}"
+        )
 
     def _pm_recv_window(self) -> int:
         return int(
@@ -366,6 +434,156 @@ class Binance(Exchange):
             "info": order,
         }
 
+    def _parse_pm_trade(self, trade: dict[str, Any], pair: str | None = None) -> dict[str, Any]:
+        """Convert a PAPI /um/userTrades entry into the ccxt trade shape freqtrade expects."""
+        symbol_id = trade.get("symbol")
+        symbol = pair or self._api.safe_symbol(symbol_id, None, None, "contract")
+        price = self._float_or_none(trade.get("price"))
+        amount = self._float_or_zero(trade.get("qty"))
+        cost = self._float_or_none(trade.get("quoteQty"))
+        commission = self._float_or_none(trade.get("commission"))
+        commission_asset = trade.get("commissionAsset")
+        timestamp = self._float_or_none(trade.get("time"))
+
+        fee = None
+        if commission is not None and commission_asset:
+            fee = {"cost": commission, "currency": commission_asset}
+
+        return {
+            "id": str(trade.get("id") or trade.get("tradeId")),
+            "order": str(trade.get("orderId")),
+            "symbol": symbol,
+            "side": str(trade.get("side", "")).lower() or None,
+            "price": price,
+            "amount": amount,
+            "cost": cost,
+            "fee": fee,
+            "datetime": dt_from_ts(int(timestamp)) if timestamp else None,
+            "timestamp": int(timestamp) if timestamp else None,
+            "takerOrMaker": "maker" if trade.get("maker") else "taker",
+            "info": trade,
+        }
+
+    @staticmethod
+    def _pm_conditional_status(status: str | None) -> str | None:
+        """
+        Map Binance PM conditional order ``strategyStatus`` to a ccxt order status.
+
+        IMPORTANT: TRIGGERED only means the strategy fired and a real order was
+        submitted. It does NOT mean the real order filled. The strategy must stay
+        ``open`` until the real order (``orderId`` in the conditional history
+        response) is resolved - otherwise freqtrade would mark the trade closed
+        while the actual position is still open.
+        """
+        if status is None:
+            return None
+        return {
+            "NEW": "open",
+            "TRIGGERED": "open",
+            "CANCELLED": "canceled",
+            "CANCELED": "canceled",
+            "EXPIRED": "expired",
+            "FINISHED": "closed",
+        }.get(status.upper(), status.lower())
+
+    def _parse_pm_conditional_order(
+        self, order: dict[str, Any], pair: str | None = None
+    ) -> CcxtOrder:
+        """Convert a PAPI conditional (stoploss) order response into a ccxt order shape."""
+        symbol_id = order.get("symbol")
+        symbol = pair or self._api.safe_symbol(symbol_id, None, None, "contract")
+        amount = self._float_or_none(order.get("quantity") or order.get("origQty"))
+        price = self._float_or_none(order.get("price"))
+        stop_price = self._float_or_none(order.get("stopPrice"))
+        strategy_id = order.get("strategyId")
+        client_strategy_id = order.get("newClientStrategyId")
+        timestamp = self._float_or_none(order.get("updateTime") or order.get("bookTime"))
+
+        # freqtrade stores order["id"] and uses it to fetch/cancel later. For conditional
+        # orders we prefer the stable client strategy id we generated (queryable by
+        # ``newClientStrategyId``); keep the exchange ``strategyId`` in ``info``.
+        order_id = str(client_strategy_id or strategy_id or "")
+
+        # Official field names (binance-connector-js QueryUmConditionalOrderHistoryResponse):
+        # ``orderId``/``status``/``type``/``triggerTime`` are only present once the
+        # strategy has been triggered and refer to the REAL order the exchange submitted.
+        info = dict(order)
+        info["strategy_status"] = order.get("strategyStatus")
+        info["actual_order_id"] = order.get("orderId")
+        info["actual_order_status"] = order.get("status")
+
+        return {
+            "id": order_id,
+            "clientStrategyId": client_strategy_id,
+            "timestamp": int(timestamp) if timestamp else None,
+            "datetime": dt_from_ts(int(timestamp)) if timestamp else None,
+            "lastTradeTimestamp": int(timestamp) if timestamp else None,
+            "symbol": symbol,
+            "type": "stoploss",
+            "timeInForce": order.get("timeInForce"),
+            "side": str(order.get("side", "")).lower() or None,
+            "price": price,
+            "average": None,
+            "stopPrice": stop_price,
+            "amount": amount,
+            "filled": 0.0,
+            "remaining": amount,
+            "cost": 0.0,
+            "status": self._pm_conditional_status(order.get("strategyStatus")),
+            "fee": None,
+            "trades": [],
+            "info": info,
+        }
+
+    def _pm_resolve_conditional_actual_order(
+        self, strategy_order: CcxtOrder, pair: str
+    ) -> CcxtOrder:
+        """
+        Resolve the REAL order behind a triggered conditional strategy.
+
+        A triggered PM conditional order reports ``orderId`` (the real order the
+        exchange submitted) and ``status`` in the conditional history response. We
+        fetch that real order via /um/order to obtain authoritative fill data
+        (filled / average / cost / fee / trades), then merge it back into the
+        strategy order shape:
+
+        * ``id`` stays the strategy id so freqtrade keeps matching the local
+          stoploss order.
+        * The real order id is kept as ``id_stop`` (see
+          ``exchange.fetch_stoploss_order`` algo-order pattern).
+        * ``status_stop`` is set to "triggered" for diagnostics.
+
+        Fails open: if the real order cannot be fetched yet (transient), we keep
+        the strategy order open - never close, never fake a fill.
+        """
+        actual_id = strategy_order.get("info", {}).get("orderId")
+        if not actual_id:
+            return strategy_order
+        try:
+            actual_order = self.fetch_order(str(actual_id), pair)
+        except InvalidOrderException:
+            # Real order not (yet) visible. Stay open and retry on the next loop.
+            logger.warning(
+                "PM conditional %s TRIGGERED but real order %s not found yet; "
+                "keeping strategy open.",
+                strategy_order.get("id"),
+                actual_id,
+            )
+            return strategy_order
+
+        merged: CcxtOrder = dict(actual_order)
+        merged["id"] = strategy_order["id"]
+        merged["id_stop"] = str(actual_order.get("id") or actual_id)
+        merged["stopPrice"] = strategy_order.get("stopPrice")
+        merged["status_stop"] = "triggered"
+        merged["type"] = "stoploss"
+        info = dict(strategy_order.get("info") or {})
+        info["actual_order"] = actual_order
+        info["actual_order_id"] = actual_order.get("id") or actual_id
+        info["actual_order_status"] = actual_order.get("status")
+        merged["info"] = info
+        return merged
+
     def _parse_pm_position(self, position: dict[str, Any]) -> CcxtPosition | None:
         pair = self._api.safe_symbol(position.get("symbol"), None, None, "contract")
         if not pair or pair not in self.markets:
@@ -409,7 +627,340 @@ class Binance(Exchange):
         if rate is not None:
             request["price"] = rate
         request.update(params)
+        # Idempotency: every PM order must carry a unique, traceable client order id.
+        # If a timeout/network error follows a successful placement, the caller can
+        # resolve the order by this id instead of blindly resubmitting it.
+        if "newClientOrderId" not in request:
+            request["newClientOrderId"] = self._pm_new_client_order_id()
         return request
+
+    @staticmethod
+    def _pm_new_client_order_id() -> str:
+        """
+        Generate a unique, traceable client order id for a PM order.
+
+        Binance PM UM `newClientOrderId` must match `^[.A-Z\\:/a-z0-9_-]{1,32}$`,
+        so the id is capped at 32 characters.
+        """
+        return f"ft{uuid.uuid4().hex[:28]}"
+
+    @staticmethod
+    def _pm_new_client_strategy_id() -> str:
+        """
+        Generate a unique client strategy id for a PM conditional (stoploss) order.
+
+        Binance PM UM conditional `newClientStrategyId` must match
+        `^[.A-Z\\:/a-z0-9_-]{1,32}$`.
+        """
+        return f"st{uuid.uuid4().hex[:28]}"
+
+    # ---- Persistent order intents (transactional DB, idempotency) ----
+    #
+    # Before ANY POST to /um/order or /um/conditional/order the order intent is
+    # durably committed to the MAIN freqtrade database (pm_order_intents table,
+    # created by ModelBase.metadata.create_all). On timeout/429/disconnect the
+    # SAME client id is used for lookup/recovery - never a fresh id - so a process
+    # restart or a later strategy loop can never submit a duplicate entry / DCA /
+    # reduceOnly / stoploss order.
+    #
+    # The durable commit is a hard prerequisite for the POST: failing to write,
+    # read, commit or parse the intent store raises (fail-closed) and the order
+    # is NOT submitted.
+    #
+    # NOTE: the model is imported lazily inside each method to avoid a circular
+    # import (freqtrade.exchange -> binance -> persistence -> trade_model ->
+    # freqtrade.exchange).
+
+    @staticmethod
+    def _pm_intent_model():
+        from freqtrade.persistence.pm_order_intent import PMOrderIntent
+
+        return PMOrderIntent
+
+    def _pm_intent_put(self, client_id: str, intent: dict[str, Any]) -> None:
+        """
+        Durably commit the order intent BEFORE the POST.
+
+        Raises OperationalException on ANY failure - the caller must not submit
+        the order when this raises.
+        """
+        PMOrderIntent = self._pm_intent_model()
+        try:
+            row = PMOrderIntent(
+                client_id=client_id,
+                kind=str(intent.get("kind")),
+                pair=str(intent.get("pair")),
+                side=intent.get("side"),
+                order_type=intent.get("type"),
+                amount=intent.get("amount"),
+                price=intent.get("price"),
+                stop_price=intent.get("stop_price"),
+                reduce_only=bool(intent.get("reduce_only", False)),
+                state="PENDING",
+            )
+            PMOrderIntent.session.add(row)
+            PMOrderIntent.session.commit()
+        except Exception as e:
+            try:
+                PMOrderIntent.session.rollback()
+            except Exception:
+                pass
+            raise OperationalException(
+                "PM order intent could not be durably committed to the database; "
+                f"refusing to submit the order (fail-closed). Error: {e}"
+            ) from e
+
+    def _pm_intent_clear(self, client_id: str) -> None:
+        """Delete a resolved intent. Raises on failure (fail-closed)."""
+        PMOrderIntent = self._pm_intent_model()
+        try:
+            row = PMOrderIntent.get_by_client_id(client_id)
+            if row is not None:
+                PMOrderIntent.session.delete(row)
+                PMOrderIntent.session.commit()
+        except Exception as e:
+            try:
+                PMOrderIntent.session.rollback()
+            except Exception:
+                pass
+            raise OperationalException(
+                f"PM order intent cleanup failed for {client_id}: {e} (fail-closed)"
+            ) from e
+
+    def _pm_intent_mark_uncertain(self, client_id: str, error: str) -> None:
+        """Transition an intent to UNKNOWN (durable). Raises on failure (fail-closed)."""
+        PMOrderIntent = self._pm_intent_model()
+        try:
+            row = PMOrderIntent.get_by_client_id(client_id)
+            if row is None:
+                raise OperationalException(
+                    f"PM order intent {client_id} not found in the store - the store is "
+                    "inconsistent; refusing to continue."
+                )
+            row.state = "UNKNOWN"
+            row.last_error = error[:250]
+            PMOrderIntent.session.commit()
+        except Exception as e:
+            try:
+                PMOrderIntent.session.rollback()
+            except Exception:
+                pass
+            raise OperationalException(
+                f"PM order intent could not be marked UNKNOWN for {client_id}: {e} "
+                "(fail-closed)"
+            ) from e
+
+    def pm_intent_store_ok(self) -> bool:
+        """Whether the intent store is readable (any failure => False => fail-closed)."""
+        PMOrderIntent = self._pm_intent_model()
+        try:
+            PMOrderIntent.session.query(PMOrderIntent).limit(1).all()
+            return True
+        except Exception:
+            return False
+
+    def pm_has_unresolved_intents(self) -> bool:
+        """
+        Whether any intent is PENDING/UNKNOWN. Store errors count as unresolved
+        (fail-closed: never submit when the store cannot be trusted).
+        """
+        PMOrderIntent = self._pm_intent_model()
+        try:
+            return PMOrderIntent.has_unresolved()
+        except Exception:
+            return True
+
+    def pm_unresolved_intent_count(self) -> int:
+        """Number of unresolved intents; -1 when the store is unreadable."""
+        PMOrderIntent = self._pm_intent_model()
+        try:
+            return len(PMOrderIntent.get_unresolved())
+        except Exception:
+            return -1
+
+    def list_pm_pending_intents(self) -> list[dict[str, Any]]:
+        """
+        All unresolved intents (PENDING/UNKNOWN) from the durable store.
+
+        Raises OperationalException when the store cannot be read - callers must
+        treat this as fail-closed, never as "no intents".
+        """
+        PMOrderIntent = self._pm_intent_model()
+        try:
+            return [row.to_dict() for row in PMOrderIntent.get_unresolved()]
+        except Exception as e:
+            raise OperationalException(
+                f"Could not read PM order intents from the database: {e} (fail-closed)"
+            ) from e
+
+    def clear_pm_pending_intent(self, client_id: str) -> None:
+        """Remove a persisted intent once it has been definitively resolved."""
+        self._pm_intent_clear(client_id)
+
+    def resolve_pm_pending_intent(self, intent: dict[str, Any]) -> dict[str, Any]:
+        """
+        Resolve one persisted intent against the exchange.
+
+        Returns a report with:
+        * ``resolved`` False + ``uncertain`` True: the exchange could not be queried;
+          the intent MUST stay pending and new orders must stay blocked.
+        * ``resolved`` True + ``exists`` False: the exchange definitively has no such
+          order; the intent can be cleared.
+        * ``resolved`` True + ``exists`` True: the order exists on the exchange; the
+          caller must reconcile it with the local database before clearing.
+        """
+        client_id = str(intent.get("client_id") or "")
+        pair = intent.get("pair") or ""
+        report: dict[str, Any] = {
+            "client_id": client_id,
+            "kind": intent.get("kind"),
+            "pair": pair,
+            "resolved": False,
+            "uncertain": False,
+            "exists": None,
+            "order": None,
+            "error": None,
+        }
+        if not client_id or not pair:
+            report["resolved"] = True
+            report["exists"] = False
+            report["error"] = "intent is malformed (missing client_id/pair)"
+            return report
+        try:
+            if intent.get("kind") == "conditional":
+                order = self.fetch_stoploss_order(client_id, pair)
+            else:
+                order = self._pm_fetch_order_by_client_id(client_id, pair)
+        except InvalidOrderException:
+            report["resolved"] = True
+            report["exists"] = False
+            return report
+        except Exception as e:
+            report["uncertain"] = True
+            report["error"] = f"{e.__class__.__name__}: {e}"
+            return report
+        report["resolved"] = True
+        report["exists"] = order is not None
+        report["order"] = order
+        return report
+
+    def _pm_fetch_order_by_client_id(self, client_order_id: str, pair: str) -> CcxtOrder | None:
+        """
+        Resolve a PM order by its client order id.
+
+        Returns None only when the exchange definitively reports the order does not exist.
+        Transient lookup failures (network/timeout) are propagated so the caller never
+        mistakes "unknown" for "absent" and therefore never blindly resubmits.
+        """
+        request: dict[str, Any] = {
+            "symbol": self._pm_symbol_for_pair(pair),
+            "origClientOrderId": client_order_id,
+        }
+        try:
+            raw_order = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/order", "GET", request
+            )
+            self._log_exchange_response("papi_fetch_order_by_client_id", raw_order)
+            return self._order_contracts_to_amount(self._parse_pm_order(raw_order, pair))
+        except ccxt.OrderNotFound:
+            return None
+        except (ccxt.InvalidOrder, InvalidOrderException) as e:
+            # Definitive "order does not exist" -> absent; anything else propagates.
+            if self._extract_binance_error_code(str(e)) in {-2011, -2012, -2013}:
+                return None
+            raise
+
+    def _pm_place_order(
+        self,
+        pair: str,
+        ordertype: str,
+        side: str,
+        amount_contracts: float,
+        rate_for_order: float | None,
+        params: dict[str, Any],
+        *,
+        log_tag: str,
+    ) -> CcxtOrder:
+        """
+        Submit an order to the PM PAPI endpoint with idempotency guarantees.
+
+        Every order carries a unique ``newClientOrderId`` and its intent is persisted
+        BEFORE the POST. On a transient submit error (network timeout, 429, disconnect)
+        the order is first resolved by that client order id; if the exchange actually
+        accepted it, the existing order is returned instead of resubmitting, so retries
+        can never duplicate an entry/adjust/exit. If both the submit and the lookup
+        fail, the intent stays UNKNOWN in the persistent store and startup recovery
+        re-resolves it after a process restart.
+        """
+        client_order_id = self._pm_new_client_order_id()
+        merged = dict(params or {})
+        merged["newClientOrderId"] = client_order_id
+        request = self._pm_order_params(
+            pair, ordertype, side, amount_contracts, rate_for_order, merged
+        )
+        self._pm_intent_put(
+            client_order_id,
+            {
+                "kind": "order",
+                "pair": pair,
+                "side": side,
+                "type": ordertype,
+                "amount": amount_contracts,
+                "price": rate_for_order,
+                "ts": time.time(),
+            },
+        )
+        try:
+            raw_order = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/order", "POST", request
+            )
+            self._pm_intent_clear(client_order_id)
+        except (TemporaryError, ccxt.ExchangeError) as e:
+            try:
+                existing = self._pm_fetch_order_by_client_id(client_order_id, pair)
+            except (TemporaryError, ccxt.ExchangeError):
+                # Both the submit AND the idempotency lookup failed transiently. The order
+                # state is uncertain - never guess, and never silently resubmit.
+                self._pm_intent_mark_uncertain(client_order_id, str(e))
+                raise TemporaryError(
+                    f"Binance PM order {client_order_id} submit failed and the idempotency "
+                    "lookup also failed; order state is uncertain and the intent is "
+                    "persisted as UNKNOWN. Startup recovery or /pm_recover will resolve it "
+                    "before any new order is allowed."
+                ) from e
+            if existing is not None:
+                self._pm_intent_clear(client_order_id)
+                logger.warning(
+                    f"Binance PM order {client_order_id} submit raised "
+                    f"{e.__class__.__name__}; resolved the already-placed order "
+                    f"{existing.get('id')} and returning it (no duplicate submitted)."
+                )
+                return existing
+            self._pm_intent_clear(client_order_id)
+            raise
+        except ccxt.BaseError:
+            # Definitive rejection (BadRequest/InsufficientFunds/InvalidOrder/...):
+            # the exchange rejected the order, so it was never created.
+            self._pm_intent_clear(client_order_id)
+            raise
+        self._log_exchange_response(log_tag, raw_order)
+        return self._order_contracts_to_amount(self._parse_pm_order(raw_order, pair))
+
+    @staticmethod
+    def _pm_order_not_found(exc: Exception) -> bool:
+        """True when Binance definitively reports the order does not exist."""
+        if isinstance(exc, ccxt.OrderNotFound):
+            return True
+        return Binance._extract_binance_error_code(str(exc)) in {-2011, -2012, -2013, -4003}
+
+    @staticmethod
+    def _pm_raise_transient(operation: str, exc: Exception) -> None:
+        if isinstance(exc, ccxt.DDoSProtection):
+            raise DDosProtection(exc) from exc
+        raise TemporaryError(
+            f"Binance PM {operation} failed transiently: "
+            f"{exc.__class__.__name__}. Message: {exc}"
+        ) from exc
 
     def _pm_account_float(self, account: dict[str, Any], *keys: str) -> float | None:
         for key in keys:
@@ -448,6 +999,12 @@ class Binance(Exchange):
             "account_equity": self._pm_account_float(
                 account, "accountEquity", "actualEquity", "totalEquity"
             ),
+            "available_balance": self._pm_account_float(
+                account,
+                "availableBalance",
+                "totalAvailableBalance",
+                "totalCrossAvailableBalance",
+            ),
             "total_collateral_value": self._pm_account_float(
                 account, "totalCollateralValue", "accountMaintMargin"
             ),
@@ -460,6 +1017,25 @@ class Binance(Exchange):
             "raw": account,
         }
 
+    def _pm_entry_price_or_fail(self, pair: str) -> float:
+        """
+        Fetch a valid entry price for notional checks. Raises on missing/invalid price
+        so notional caps can never be bypassed by a price of 0 (fail-closed).
+        """
+        try:
+            price = self._float_or_none(self.get_rate(pair, side="entry", refresh=True))
+        except Exception as e:
+            raise OperationalException(
+                f"Could not fetch entry price for {pair}; refusing to open a new order "
+                f"(fail-closed). Error: {e}"
+            ) from e
+        if not price or price <= 0:
+            raise OperationalException(
+                f"Invalid entry price ({price}) for {pair}; refusing to open a new order "
+                "(fail-closed)."
+            )
+        return price
+
     def assert_pm_risk_allows_order(
         self,
         pair: str | None = None,
@@ -471,20 +1047,41 @@ class Binance(Exchange):
             return
 
         risk_config = self._pm_risk_config()
-        risk = self.get_pm_risk_summary()
+        try:
+            risk = self.get_pm_risk_summary()
+        except Exception as e:
+            raise OperationalException(
+                "Binance PM risk check failed; refusing to open a new order (fail-closed). "
+                f"Error: {e}"
+            ) from e
+        if not risk.get("enabled"):
+            raise OperationalException(
+                "Binance PM risk data unavailable; refusing to open a new order (fail-closed)."
+            )
+
         account_status = risk.get("account_status")
-        if account_status and account_status != "NORMAL":
+        if not account_status:
+            raise OperationalException(
+                "Binance PM accountStatus is missing; refusing to open a new order (fail-closed)."
+            )
+        if account_status != "NORMAL":
             raise OperationalException(
                 f"Binance PM account status is {account_status}; refusing to open a new order."
             )
 
         min_uni_mmr = risk_config.get("min_uni_mmr")
         uni_mmr = risk.get("uni_mmr")
-        if min_uni_mmr is not None and uni_mmr is not None and uni_mmr < float(min_uni_mmr):
-            raise OperationalException(
-                f"Binance PM uniMMR {uni_mmr} is below configured minimum {min_uni_mmr}; "
-                "refusing to open a new order."
-            )
+        if min_uni_mmr is not None:
+            if uni_mmr is None:
+                raise OperationalException(
+                    "Binance PM uniMMR is missing while min_uni_mmr is configured; "
+                    "refusing to open a new order (fail-closed)."
+                )
+            if uni_mmr < float(min_uni_mmr):
+                raise OperationalException(
+                    f"Binance PM uniMMR {uni_mmr} is below configured minimum {min_uni_mmr}; "
+                    "refusing to open a new order."
+                )
 
         max_leverage = risk_config.get("max_leverage")
         if max_leverage is not None and leverage is not None and leverage > float(max_leverage):
@@ -515,8 +1112,8 @@ class Binance(Exchange):
                 if positions is not None
                 else 0.0
             )
-            price = self._float_or_zero(self.get_rate(pair, side="entry", refresh=True))
-            new_notional = amount * (price or 0.0)
+            price = self._pm_entry_price_or_fail(pair)
+            new_notional = amount * price
             projected_total = current_total + new_notional
 
             if projected_total > float(max_total_notional):
@@ -540,8 +1137,8 @@ class Binance(Exchange):
                     if positions is not None
                     else 0.0
                 )
-                price = self._float_or_zero(self.get_rate(pair, side="entry", refresh=True))
-                new_notional = amount * (price or 0.0)
+                price = self._pm_entry_price_or_fail(pair)
+                new_notional = amount * price
                 projected_pair = current_pair_notional + new_notional
                 if projected_pair > float(pair_cap):
                     raise OperationalException(
@@ -568,6 +1165,7 @@ class Binance(Exchange):
         self._validate_pm_risk_positive_values(risk_config)
         self._validate_pm_risk_threshold_order(risk_config)
         self._validate_pm_risk_boolean_keys(risk_config)
+        self._validate_pm_wallet_mode(risk_config)
 
     def _validate_pm_risk_positive_values(self, risk_config: dict[str, Any]) -> None:
         for key in self._pm_risk_positive_number_keys:
@@ -622,6 +1220,20 @@ class Binance(Exchange):
                 raise OperationalException(
                     f"exchange.portfolio_margin_risk.{key} must be a boolean."
                 )
+
+    @staticmethod
+    def _validate_pm_wallet_mode(risk_config: dict[str, Any]) -> None:
+        wallet_mode = risk_config.get("wallet_mode", "USDT_ONLY")
+        if wallet_mode not in {"USDT_ONLY", "PM_COLLATERAL_HAIRCUT"}:
+            raise OperationalException(
+                "exchange.portfolio_margin_risk.wallet_mode must be "
+                "'USDT_ONLY' or 'PM_COLLATERAL_HAIRCUT'."
+            )
+        haircut = risk_config.get("collateral_haircut")
+        if haircut is not None and not (0 < float(haircut) <= 1):
+            raise OperationalException(
+                "exchange.portfolio_margin_risk.collateral_haircut must be > 0 and <= 1."
+            )
 
     @retrier
     def create_pm_listen_key(self) -> str:
@@ -829,6 +1441,46 @@ class Binance(Exchange):
             raise OperationalException(
                 "Binance Portfolio Margin requires trading_mode='futures' and margin_mode='cross'."
             )
+        if not config.get("dry_run", True):
+            # Live PM trading must fail fast on missing credentials or risk config.
+            # NOTE: FreqtradeBot strips exchange.key/secret from the config before the
+            # exchange is constructed, so credentials must be read from the ccxt API
+            # object (which was built from the retained deep copy), not from config.
+            exchange_conf = config.get("exchange", {})
+            api_key = getattr(self._api, "apiKey", "") or ""
+            api_secret = getattr(self._api, "secret", "") or ""
+            if not api_key:
+                raise OperationalException(
+                    "Binance PM live trading requires exchange.key / exchange.secret "
+                    "(or FREQTRADE__EXCHANGE__KEY / SECRET env vars). Refusing to start."
+                )
+            if not api_secret:
+                raise OperationalException(
+                    "Binance PM live trading requires exchange.secret. Refusing to start."
+                )
+            pm_risk = exchange_conf.get("portfolio_margin_risk")
+            if not pm_risk or not isinstance(pm_risk, dict) or not pm_risk:
+                raise OperationalException(
+                    "Binance PM live trading requires a non-empty "
+                    "exchange.portfolio_margin_risk config (at minimum min_uni_mmr, "
+                    "monitor_interval_minutes). Refusing to start (fail-closed)."
+                )
+            if not config.get("db_url"):
+                raise OperationalException(
+                    "Binance PM live trading requires a persistent database (db_url) "
+                    "for the durable order intent store (pm_order_intents table). "
+                    "Refusing to start without database persistence (fail-closed)."
+                )
+        # Wallet model A: only USDT/USDC are usable as opening capital. BTC/ETH held as PM
+        # collateral are deliberately NOT converted into available stake, so collateral can
+        # never be double-counted into balance, position margin and available funds.
+        stake_currency = config.get("stake_currency")
+        if stake_currency not in {"USDT", "USDC"}:
+            raise OperationalException(
+                "Binance PM wallet model requires stake_currency to be USDT or USDC. "
+                "BTC/ETH PM collateral is not used as available opening capital. "
+                f"Current stake_currency: {stake_currency}."
+            )
         invalid_pairs = [
             pair
             for pair in config.get("exchange", {}).get("pair_whitelist", [])
@@ -943,6 +1595,15 @@ class Binance(Exchange):
             )
 
         params = self._get_params(side, ordertype, leverage, reduceOnly, time_in_force)
+        # Fail-closed idempotency gate: any unresolved intent in the durable store
+        # blocks exposure-increasing orders. reduceOnly exits / emergency closes are
+        # NEVER blocked by this gate.
+        if not reduceOnly and self.pm_has_unresolved_intents():
+            raise TemporaryError(
+                "Binance PM has unresolved order intents in the database; refusing to "
+                "place a new exposure-increasing order (fail-closed). Resolve the "
+                "pending intents via /pm_recover."
+            )
         try:
             amount_contracts = self.amount_to_precision(
                 pair, self._amount_to_contracts(pair, amount)
@@ -954,15 +1615,15 @@ class Binance(Exchange):
                     pair=pair, amount=amount, leverage=leverage, entry_mode=entry_mode
                 )
                 self._lev_prep(pair, leverage, side, accept_fail=not initial_order)
-            raw_order = self._papi_request(
-                f"{self._pm_namespace_for_pair(pair)}/order",
-                "POST",
-                self._pm_order_params(
-                    pair, ordertype, side, amount_contracts, rate_for_order, params
-                ),
+            return self._pm_place_order(
+                pair,
+                ordertype,
+                side,
+                amount_contracts,
+                rate_for_order,
+                params,
+                log_tag="papi_create_order",
             )
-            self._log_exchange_response("papi_create_order", raw_order)
-            return self._order_contracts_to_amount(self._parse_pm_order(raw_order, pair))
         except ccxt.InsufficientFunds as e:
             raise InsufficientFundsError(
                 f"Insufficient funds to create {ordertype} {side} PM order on {pair}. "
@@ -987,8 +1648,15 @@ class Binance(Exchange):
         if not self._is_portfolio_margin() or self._config["dry_run"]:
             return super().fetch_order(order_id, pair, params)
         try:
-            request = {"symbol": self._pm_symbol_for_pair(pair), "orderId": order_id}
-            request.update(params or {})
+            request: dict[str, Any] = {
+                "symbol": self._pm_symbol_for_pair(pair),
+                "orderId": order_id,
+            }
+            # Strip framework-only params (e.g. `stop` added by stoploss_query_requires_stop_flag)
+            # that PAPI does not accept.
+            pm_params = dict(params or {})
+            pm_params.pop("stop", None)
+            request.update(pm_params)
             raw_order = self._papi_request(
                 f"{self._pm_namespace_for_pair(pair)}/order", "GET", request
             )
@@ -1022,7 +1690,13 @@ class Binance(Exchange):
     ) -> dict[str, Any]:
         try:
             request = {"symbol": self._pm_symbol_for_pair(pair), "orderId": order_id}
-            request.update(params or {})
+            # PAPI regular order cancel only accepts symbol/orderId|origClientOrderId/recvWindow.
+            # Strip framework-only params (e.g. `stop` added for stoploss flows) so regular
+            # cancels never fail; conditional stoploss cancels route through
+            # cancel_stoploss_order instead.
+            pm_params = dict(params or {})
+            pm_params.pop("stop", None)
+            request.update(pm_params)
             raw_order = self._papi_request(
                 f"{self._pm_namespace_for_pair(pair)}/order", "DELETE", request
             )
@@ -1077,6 +1751,452 @@ class Binance(Exchange):
         except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
             raise TemporaryError(
                 f"Could not set Binance PM leverage due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier(retries=0)
+    def _fetch_orders(
+        self, pair: str, since: datetime, params: dict | None = None
+    ) -> list[CcxtOrder]:
+        """
+        Fetch all orders for a pair "since" through the PM PAPI order history endpoint.
+
+        PM mode must never fall back to the generic CCXT futures fetch_orders().
+        :param pair: Pair for the query
+        :param since: Starting time for the query
+        """
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super()._fetch_orders(pair, since, params)
+        try:
+            since_ms = int((since.timestamp() - 10) * 1000)
+            request: dict[str, Any] = {
+                "symbol": self._pm_symbol_for_pair(pair),
+                "startTime": since_ms,
+                "limit": 1000,
+            }
+            request.update(params or {})
+            raw_orders = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/allOrders", "GET", request
+            )
+            self._log_exchange_response("papi_all_orders", raw_orders)
+            orders = [
+                self._order_contracts_to_amount(self._parse_pm_order(raw_order, pair))
+                for raw_order in raw_orders
+            ]
+            return orders
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get Binance PM orders due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier(retries=0)
+    def fetch_open_orders(
+        self, pair: str | None = None, since: datetime | None = None, params: dict | None = None
+    ) -> list[CcxtOrder]:
+        """
+        Fetch currently open orders through the PM PAPI endpoint.
+
+        PM mode must never use the generic CCXT futures fetch_open_orders().
+        :param pair: Pair for the query (None => all pairs)
+        """
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return self._api.fetch_open_orders(pair, params=params or {})
+        try:
+            request: dict[str, Any] = dict(params or {})
+            if pair is not None:
+                request["symbol"] = self._pm_symbol_for_pair(pair)
+            raw_orders = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair or list(self.markets.keys())[0])}/openOrders",
+                "GET",
+                request,
+            )
+            self._log_exchange_response("papi_open_orders", raw_orders)
+            return [
+                self._order_contracts_to_amount(self._parse_pm_order(raw_order, pair))
+                for raw_order in raw_orders
+            ]
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get Binance PM open orders due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier
+    def get_trades_for_order(
+        self, order_id: str, pair: str, since: datetime, params: dict | None = None
+    ) -> list:
+        """
+        Fetch executed trades for an order through the PM PAPI userTrades endpoint.
+
+        PM mode must never use the generic CCXT futures fetch_my_trades() (FAPI).
+        """
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super().get_trades_for_order(order_id, pair, since, params)
+        try:
+            since_ms = int((since.replace(tzinfo=UTC).timestamp() - 5) * 1000)
+            request: dict[str, Any] = {
+                "symbol": self._pm_symbol_for_pair(pair),
+                "startTime": since_ms,
+                "limit": 1000,
+            }
+            request.update(params or {})
+            raw_trades = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/userTrades", "GET", request
+            )
+            self._log_exchange_response("papi_user_trades", raw_trades)
+            trades = [self._parse_pm_trade(raw_trade, pair) for raw_trade in raw_trades]
+            matched_trades = [trade for trade in trades if trade["order"] == order_id]
+            return self._trades_contracts_to_amount(matched_trades)
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get Binance PM trades due to {e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    def _pm_conditional_lookup_params(self, order_id: str) -> dict[str, Any]:
+        """
+        Build the lookup params for a PM conditional order.
+
+        freqtrade stores ``order["id"]`` and passes it back for fetch/cancel. Conditional
+        orders are identified by either the exchange ``strategyId`` (numeric) or the client
+        ``newClientStrategyId`` we generated at creation time.
+        """
+        if str(order_id).isdigit():
+            return {"strategyId": int(order_id)}
+        return {"newClientStrategyId": order_id}
+
+    def create_stoploss(
+        self,
+        pair: str,
+        amount: float,
+        stop_price: float,
+        order_types: dict,
+        side: BuySell,
+        leverage: float,
+    ) -> CcxtOrder:
+        """
+        Creates a stoploss order through the PM PAPI conditional order endpoint.
+
+        Binance PM defines STOP/STOP_MARKET as conditional orders with their own lifecycle
+        (``strategyType`` + ``newClientStrategyId``) on ``/papi/v1/um/conditional/order``,
+        NOT as regular ``/papi/v1/um/order`` orders.
+        """
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super().create_stoploss(
+                pair=pair,
+                amount=amount,
+                stop_price=stop_price,
+                order_types=order_types,
+                side=side,
+                leverage=leverage,
+            )
+
+        user_order_type = order_types.get("stoploss", "market")
+        ordertype, user_order_type = self._get_stop_order_type(user_order_type)
+        # freqtrade futures mapping: market -> "stop_market", limit -> "stop".
+        strategy_type = "STOP_MARKET" if ordertype == "stop_market" else "STOP"
+
+        # Fail-closed idempotency gate: with unresolved intents a second strategy id
+        # must never be generated (a previous stoploss POST may have succeeded).
+        if self.pm_has_unresolved_intents():
+            raise TemporaryError(
+                "Binance PM has unresolved order intents in the database; refusing to "
+                "generate a new client strategy id / place a stoploss order "
+                "(fail-closed). Resolve the pending intents via /pm_recover."
+            )
+
+        round_mode = ROUND_DOWN if side == "buy" else ROUND_UP
+        stop_price_norm = self.price_to_precision(pair, stop_price, rounding_mode=round_mode)
+        limit_rate = None
+        if user_order_type == "limit":
+            limit_rate = self._get_stop_limit_rate(stop_price, order_types, side)
+            limit_rate = self.price_to_precision(pair, limit_rate, rounding_mode=round_mode)
+
+        working_type = "CONTRACT_PRICE"
+        if "stoploss_price_type" in order_types and "stop_price_type_field" in self._ft_has:
+            working_type = self._ft_has["stop_price_type_value_mapping"][
+                order_types.get("stoploss_price_type", PriceType.LAST)
+            ]
+
+        client_strategy_id = self._pm_new_client_strategy_id()
+        request: dict[str, Any] = {
+            "symbol": self._pm_symbol_for_pair(pair),
+            "side": side.upper(),
+            "strategyType": strategy_type,
+            "reduceOnly": "true",
+            "stopPrice": stop_price_norm,
+            "workingType": working_type,
+            "newClientStrategyId": client_strategy_id,
+        }
+        if limit_rate is not None:
+            request["price"] = limit_rate
+
+        # Persist the intent BEFORE the POST so a timeout/restart can never create a
+        # duplicate conditional stoploss for the same position.
+        self._pm_intent_put(
+            client_strategy_id,
+            {
+                "kind": "conditional",
+                "pair": pair,
+                "side": side,
+                "type": strategy_type,
+                "amount": amount,
+                "stop_price": stop_price_norm,
+                "price": limit_rate,
+                "reduce_only": True,
+                "ts": time.time(),
+            },
+        )
+        try:
+            amount_contracts = self.amount_to_precision(
+                pair, self._amount_to_contracts(pair, amount)
+            )
+            request["quantity"] = amount_contracts
+            self._lev_prep(pair, leverage, side, accept_fail=True)
+            raw_order = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/conditional/order", "POST", request
+            )
+            self._pm_intent_clear(client_strategy_id)
+            self._log_exchange_response("papi_create_stoploss", raw_order)
+            order = self._parse_pm_conditional_order(raw_order, pair)
+            logger.info(
+                f"stoploss {user_order_type} ({strategy_type}) order added for {pair} "
+                f"through PM PAPI conditional endpoint. stop price: {stop_price}. "
+                f"limit: {limit_rate}."
+            )
+            return order
+        except ccxt.InsufficientFunds as e:
+            self._pm_intent_clear(client_strategy_id)
+            raise InsufficientFundsError(
+                f"Insufficient funds to create {strategy_type} {side} PM stoploss order on "
+                f"{pair}. Tried to {side} amount {amount} at rate {limit_rate} with "
+                f"stop-price {stop_price_norm}. Message: {e}"
+            ) from e
+        except (ccxt.InvalidOrder, ccxt.BadRequest, ccxt.OperationRejected) as e:
+            self._pm_intent_clear(client_strategy_id)
+            raise InvalidOrderException(
+                f"Could not create {strategy_type} {side} PM stoploss order on market {pair}. "
+                f"Tried to {side} amount {amount} at rate {limit_rate} with "
+                f"stop-price {stop_price_norm}. Message: {e}"
+            ) from e
+        except ccxt.DDoSProtection as e:
+            existing = self._pm_stoploss_resolve_after_transient(client_strategy_id, pair, str(e))
+            if existing is not None:
+                return existing
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            existing = self._pm_stoploss_resolve_after_transient(client_strategy_id, pair, str(e))
+            if existing is not None:
+                return existing
+            raise TemporaryError(
+                f"Could not place Binance PM stoploss order due to {e.__class__.__name__}. "
+                f"Message: {e}. The intent is persisted as UNKNOWN and will be resolved "
+                "before any new order is allowed."
+            ) from e
+        except ccxt.BaseError as e:
+            self._pm_intent_mark_uncertain(client_strategy_id, str(e))
+            raise OperationalException(e) from e
+
+    def _pm_stoploss_resolve_after_transient(
+        self, client_strategy_id: str, pair: str, error: str
+    ) -> CcxtOrder | None:
+        """
+        Resolve a conditional stoploss after a transient POST failure using the SAME
+        ``newClientStrategyId`` (openOrder -> orderHistory -> triggered real order).
+
+        * Order exists on the exchange -> clear the intent and RETURN it (the caller
+          writes it into the local trade). No duplicate strategy id is ever created.
+        * Definitively absent -> clear the intent (safe to retry on a later loop).
+        * Lookup also failed -> the intent stays UNKNOWN (block remains) and None is
+          returned so the caller raises. Never guesses.
+        """
+        try:
+            existing = self.fetch_stoploss_order(client_strategy_id, pair)
+        except InvalidOrderException:
+            # Exchange definitively has no such strategy -> it was never placed.
+            self._pm_intent_clear(client_strategy_id)
+            return None
+        except Exception as lookup_error:
+            # Uncertain: keep the UNKNOWN intent (block) - never resubmit.
+            self._pm_intent_mark_uncertain(client_strategy_id, error)
+            logger.warning(
+                f"Binance PM stoploss {client_strategy_id} POST raised {error} and the "
+                f"same-id lookup also failed ({lookup_error}); intent kept UNKNOWN."
+            )
+            return None
+        self._pm_intent_clear(client_strategy_id)
+        logger.warning(
+            f"Binance PM stoploss {client_strategy_id} POST raised {error}; resolved the "
+            f"already-placed conditional order {existing.get('id')} and returning it "
+            "(no duplicate submitted)."
+        )
+        return existing
+
+    @retrier(retries=0)
+    def fetch_stoploss_order(
+        self, order_id: str, pair: str, params: dict | None = None
+    ) -> CcxtOrder:
+        """
+        Fetch a PM conditional (stoploss) order with full lifecycle resolution.
+
+        * ``NEW`` strategies live on ``/um/conditional/openOrder``.
+        * Triggered/cancelled/expired strategies fall back to
+          ``/um/conditional/orderHistory``.
+        * A TRIGGERED strategy reports the REAL order id in ``orderId``; the real
+          order is fetched through ``/um/order`` so filled/average/cost/fee/trades
+          are authoritative - the strategy stays ``open`` until the real order
+          actually fills. No fill data is ever fabricated from the strategy record.
+
+        Fail-closed: transient failures propagate (TemporaryError) so the caller
+        aborts the iteration instead of assuming the stoploss is gone and placing a
+        duplicate one. InvalidOrderException is raised ONLY when the exchange
+        definitively reports the strategy no longer exists.
+        """
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super().fetch_stoploss_order(order_id, pair, params)
+        request: dict[str, Any] = {"symbol": self._pm_symbol_for_pair(pair)}
+        request.update(self._pm_conditional_lookup_params(order_id))
+        request.update(params or {})
+        try:
+            raw_order = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/conditional/openOrder", "GET", request
+            )
+            self._log_exchange_response("papi_fetch_stoploss_order", raw_order)
+            return self._parse_pm_conditional_order(raw_order, pair)
+        except ccxt.BaseError as e:
+            if not self._pm_order_not_found(e):
+                # Transient error -> propagate; the caller must not treat the
+                # stoploss as absent and must not create a duplicate.
+                self._pm_raise_transient("fetch_stoploss_order", e)
+            # Definitive "not open": fall back to the conditional history.
+            try:
+                raw_order = self._papi_request(
+                    f"{self._pm_namespace_for_pair(pair)}/conditional/orderHistory",
+                    "GET",
+                    request,
+                )
+                self._log_exchange_response("papi_fetch_stoploss_history", raw_order)
+            except ccxt.BaseError as history_exc:
+                if self._pm_order_not_found(history_exc):
+                    raise InvalidOrderException(
+                        f"Binance PM conditional order {order_id} on {pair} does not exist "
+                        "(not open, not in history)."
+                    ) from history_exc
+                self._pm_raise_transient("fetch_stoploss_history", history_exc)
+            order = self._parse_pm_conditional_order(raw_order, pair)
+            # TRIGGERED/FINISHED with a real order id -> resolve the real order.
+            strategy_status = str(order.get("info", {}).get("strategyStatus") or "").upper()
+            if order.get("info", {}).get("orderId") and strategy_status in {
+                "TRIGGERED",
+                "FINISHED",
+            }:
+                return self._pm_resolve_conditional_actual_order(order, pair)
+            return order
+
+    @retrier(retries=0)
+    def fetch_open_conditional_orders(self, pair: str | None = None) -> list[CcxtOrder]:
+        """
+        Fetch currently open PM conditional (stoploss) orders via
+        ``/um/conditional/openOrders``. Used by the startup consistency check.
+        """
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return []
+        request: dict[str, Any] = {}
+        if pair is not None:
+            request["symbol"] = self._pm_symbol_for_pair(pair)
+        try:
+            raw_orders = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair or list(self.markets.keys())[0])}"
+                "/conditional/openOrders",
+                "GET",
+                request,
+            )
+            self._log_exchange_response("papi_open_conditional_orders", raw_orders)
+            return [
+                self._parse_pm_conditional_order(raw_order, pair)
+                for raw_order in raw_orders
+            ]
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get Binance PM open conditional orders due to "
+                f"{e.__class__.__name__}. Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier
+    def cancel_stoploss_order(
+        self, order_id: str, pair: str, params: dict | None = None
+    ) -> dict:
+        """
+        Cancel a PM conditional (stoploss) order via ``/um/conditional/order`` DELETE.
+        """
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super().cancel_stoploss_order(order_id, pair, params)
+        request: dict[str, Any] = {"symbol": self._pm_symbol_for_pair(pair)}
+        request.update(self._pm_conditional_lookup_params(order_id))
+        request.update(params or {})
+        try:
+            raw_order = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/conditional/order", "DELETE", request
+            )
+            self._log_exchange_response("papi_cancel_stoploss", raw_order)
+            return self._parse_pm_conditional_order(raw_order, pair)
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not cancel Binance PM stoploss order due to {e.__class__.__name__}. "
+                f"Message: {e}"
+            ) from e
+        except ccxt.BaseError as e:
+            raise OperationalException(e) from e
+
+    @retrier
+    def _get_funding_fees_from_exchange(self, pair: str, since: datetime | int) -> float:
+        """
+        Sum funding fees for a PM pair through the PAPI ``/um/income`` endpoint.
+
+        PM private flows must not use the generic ccxt FAPI ``fetch_funding_history()``.
+        """
+        if not self._is_portfolio_margin() or self._config["dry_run"]:
+            return super()._get_funding_fees_from_exchange(pair, since)
+
+        if type(since) is datetime:
+            since = dt_ts(since)
+        try:
+            raw_income = self._papi_request(
+                f"{self._pm_namespace_for_pair(pair)}/income",
+                "GET",
+                {
+                    "symbol": self._pm_symbol_for_pair(pair),
+                    "incomeType": "FUNDING_FEE",
+                    "startTime": int(since),
+                    "limit": 1000,
+                },
+            )
+            self._log_exchange_response(
+                "papi_funding_fees", raw_income, add_info=f"pair: {pair}, since: {since}"
+            )
+            return sum(self._float_or_zero(entry.get("income")) for entry in raw_income)
+        except ccxt.DDoSProtection as e:
+            raise DDosProtection(e) from e
+        except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            raise TemporaryError(
+                f"Could not get Binance PM funding fees due to {e.__class__.__name__}. Message: {e}"
             ) from e
         except ccxt.BaseError as e:
             raise OperationalException(e) from e

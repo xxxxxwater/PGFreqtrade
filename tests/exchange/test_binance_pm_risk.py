@@ -1,11 +1,13 @@
 import asyncio
+from datetime import UTC, datetime
 from threading import RLock
 from unittest.mock import MagicMock
 
 import ccxt
 import pytest
 
-from freqtrade.exceptions import OperationalException
+from freqtrade.enums import PriceType
+from freqtrade.exceptions import OperationalException, TemporaryError
 from freqtrade.exchange.binance import Binance
 
 
@@ -76,12 +78,8 @@ def test_pm_create_order_passes_entry_mode_to_risk_check():
     exchange._order_needs_price = MagicMock(return_value=False)
     exchange.assert_pm_risk_allows_order = MagicMock()
     exchange._lev_prep = MagicMock()
-    exchange._pm_namespace_for_pair = MagicMock(return_value="um")
-    exchange._pm_order_params = MagicMock(return_value={"symbol": "BTCUSDT"})
-    exchange._papi_request = MagicMock(return_value={"orderId": 1, "status": "NEW"})
-    exchange._log_exchange_response = MagicMock()
-    exchange._parse_pm_order = MagicMock(return_value={"id": "1", "status": "open"})
-    exchange._order_contracts_to_amount = MagicMock(side_effect=lambda order: order)
+    exchange.pm_has_unresolved_intents = MagicMock(return_value=False)
+    exchange._pm_place_order = MagicMock(return_value={"id": "1", "status": "open"})
 
     exchange.create_order(
         pair=PAIR,
@@ -96,6 +94,29 @@ def test_pm_create_order_passes_entry_mode_to_risk_check():
     exchange.assert_pm_risk_allows_order.assert_called_once_with(
         pair=PAIR, amount=0.001, leverage=5, entry_mode="pos_adjust"
     )
+
+
+def test_pm_create_order_blocked_on_unresolved_intents():
+    """Exposure-increasing orders must be refused when intents are unresolved."""
+    exchange = Binance.__new__(Binance)
+    exchange._portfolio_margin = True
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._config = {"dry_run": False, "exchange": {"portfolio_margin_risk": {}}}
+    exchange._get_params = MagicMock(return_value={})
+    exchange.pm_has_unresolved_intents = MagicMock(return_value=True)
+
+    with pytest.raises(TemporaryError, match="unresolved order intents"):
+        exchange.create_order(
+            pair=PAIR,
+            ordertype="market",
+            side="buy",
+            amount=0.001,
+            rate=60000,
+            leverage=5,
+            entry_mode="initial",
+        )
 
 
 def test_pm_risk_config_rejects_unknown_keys():
@@ -196,6 +217,145 @@ def test_pm_papi_auth_error_includes_request_ip_hint():
 
     with pytest.raises(OperationalException, match=r"43\.212\.29\.197"):
         exchange._papi_request("account", "GET")
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed risk checks
+# ---------------------------------------------------------------------------
+
+
+def test_pm_risk_fail_closed_missing_account_status():
+    exchange = make_pm_exchange({})
+    exchange.fetch_pm_account_information = MagicMock(return_value={"uniMMR": "10"})
+
+    with pytest.raises(OperationalException, match="accountStatus is missing"):
+        exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=5)
+
+
+def test_pm_risk_fail_closed_missing_uni_mmr_when_configured():
+    exchange = make_pm_exchange({"min_uni_mmr": 1.5})
+    exchange.fetch_pm_account_information = MagicMock(return_value={"accountStatus": "NORMAL"})
+
+    with pytest.raises(OperationalException, match="uniMMR is missing"):
+        exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=5)
+
+
+def test_pm_risk_fail_closed_api_exception():
+    exchange = make_pm_exchange({})
+    exchange.fetch_pm_account_information = MagicMock(side_effect=ccxt.ExchangeError("boom"))
+
+    with pytest.raises(OperationalException, match="fail-closed"):
+        exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=5)
+
+
+def test_pm_risk_fail_closed_price_unavailable():
+    exchange = make_pm_exchange({"max_total_notional": 100})
+    exchange.get_rate = MagicMock(side_effect=Exception("no price"))
+
+    with pytest.raises(OperationalException, match="Could not fetch entry price"):
+        exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=5)
+
+
+def test_pm_risk_fail_closed_zero_price():
+    exchange = make_pm_exchange({"max_total_notional": 100})
+    exchange.get_rate = MagicMock(return_value=0)
+
+    with pytest.raises(OperationalException, match="Invalid entry price"):
+        exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=5)
+
+
+# ---------------------------------------------------------------------------
+# PM order endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_pm_fetch_orders_uses_papi_all_orders():
+    exchange = Binance.__new__(Binance)
+    exchange._portfolio_margin = True
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._config = {"dry_run": False, "exchange": {}}
+    exchange._pm_symbol_for_pair = MagicMock(return_value="BTCUSDT")
+    exchange._pm_namespace_for_pair = MagicMock(return_value="um")
+    exchange._papi_request = MagicMock(return_value=[{"orderId": 1, "status": "FILLED"}])
+    exchange._log_exchange_response = MagicMock()
+    exchange._parse_pm_order = MagicMock(return_value={"id": "1", "status": "closed"})
+    exchange._order_contracts_to_amount = MagicMock(side_effect=lambda o: o)
+
+    orders = exchange._fetch_orders(PAIR, datetime(2024, 1, 1, tzinfo=UTC))
+
+    assert len(orders) == 1
+    assert exchange._papi_request.call_args[0][0] == "um/allOrders"
+    request = exchange._papi_request.call_args[0][2]
+    assert request["symbol"] == "BTCUSDT"
+    assert "startTime" in request
+
+
+def test_pm_fetch_order_strips_stop_param():
+    exchange = Binance.__new__(Binance)
+    exchange._portfolio_margin = True
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._config = {"dry_run": False, "exchange": {}}
+    exchange._pm_symbol_for_pair = MagicMock(return_value="BTCUSDT")
+    exchange._pm_namespace_for_pair = MagicMock(return_value="um")
+    exchange._papi_request = MagicMock(return_value={"orderId": 1, "status": "NEW"})
+    exchange._log_exchange_response = MagicMock()
+    exchange._parse_pm_order = MagicMock(return_value={"id": "1", "status": "open"})
+    exchange._order_contracts_to_amount = MagicMock(side_effect=lambda o: o)
+
+    exchange.fetch_order("1", PAIR, params={"stop": True})
+
+    request = exchange._papi_request.call_args[0][2]
+    assert "stop" not in request
+    assert request["orderId"] == "1"
+
+
+def test_pm_create_stoploss_uses_papi_conditional_reduce_only():
+    exchange = Binance.__new__(Binance)
+    exchange._portfolio_margin = True
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+    exchange._config = {"dry_run": False, "exchange": {}}
+    exchange.pm_has_unresolved_intents = MagicMock(return_value=False)
+    exchange._get_stop_order_type = MagicMock(return_value=("stop_market", "market"))
+    exchange._pm_new_client_strategy_id = MagicMock(return_value="st1234567890abcdef")
+    exchange._pm_intent_put = MagicMock()
+    exchange._pm_intent_clear = MagicMock()
+    exchange._pm_namespace_for_pair = MagicMock(return_value="um")
+    exchange._pm_symbol_for_pair = MagicMock(return_value="BTCUSDT")
+    exchange.price_to_precision = MagicMock(side_effect=lambda pair, price, **kw: price)
+    exchange.amount_to_precision = MagicMock(side_effect=lambda pair, amount: amount)
+    exchange._amount_to_contracts = MagicMock(side_effect=lambda pair, amount: amount)
+    exchange._lev_prep = MagicMock()
+    exchange._papi_request = MagicMock(
+        return_value={"orderId": 9, "status": "NEW", "type": "STOP_MARKET"}
+    )
+    exchange._log_exchange_response = MagicMock()
+    exchange._parse_pm_conditional_order = MagicMock(return_value={"id": "9", "status": "open"})
+    exchange._order_contracts_to_amount = MagicMock(side_effect=lambda o: o)
+
+    exchange.create_stoploss(
+        pair=PAIR,
+        amount=0.001,
+        stop_price=60000,
+        order_types={"stoploss": "market", "stoploss_price_type": PriceType.LAST},
+        side="sell",
+        leverage=5,
+    )
+
+    assert exchange._papi_request.call_args[0][0] == "um/conditional/order"
+    request = exchange._papi_request.call_args[0][2]
+    assert request["strategyType"] == "STOP_MARKET"
+    assert request["reduceOnly"] == "true"
+    assert request["stopPrice"] == 60000
+    assert request["workingType"] == "CONTRACT_PRICE"
+    assert request["newClientStrategyId"] == "st1234567890abcdef"
+    exchange._pm_intent_put.assert_called_once()
+    exchange._pm_intent_clear.assert_called_once()
 
 
 def test_pm_papi_operation_rejected_auth_error_is_not_retried():

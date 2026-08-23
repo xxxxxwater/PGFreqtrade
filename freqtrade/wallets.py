@@ -59,11 +59,47 @@ class Wallets:
         )
 
     def get_free(self, currency: str) -> float:
+        # Binance PM collateral-haircut funding model: derive strategy-usable stake from
+        # the PAPI risk account available balance (collateral converted by Binance) with a
+        # conservative discount, instead of only the stake-currency free balance.
+        if currency == self._stake_currency:
+            pm_available = self._get_pm_available_stake()
+            if pm_available is not None:
+                return pm_available
         balance = self._wallets.get(currency)
         if balance and balance.free:
             return balance.free
         else:
             return 0
+
+    def _get_pm_available_stake(self) -> float | None:
+        """
+        Available opening stake under the PM_COLLATERAL_HAIRCUT wallet model.
+
+        Uses the PAPI risk account ``available_balance`` (which already excludes used
+        initial margin, so collateral / margin / available funds are never double-counted)
+        multiplied by the configured ``collateral_haircut`` discount. Returns None when the
+        model is not enabled or the data is unavailable (caller falls back to USDT free).
+        """
+        risk_cfg = self._config.get("exchange", {}).get("portfolio_margin_risk", {})
+        if risk_cfg.get("wallet_mode", "USDT_ONLY") != "PM_COLLATERAL_HAIRCUT":
+            return None
+        if not getattr(self._exchange, "_is_portfolio_margin", lambda: False)():
+            return None
+        if not hasattr(self._exchange, "get_pm_risk_summary"):
+            return None
+        try:
+            summary = self._exchange.get_pm_risk_summary()
+        except Exception:
+            logger.warning("PM wallet: could not read risk summary; falling back to USDT free.")
+            return None
+        if not summary.get("enabled"):
+            return None
+        available = summary.get("available_balance")
+        if available is None:
+            return None
+        haircut = float(risk_cfg.get("collateral_haircut", 1.0))
+        return available * haircut
 
     def get_used(self, currency: str) -> float:
         balance = self._wallets.get(currency)

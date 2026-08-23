@@ -72,6 +72,8 @@ def test_send_msg_webhook(default_conf, mocker):
     msg_mock = MagicMock()
     mocker.patch("freqtrade.rpc.webhook.Webhook._send_msg", msg_mock)
     webhook = Webhook(RPC(get_patched_freqtradebot(mocker, default_conf)), default_conf)
+    # Make delivery synchronous so the async sender queue does not race assertions.
+    mocker.patch.object(Webhook, "_enqueue", lambda self, payload: self._send_msg(payload))
     # Test buy
     msg_mock = MagicMock()
     mocker.patch("freqtrade.rpc.webhook.Webhook._send_msg", msg_mock)
@@ -449,6 +451,8 @@ def test_send_msg_discord(default_conf, mocker):
     msg_mock = MagicMock()
     mocker.patch("freqtrade.rpc.webhook.Webhook._send_msg", msg_mock)
     discord = Discord(RPC(get_patched_freqtradebot(mocker, default_conf)), default_conf)
+    # Make delivery synchronous so the async sender queue does not race assertions.
+    mocker.patch.object(Webhook, "_enqueue", lambda self, payload: self._send_msg(payload))
 
     msg = {
         "type": RPCMessageType.EXIT_FILL,
@@ -492,6 +496,8 @@ def test_nested_payload_format(default_conf, mocker):
     default_conf["webhook"] = webhook_config
 
     webhook = Webhook(RPC(get_patched_freqtradebot(mocker, default_conf)), default_conf)
+    # Make delivery synchronous so the async sender queue does not race assertions.
+    mocker.patch.object(Webhook, "_enqueue", lambda self, payload: self._send_msg(payload))
 
     msg = {
         "type": RPCMessageType.STATUS,
@@ -507,3 +513,78 @@ def test_nested_payload_format(default_conf, mocker):
     }
 
     post.assert_called_once_with("https://example.com", json=expected_payload, timeout=10)
+
+
+def test_webhook_async_delivery_background_thread(default_conf, mocker):
+    """
+    Webhook send_msg must enqueue and return immediately; the dedicated background
+    thread performs the (potentially slow, blocking) HTTP delivery so the trading
+    main loop is never blocked.
+    """
+    import threading
+
+    default_conf["webhook"] = get_webhook_dict()
+    webhook = Webhook(RPC(get_patched_freqtradebot(mocker, default_conf)), default_conf)
+
+    delivered = threading.Event()
+    sent_payload: dict = {}
+
+    def fake_send(payload):
+        sent_payload.update(payload)
+        delivered.set()
+
+    mocker.patch.object(webhook, "_send_msg", side_effect=fake_send)
+    msg = {
+        "type": RPCMessageType.ENTRY,
+        "exchange": "Binance",
+        "pair": "ETH/BTC",
+        "leverage": 1.0,
+        "direction": "Long",
+        "limit": 0.005,
+        "stake_amount": 0.8,
+        "stake_amount_fiat": 500,
+        "stake_currency": "BTC",
+        "fiat_currency": "EUR",
+    }
+
+    webhook.send_msg(msg=msg)
+
+    # send_msg returns immediately (it only enqueues); the background thread
+    # performs delivery asynchronously.
+    assert delivered.wait(timeout=3), "background thread did not deliver the message"
+    assert "Buying ETH/BTC" in sent_payload.get("value1", "")
+    webhook.cleanup()
+
+
+def test_webhook_queue_full_counts_dropped(default_conf, mocker):
+    """
+    When the async queue is full, send_msg must not block; the message is dropped and
+    counted, and the drop is exposed through health().
+    """
+    default_conf["webhook"] = get_webhook_dict()
+    default_conf["webhook"]["queue_maxsize"] = 1
+    webhook = Webhook(RPC(get_patched_freqtradebot(mocker, default_conf)), default_conf)
+
+    # Do not consume the queue (block the sender) so we can overflow it.
+    mocker.patch.object(webhook, "_sender_loop", MagicMock())
+    msg = {
+        "type": RPCMessageType.ENTRY,
+        "exchange": "Binance",
+        "pair": "ETH/BTC",
+        "leverage": 1.0,
+        "direction": "Long",
+        "limit": 0.005,
+        "stake_amount": 0.8,
+        "stake_amount_fiat": 500,
+        "stake_currency": "BTC",
+        "fiat_currency": "EUR",
+    }
+    webhook.send_msg(msg=msg)
+    webhook.send_msg(msg=msg)
+
+    assert webhook._queue.qsize() == 1
+    assert webhook._dropped == 1
+    health = webhook.health()
+    assert health["dropped"] == 1
+    assert health["queue_size"] == 1
+    webhook.cleanup()

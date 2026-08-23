@@ -34,6 +34,7 @@ from freqtrade.enums import (
     ExitCheckTuple,
     ExitType,
     MarketDirection,
+    RPCMessageType,
     SignalDirection,
     State,
     TradingMode,
@@ -1184,6 +1185,17 @@ class RPC:
             result += f" Skipped other settlements: {', '.join(skipped)}."
         if failed_ids:
             result += f" Failed ids: {', '.join(failed_ids)}."
+            # Explicit alert: failed exits are NOT silently treated as closed.
+            self._freqtrade.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM /pm_close PARTIAL FAILURE: could not create exit orders for "
+                        f"trades {', '.join(failed_ids)} (settlement={target}). "
+                        "These positions remain OPEN - manual intervention required."
+                    ),
+                }
+            )
         return {"result": result}
 
     def _rpc_pm_status(self) -> dict[str, Any]:
@@ -1215,7 +1227,13 @@ class RPC:
             "account_equity": risk.get("account_equity"),
             "initial_margin": risk.get("initial_margin"),
             "maintenance_margin": risk.get("maintenance_margin"),
+            "user_stream_state": getattr(
+                self._freqtrade, "_pm_get_user_stream_state", lambda: "UNKNOWN"
+            )(),
             "user_stream": stream,
+            "orders_blocked_reasons": getattr(
+                self._freqtrade, "_pm_blocked_order_reasons", lambda: []
+            )(),
             "balances": non_zero_balances,
             "positions": [
                 position
@@ -1239,6 +1257,12 @@ class RPC:
         account_status = risk.get("account_status")
         min_uni_mmr = risk_cfg.get("min_uni_mmr")
         warning_uni_mmr = risk_cfg.get("warning_uni_mmr")
+        equity = risk.get("account_equity")
+        initial_margin = risk.get("initial_margin")
+
+        equity_buffer = None
+        if equity is not None and initial_margin is not None:
+            equity_buffer = equity - initial_margin
 
         alerts: list[str] = []
         if account_status and account_status != "NORMAL":
@@ -1250,17 +1274,22 @@ class RPC:
 
         return {
             "enabled": True,
+            "wallet_mode": risk_cfg.get("wallet_mode", "USDT_ONLY"),
             "account_status": risk.get("account_status") or "unknown",
             "uni_mmr": uni_mmr,
-            "account_equity": risk.get("account_equity"),
-            "initial_margin": risk.get("initial_margin"),
+            "account_equity": equity,
+            "available_balance": risk.get("available_balance"),
+            "initial_margin": initial_margin,
             "maintenance_margin": risk.get("maintenance_margin"),
             "total_collateral_value": risk.get("total_collateral_value"),
+            "equity_buffer": equity_buffer,
+            "available_stake": self._freqtrade.wallets.get_available_stake_amount(),
             "min_uni_mmr": min_uni_mmr,
             "warning_uni_mmr": warning_uni_mmr,
             "alerts": alerts,
             "new_orders_allowed": (
                 account_status == "NORMAL"
+                and not self._freqtrade._pm_blocked_order_reasons()
                 and (min_uni_mmr is None or uni_mmr is None or uni_mmr >= float(min_uni_mmr))
             ),
         }
@@ -1273,36 +1302,32 @@ class RPC:
         if not self._freqtrade.exchange._is_portfolio_margin():
             raise RPCException("Binance PM mode is not enabled.")
 
-        open_trades = Trade.get_open_trades()
-        reconciled: list[str] = []
-        mismatches: list[str] = []
-        errors: list[str] = []
-
-        for trade in open_trades:
-            for order in trade.open_orders:
-                try:
-                    exchange_order = self._freqtrade.exchange.fetch_order(
-                        order.order_id, trade.pair
-                    )
-                    if exchange_order.get("status") != order.status:
-                        mismatches.append(
-                            f"{order.order_id}({trade.pair}): DB={order.status} "
-                            f"Exchange={exchange_order.get('status')}"
-                        )
-                        trade.update_order(exchange_order)
-                        reconciled.append(order.order_id)
-                except Exception as e:
-                    errors.append(f"{order.order_id}: {e}")
-
-        if reconciled:
-            Trade.commit()
+        # 1) Resolve ALL unresolved order intents first. The fail-closed block may
+        #    only be cleared once every intent is definitively resolved.
+        intents_report = self._freqtrade._pm_recover_pending_intents()
+        # 2) Use the shared, idempotent PM reconciliation which runs the full
+        #    update_trade_state() lifecycle (fees, realized PnL, exit time, wallet,
+        #    notifications, protections) - not just a bare trade.update_order().
+        result = self._freqtrade._pm_reconcile_open_orders()
+        unresolved = self._freqtrade._pm_has_unresolved_intents()
+        # 3) Only a fully clean recovery clears the fail-closed blocks.
+        if not result["errors"] and not unresolved and not intents_report["unresolved"]:
+            self._freqtrade._pm_unblock_orders("unmatched_stream_order")
+            self._freqtrade._pm_unblock_orders("reconciliation_incomplete")
+            self._freqtrade._pm_unblock_orders("pending_intent_unresolved")
 
         return {
-            "open_trades": len(open_trades),
-            "reconciled_count": len(reconciled),
-            "reconciled": reconciled,
-            "mismatches": mismatches,
-            "errors": errors,
+            "open_trades": result["open_trades"],
+            "orders_checked": result["checked"],
+            "reconciled_count": result["reconciled"],
+            "mismatches": result["mismatches"],
+            "errors": result["errors"],
+            "intents_checked": intents_report["checked"],
+            "intents_cleared": intents_report["cleared"],
+            "intents_existed": intents_report["existed"],
+            "intents_unresolved": intents_report["unresolved"],
+            "intent_store_error": intents_report["store_error"],
+            "orders_blocked_reasons": self._freqtrade._pm_blocked_order_reasons(),
         }
 
     def _force_entry_validations(self, pair: str, order_side: SignalDirection):
@@ -1934,9 +1959,9 @@ class RPC:
             "ram_pct": psutil.virtual_memory().percent,
         }
 
-    def health(self) -> dict[str, str | int | None]:
+    def health(self) -> dict[str, Any]:
         last_p = self._freqtrade.last_process
-        res: dict[str, None | str | int] = {
+        res: dict[str, Any] = {
             "last_process": None,
             "last_process_loc": None,
             "last_process_ts": None,
@@ -1974,7 +1999,69 @@ class RPC:
                 }
             )
 
+        # Expose Binance PM account / user-stream / PAPI health for live PM operations.
+        if getattr(self._freqtrade.exchange, "_is_portfolio_margin", lambda: False)():
+            pm: dict[str, Any] = {
+                "enabled": True,
+                "account_status": "unknown",
+                "uni_mmr": None,
+                "user_stream_state": getattr(
+                    self._freqtrade, "_pm_get_user_stream_state", lambda: "UNKNOWN"
+                )(),
+                "orders_blocked_reasons": getattr(
+                    self._freqtrade, "_pm_blocked_order_reasons", lambda: []
+                )(),
+                "last_papi_success": getattr(
+                    self._freqtrade.exchange, "_last_papi_success_time", None
+                ),
+                "last_reconcile_result": getattr(
+                    self._freqtrade, "_pm_last_reconcile_result", None
+                ),
+                "last_success_reconcile_time": (
+                    getattr(
+                        self._freqtrade, "_pm_last_success_reconcile_time", None
+                    ).isoformat()
+                    if getattr(self._freqtrade, "_pm_last_success_reconcile_time", None)
+                    else None
+                ),
+                "unresolved_intent_count": getattr(
+                    self._freqtrade, "_pm_unresolved_intent_count", lambda: -1
+                )(),
+                "intent_store_ok": getattr(
+                    self._freqtrade.exchange, "pm_intent_store_ok", lambda: False
+                )(),
+                "pending_order_intents": [],
+                "unmatched_stream_order_ids": sorted(
+                    list(getattr(self._freqtrade, "_pm_unmatched_stream_order_ids", set()))
+                ),
+            }
+            try:
+                if hasattr(self._freqtrade.exchange, "list_pm_pending_intents"):
+                    pm["pending_order_intents"] = (
+                        self._freqtrade.exchange.list_pm_pending_intents()
+                    )
+            except Exception:
+                logger.debug("Could not include PM pending order intents in health endpoint.")
+            try:
+                risk = self._freqtrade.exchange.get_pm_risk_summary()
+                if risk.get("enabled"):
+                    pm["account_status"] = risk.get("account_status") or "unknown"
+                    pm["uni_mmr"] = risk.get("uni_mmr")
+            except Exception:
+                logger.debug("Could not include PM risk summary in health endpoint.")
+            res["pm"] = pm
+
         return res
+
+    def rpc_health(self) -> list[dict[str, Any]]:
+        """
+        Health/status of all registered RPC modules (Telegram init failures, send
+        failures, webhook queue backlog, ...). Exposed via GET /api/v1/rpc_health.
+        """
+        rpc_manager = getattr(self._freqtrade, "rpc", None)
+        if rpc_manager is None or not hasattr(rpc_manager, "health"):
+            return []
+        return rpc_manager.health()
 
     def _update_market_direction(self, direction: MarketDirection) -> None:
         self._freqtrade.strategy.market_direction = direction

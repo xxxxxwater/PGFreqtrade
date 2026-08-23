@@ -113,7 +113,140 @@ environment variables cannot silently override the config file credentials.
 | `max_leverage` | Maximum allowed leverage for any position. | _optional_ |
 | `max_total_notional` | Maximum total notional value across all positions (USD). | _optional_ |
 | `max_position_notional` | Per-pair maximum notional value (dict: pair→cap). | _optional_ |
-| `max_daily_loss` | Maximum realized loss per UTC day before emergency stop. | _optional_ |
+| `max_daily_loss` | Maximum loss per UTC day before emergency stop. By default **realized PnL only** (trades closed today); see `max_daily_loss_include_unrealized`. | _optional_ |
+| `max_daily_loss_include_unrealized` | Also include unrealized PnL of open trades when evaluating `max_daily_loss`. | `false` |
+| `risk_api_failure_action` | Action when the PM risk API fails during the scheduled risk monitor: `warn` (block new orders + alert), `pause` (enter PAUSED), `stop` (enter STOPPED). New orders are always blocked (fail-closed). | `warn` |
+| `user_stream_fail_closed` | When `true`, block new orders whenever the PM user stream is unavailable (listenKey creation failed, stream not running, long disconnect, dropped/backlogged events). | `true` |
+| `allow_degraded_rest_recovery` | When `user_stream_fail_closed=false`, allow opening new orders using REST-only recovery. **Default `false` - do not enable for real money.** | `false` |
+| `wallet_mode` | Wallet funding model. `USDT_ONLY` (default): only actual USDT/USDC free balance is usable as opening capital; BTC/ETH collateral is never converted into stake. `PM_COLLATERAL_HAIRCUT`: derive strategy-usable stake from the PAPI risk account `available_balance` × `collateral_haircut`. | `USDT_ONLY` |
+| `collateral_haircut` | Conservative discount `(0, 1]` applied to PAPI `available_balance` when `wallet_mode=PM_COLLATERAL_HAIRCUT`. | `1.0` |
+| `startup_consistency_mode` | Startup mismatch handling between exchange PM positions/open orders and the local database. `pause` (default, safe): alert + enter PAUSED; `report`: alert only; `cancel`: cancel unmatched exchange open orders, and enter PAUSED if unmatched positions remain. | `pause` |
+| `emergency_close_retries` | Maximum attempts to force-close each open position during a PM emergency close. | `3` |
+
+## Fail-Closed Behavior
+
+PM risk control is **fail-closed by default**:
+
+- New non-reduce-only orders require `accountStatus == NORMAL` and a valid `uniMMR`
+  when `min_uni_mmr` is configured. Missing/invalid data refuses the order.
+- If an entry price cannot be fetched (or is 0) while notional caps are configured,
+  the order is refused.
+- If the PM risk API fails during the scheduled monitor, new orders are blocked and
+  the configured `risk_api_failure_action` runs (`warn`/`pause`/`stop`).
+- If the user data stream is unavailable and `user_stream_fail_closed=true`, new
+  orders are blocked until the stream recovers AND a clean reconciliation
+  completes (see User Stream Health State Machine).
+- `max_daily_loss` counts realized PnL by default; set `max_daily_loss_include_unrealized`
+  to include unrealized losses.
+
+## Durable Order Intents (idempotency)
+
+Every PM order (entry / DCA / exit / stoploss) is protected by a **durable order
+intent** stored in the MAIN freqtrade database (new table `pm_order_intents`,
+created automatically by `ModelBase.metadata.create_all`). The JSON-file based
+intent store of earlier revisions is removed - there is no ad-hoc JSON file and
+no silent fallback:
+
+| Column | Meaning |
+|--------|---------|
+| `client_id` | Unique `newClientOrderId` (`ft...`) or `newClientStrategyId` (`st...`) |
+| `kind` | `order` (normal) or `conditional` (stoploss) |
+| `pair` / `side` / `order_type` / `amount` / `price` / `stop_price` | Order parameters |
+| `reduce_only` | Whether the order is reduce-only |
+| `created_at` / `state` / `last_error` | Timestamp, `PENDING`/`UNKNOWN`, error detail |
+
+Rules:
+
+1. The intent is durably committed **before** the exchange POST. Failing to
+   write/read/commit the store => NO POST, bot `PAUSED` / orders blocked,
+   RPC/Telegram alert (`intent_store_unavailable`).
+2. On a transient POST failure the order is resolved with the **same** client id
+   (`origClientOrderId` for normal orders; `newClientStrategyId` conditional
+   openOrder/orderHistory for stoplosses). If the order exists it is returned
+   and written into the local trade - never resubmitted.
+3. If the same-id lookup also fails, the intent stays `UNKNOWN`. From that exact
+   moment the unified entry gate (strategy entry, DCA, force-entry, recovery
+   re-entry, stoploss creation) reads the durable store and blocks - no second
+   client id is ever generated. reduceOnly exits / emergency closes are NOT
+   blocked.
+4. `/pm_recover` resolves all unresolved intents first; the fail-closed block is
+   cleared only when every intent is definitively resolved and reconciliation
+   completed without errors.
+
+## Wallet Model (collateral)
+
+The adapter supports two mutually exclusive wallet funding models, selected via
+`portfolio_margin_risk.wallet_mode`:
+
+### `USDT_ONLY` (default, recommended)
+
+Only the actual `USDT`/`USDC` free balance (the stake currency) counts as available
+opening capital. BTC/ETH held as Binance PM collateral are **not** converted into
+available stake and are **never** double-counted into balances, position margin or
+available funds. `stake_currency` must therefore be `USDT` or `USDC`, enforced at
+startup. This is the safest model: the bot only ever opens what the USDT/USDC free
+balance can cover.
+
+### `PM_COLLATERAL_HAIRCUT`
+
+The strategy-usable stake is derived from the PAPI risk account
+`available_balance` (collateral already converted by Binance to account base
+currency) multiplied by a conservative `collateral_haircut` discount:
+
+```
+available_stake = available_balance * collateral_haircut
+```
+
+`available_balance` already excludes used initial margin, so collateral, margin and
+available funds are never double-counted. Use a haircut below `1.0` (for example
+`0.8`) as a safety buffer. The bot still only ever opens what the discounted
+available balance can cover, and it does **not** automatically transfer, borrow or
+repay collateral.
+
+## User Stream Health State Machine
+
+The PM user data stream health is exposed as an explicit state (see `/pm_status` and
+the API `/health` endpoint):
+
+| State | Meaning |
+|-------|---------|
+| `SYNCING` | Initial state before the first health evaluation. |
+| `HEALTHY` | Stream running and connected, no dropped/backlogged events. New orders allowed. |
+| `DEGRADED` | Stream not running / disconnected too long / queue backlog / dropped events. New orders blocked (fail-closed). |
+| `FAILED` | Restart limit reached and the stream cannot self-heal. New orders blocked. |
+
+On reconnect or after dropped events, the bot first reconciles open orders against
+PAPI **successfully** (no errors, all local open orders resolved, no unresolved
+intents) before allowing new orders again. A connected WebSocket alone never
+unblocks: a failed reconcile keeps/adds `reconciliation_incomplete` and new orders
+stay blocked. `listenKeyExpired` rebuilds the listenKey, reconnects and reconciles
+before trading resumes.
+
+`/health` pm block exposes `last_reconcile_result`, `last_success_reconcile_time`,
+`unresolved_intent_count`, `intent_store_ok` and `orders_blocked_reasons`.
+
+## Startup Consistency Check
+
+On startup in live PM mode the bot compares exchange (PAPI) positions, normal open
+orders AND conditional open orders against the local database:
+
+- Unmatched exchange positions/open orders/conditionals are detected and reported.
+- `startup_consistency_mode=pause` (default): alert + `PAUSED` + new orders blocked.
+- `startup_consistency_mode=report`: alert only (explicit operator opt-out).
+- `startup_consistency_mode=cancel`: cancel unmatched normal orders via
+  `/um/order` DELETE and unmatched conditionals via `/um/conditional/order`
+  DELETE, then **re-query the exchange**. Only when the second check is clean
+  (no unknown positions/orders/conditionals) and every cancel succeeded does the
+  bot continue; otherwise `PAUSED` + `startup_consistency_mismatch`. Issuing a
+  cancel request is never treated as proof of safety.
+
+Before the user stream is released at startup, the bot also rebuilds the
+real-order-id -> strategy-id map from the local stoploss orders (conditional
+history resolution), so a child order event arriving right after restart is never
+classified as foreign.
+
+The bot never opens new positions while the local database is inconsistent with the
+exchange. Manual reconciliation is required before resuming.
 
 ## Risk Alert Levels
 
@@ -192,11 +325,13 @@ python scripts/binance_pm_framework_probe.py --user-stream-test --pretty
 Prints PM account status, risk fields, user stream state, balances, and open UM
 positions (up to 20).
 
-### `/pm_close [all|USDT|USDC]`
-Creates market exit orders for open futures trades:
-- `all` — close all trades regardless of settlement currency
-- `USDT` — close only USDT-settled contracts
-- `USDC` — close only USDC-settled contracts
+### `/pm_close [all|USDT|USDC] CONFIRM`
+Creates market exit orders for open futures trades. Requires the explicit
+`CONFIRM` token to execute (a single command must never liquidate the whole book
+accidentally):
+- `all CONFIRM` — close all trades regardless of settlement currency
+- `USDT CONFIRM` — close only USDT-settled contracts
+- `USDC CONFIRM` — close only USDC-settled contracts
 
 BTC/ETH are supported as PM collateral assets, not as contract settlement filters in this
 adapter. Coin-margined inverse contracts are intentionally out of scope.
@@ -232,6 +367,56 @@ The WebSocket stream is the fast path. Scheduled REST recovery remains enabled a
 the safety net for disconnects, missed events, process restarts, or delayed Binance
 order state propagation.
 
+## Deployment
+
+The repository ships a runnable dry-run example:
+
+- Strategy: `user_data/strategies/BtcUsdtPmStrategy.py` (example EMA cross - replace it).
+- Config template: `user_data/config_pm_live.example.json` (non-sensitive, `dry_run: true`).
+- Env template: `.env.pm.example`.
+- Compose: `docker-compose-pm.yml`.
+
+Startup is fail-fast: live mode (`dry_run: false`) refuses to start when the API
+key/secret are missing, `exchange.portfolio_margin_risk` is empty, `stake_currency` is
+not USDT/USDC, or the account type / pair whitelist is incompatible. A missing strategy
+also fails at startup via the strategy resolver.
+
+```bash
+# 1. Prepare config and env
+cp user_data/config_pm_live.example.json user_data/config_pm_live.json   # then edit
+cp .env.pm.example .env                                                   # then fill secrets
+
+# 2. Pre-flight checks
+python scripts/binance_pm_probe.py --all --pretty
+python scripts/binance_pm_probe.py --listen-key-test --pretty
+
+# 3. Dry-run first
+freqtrade trade --config user_data/config_pm_live.json --strategy BtcUsdtPmStrategy
+
+# 4. Only then: flip dry_run to false (small size first), monitor /pm_status /pm_risk /pm_recover
+```
+
+## Database Backup / Restore
+
+The default database is SQLite (`user_data/tradesv3.sqlite`). SQLite is single-writer
+and not recommended as the only copy for a live bot. Recommended:
+
+- **SQLite (simple):** take regular online backups while the bot runs:
+  ```bash
+  python scripts/backup_db.py --db-url sqlite:///user_data/tradesv3.sqlite \
+      --backup-dir user_data/backups --keep 7
+  ```
+- **PostgreSQL (recommended for live):** migrate once, then run with `--db-url`:
+  ```bash
+  freqtrade convert-db --db-url sqlite:///user_data/tradesv3.sqlite \
+      --db-url-out postgresql://user:pass@localhost:5432/freqtrade
+  # consistent dumps:
+  pg_dump 'postgresql://user:pass@localhost:5432/freqtrade' > backup.sql
+  ```
+- Keep a kill-switch: a separate process/alert that can stop the bot container
+  independently of the bot's own risk checks (e.g. `docker stop freqtrade-pm`),
+  since RPC notifications are best-effort and must never be the only emergency path.
+
 ## Production Notes
 
 Before enabling live trading, verify:
@@ -248,3 +433,111 @@ Before enabling live trading, verify:
 - API keys are IP-restricted and rotated after every accidental exposure.
 - Operational alerts cover rejected orders, cancelled orders, missing positions and low `uniMMR`.
 - PM listenKey lifecycle is verified via `--listen-key-test` before production.
+
+## PAPI Interface Mapping
+
+Private trading operations are routed to Binance Portfolio Margin PAPI endpoints only.
+No `/fapi/v1/*` private endpoint is used for the PM automation path.
+
+| Operation | PAPI endpoint | Method |
+|-----------|---------------|--------|
+| Create entry / exit / adjust / reduceOnly order | `POST /papi/v1/um/order` | `POST` |
+| Create stoploss (STOP_MARKET / STOP, reduceOnly) | `POST /papi/v1/um/conditional/order` | `POST` |
+| Fetch single order | `GET /papi/v1/um/order` | `GET` |
+| Resolve order by clientOrderId (idempotency) | `GET /papi/v1/um/order` (`origClientOrderId`) | `GET` |
+| Cancel order | `DELETE /papi/v1/um/order` | `DELETE` |
+| Fetch open conditional (stoploss) order | `GET /papi/v1/um/conditional/openOrder` | `GET` |
+| Fetch ALL open conditional (stoploss) orders (startup consistency) | `GET /papi/v1/um/conditional/openOrders` | `GET` |
+| Fetch conditional (stoploss) order history | `GET /papi/v1/um/conditional/orderHistory` | `GET` |
+| Cancel conditional (stoploss) order | `DELETE /papi/v1/um/conditional/order` | `DELETE` |
+| Fetch open orders | `GET /papi/v1/um/openOrders` | `GET` |
+| Fetch order history | `GET /papi/v1/um/allOrders` | `GET` |
+| Fetch executed trades (fills/fees) | `GET /papi/v1/um/userTrades` | `GET` |
+| Fetch funding fees | `GET /papi/v1/um/income` (`incomeType=FUNDING_FEE`) | `GET` |
+| Fetch positions | `GET /papi/v1/um/positionRisk` | `GET` |
+| Fetch account risk / equity / uniMMR | `GET /papi/v1/account` | `GET` |
+| Fetch balances | `GET /papi/v1/balance` | `GET` |
+| Set leverage | `POST /papi/v1/um/leverage` | `POST` |
+| Create / keepalive / delete listenKey | `POST/PUT/DELETE /papi/v1/listenKey` | |
+
+## Deployment Readiness
+
+This branch ships with a **safe, testable adapter** but has **not** completed live
+PAPI order lifecycle validation on a real standard Portfolio Margin account. There is
+no official Binance PM testnet; ordinary Futures testnet is **not** equivalent to PM.
+
+| Conclusion | Meaning | Required before advancing |
+|-----------|---------|---------------------------|
+| `BLOCKED` | Do not run live. | Any failing P0/P1 test or missing credential/preflight verification. |
+| `READ_ONLY_READY` | Read-only PAPI + user stream validation is safe to run. | All P0/P1 unit/integration tests pass; probe script verified against a read-only key. |
+| `CANARY_READY` | Small, supervised live trading on a single BTC/USDT:USDT perpetual is acceptable. | Read-only validation passed; `dry_run=false` preflight passes; small size, low leverage, human supervision, rollback + emergency-close plan ready. |
+| `LIVE_READY` | Unattended live trading is acceptable. | Full PAPI order lifecycle (entry/exit/adjust/cancel/stoploss) plus user-stream + order-recovery verified against the real PM account over multiple sessions. |
+
+**Current status of this branch: `READ_ONLY_READY` (pending operator's real-account
+read-only validation). Not `CANARY_READY` and not `LIVE_READY`.** Do not run
+unattended live trading until the closed-loop acceptance steps below have been
+executed on the real account.
+
+## Conditional Stoploss Closed Loop (P0)
+
+The conditional (stoploss) lifecycle is implemented end-to-end; `strategyStatus`
+alone is never trusted to close a trade:
+
+1. **Create**: `POST /um/conditional/order` with `strategyType=STOP|STOP_MARKET`,
+   `reduceOnly=true` and a client-generated `newClientStrategyId`. The intent is
+   durably committed to the main database table `pm_order_intents` (state
+   `PENDING`) **before** the POST so a timeout/restart can never submit a
+   duplicate stoploss for the same position. If the database cannot be written,
+   the POST is refused (fail-closed, see Durable Order Intents above).
+2. **State model**: `NEW` -> `open`. `TRIGGERED` -> **still open**: the exchange
+   reports the real order id in `orderId` (official
+   `QueryUmConditionalOrderHistoryResponse` field, only present after trigger);
+   the real order is fetched through `GET /um/order` and its authoritative
+   `filled`/`average`/`cost`/`fee`/`trades` are merged. Only a real `FILLED`
+   closes the strategy order. `CANCELLED`/`EXPIRED` never fabricate fills.
+3. **User stream**: order events are matched by local order id first, then by the
+   actual-order map (real order id -> strategy id). An unmatched event with our
+   `ft*`/`st*` client id triggers fail-closed blocking (`unmatched_stream_order`)
+   + Telegram/API alert + full reconciliation; foreign orders are ignored.
+4. **Recovery**: `_pm_reconcile_open_orders` branches per order side - stoploss
+   orders go through `fetch_stoploss_order` (conditional lifecycle), normal
+   orders through `fetch_order`. `/pm_recover` runs the same path and clears the
+   fail-closed block only when it completes without errors.
+5. **Startup**: pending order intents are resolved against the exchange first
+   (unresolvable => block `pending_intent_unresolved`). The consistency check
+   then compares positions, normal open orders AND conditional open orders
+   (`GET /um/conditional/openOrders`); unknown conditional orders pause + block
+   by default, and `cancel` mode deletes them through the conditional DELETE
+   endpoint - never through `/um/order`.
+
+## Minimal Live Acceptance Steps (real PM account, small size)
+
+Before `CANARY_READY` can be considered, run this supervised sequence on the real
+standard Portfolio Margin account with minimal BTCUSDT size and low leverage.
+Stop after each step if anything deviates; reconcile via `/pm_recover`.
+
+1. Read-only probe: `python scripts/binance_pm_probe.py --all` (account, balance,
+   positions, api trading status, account config, symbol config, listenKey).
+2. Manual entry: `POST /papi/v1/um/order` LIMIT BUY 0.001 BTCUSDT
+   (`newClientOrderId` = `ft` + 30 hex). Verify via `GET /um/order`.
+3. Filled entry appears in freqtrade (`/status` shows the trade and the entry order).
+4. Place a `STOP_MARKET` stoploss: `POST /um/conditional/order` with
+   `newClientStrategyId` = `st` + 30 hex, `stopPrice` slightly below entry.
+   Verify `/pm_status` shows the stoploss order open.
+5. Let the market hit the stop price (or move the stop price to trigger
+   immediately). Verify: the conditional history returns `TRIGGERED` with a real
+   `orderId`; freqtrade closes the trade with non-zero `filled`/`average`; the
+   position is flat on the exchange.
+6. Repeat with a `STOP` (limit) stoploss whose real order rests in the book
+   (NOT filled). Verify the strategy stays open in freqtrade and cancel it via
+   `/um/conditional/order` DELETE; verify freqtrade reflects `canceled`.
+7. User-stream: with a trade open, restart the bot process; verify pending
+   intents are resolved, the startup consistency check matches exchange state,
+   and open stoploss orders are re-associated after reconnect.
+8. Kill the network mid-POST (or simulate with `--pm-force-timeout` probe),
+   restart, and verify no duplicate order is placed (same client id resolved).
+9. Emergency: `/pm_close all CONFIRM` closes everything; `/pm_recover` shows a
+   clean reconcile and clears any fail-closed block.
+
+Until steps 1-9 complete successfully on the real account, this branch stays
+`READ_ONLY_READY` (never `CANARY_READY` or `LIVE_READY`).

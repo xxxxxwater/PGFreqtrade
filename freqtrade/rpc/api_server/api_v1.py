@@ -147,3 +147,12 @@ def sysinfo():
 @router.get("/health", response_model=Health, tags=["Info"])
 def health(rpc: RPC = Depends(get_rpc)):
     return rpc.health()
+
+
+@router.get("/rpc_health", tags=["Info"])
+def rpc_health(rpc: RPC = Depends(get_rpc)):
+    """
+    Health/status of all registered RPC modules (Telegram init failures, send
+    failures, webhook queue backlog and drop counters).
+    """
+    return rpc.rpc_health()

@@ -11,7 +11,7 @@ import re
 from collections.abc import Callable, Coroutine
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from functools import partial, wraps
 from html import escape
 from itertools import chain
@@ -153,6 +153,11 @@ class Telegram(RPCHandler):
 
         self._app: Application
         self._loop: asyncio.AbstractEventLoop
+        # Health/status tracking exposed via RPCManager.health() and API endpoints.
+        self._init_failed = False
+        self._send_failures = 0
+        self._last_send_error: str | None = None
+        self._last_sent_at: str | None = None
         self._init_keyboard()
         self._start_thread()
 
@@ -218,6 +223,7 @@ class Telegram(RPCHandler):
             r"/forceexit$",
             r"/pm_close$",
             r"/pm_close (all|USDT|USDC|usdt|usdc)$",
+            r"/pm_close (all|USDT|USDC|usdt|usdc)? ?CONFIRM$",
             r"/pm_status$",
             r"/pm_risk$",
             r"/pm_recover$",
@@ -365,6 +371,7 @@ class Telegram(RPCHandler):
                 )
                 attempt += 1
                 if attempt == retries:
+                    self._init_failed = True
                     logger.warning("Telegram init failed.")
                     return
                 await asyncio.sleep(2)
@@ -393,6 +400,19 @@ class Telegram(RPCHandler):
         # This can take up to `timeout` from the call to `start_polling`.
         asyncio.run_coroutine_threadsafe(self._cleanup_telegram(), self._loop)
         self._thread.join()
+
+    def health(self) -> dict[str, Any]:
+        """
+        Telegram health/status exposed through RPCManager.health() and the API.
+        """
+        return {
+            "module": self.name,
+            "enabled": True,
+            "init_failed": self._init_failed,
+            "send_failures": self._send_failures,
+            "last_send_error": self._last_send_error,
+            "last_sent_at": self._last_sent_at,
+        }
 
     def _exchange_from_msg(self, msg: RPCOrderMsg) -> str:
         """
@@ -1458,10 +1478,28 @@ class Telegram(RPCHandler):
     @authorized_only
     async def _pm_close(self, update: Update, context: CallbackContext) -> None:
         """
-        Handler for /pm_close [all|USDT|USDC].
+        Handler for /pm_close [all|USDT|USDC] CONFIRM.
         Creates market exit orders for all matching futures trades.
+
+        Market-closing positions is destructive, so an explicit ``CONFIRM`` token is
+        required to prevent accidental one-command liquidation of the whole book.
         """
-        target_currency = context.args[0] if context.args else "all"
+        args = context.args or []
+        if not args:
+            await self._send_msg(
+                "Usage: `/pm_close [all|USDT|USDC] CONFIRM`.\n"
+                "This market-closes matching futures trades. Re-send with `CONFIRM` to execute."
+            )
+            return
+
+        if args[-1] != "CONFIRM":
+            target = args[0] if args else "all"
+            await self._send_msg(
+                f"Confirm closing `{target}` trades by sending `/pm_close {target} CONFIRM`."
+            )
+            return
+
+        target_currency = args[0] if len(args) > 1 else "all"
         try:
             loop = asyncio.get_running_loop()
             msg = await loop.run_in_executor(
@@ -1585,6 +1623,7 @@ class Telegram(RPCHandler):
         )
         await self._send_msg(message, ParseMode.MARKDOWN)
 
+    @authorized_only
     async def _force_exit_inline(self, update: Update, _: CallbackContext) -> None:
         if update.callback_query:
             query = update.callback_query
@@ -1624,6 +1663,7 @@ class Telegram(RPCHandler):
                 logger.exception("Forcebuy error!")
                 await self._send_msg(str(e), ParseMode.HTML)
 
+    @authorized_only
     async def _force_enter_inline(self, update: Update, _: CallbackContext) -> None:
         if update.callback_query:
             query = update.callback_query
@@ -2070,7 +2110,7 @@ class Telegram(RPCHandler):
             "*/forceexit <trade_id>|all:* `Instantly exits the given trade or all trades, "
             "regardless of profit`\n"
             "*/fx <trade_id>|all:* `Alias to /forceexit`\n"
-            "*/pm_close [all|USDT|USDC]:* `Market-closes all futures trades matching "
+            "*/pm_close [all|USDT|USDC] CONFIRM:* `Market-closes all futures trades matching "
             "the contract settlement currency. BTC/ETH in PM is collateral only.`\n"
             "*/pm_status:* `Shows Binance PM account status, uniMMR, balances and positions.`\n"
             "*/pm_risk:* `Quick Binance PM risk check with alerts and new-order block status.`\n"
@@ -2346,7 +2386,11 @@ class Telegram(RPCHandler):
                     message_thread_id=self._config["telegram"].get("topic_id"),
                 )
         except TelegramError as telegram_err:
+            self._send_failures += 1
+            self._last_send_error = f"{telegram_err.__class__.__name__}: {telegram_err.message}"
             logger.warning("TelegramError: %s! Giving up on that message.", telegram_err.message)
+        else:
+            self._last_sent_at = datetime.now(UTC).isoformat()
 
     @authorized_only
     async def _changemarketdir(self, update: Update, context: CallbackContext) -> None:

@@ -270,6 +270,38 @@ def probe_positions(symbol: str | None = None) -> dict[str, Any]:
     }
 
 
+def probe_api_trading_status() -> dict[str, Any]:
+    print("→ GET /papi/v1/um/apiTradingStatus ...")
+    status = signed_get("/papi/v1/um/apiTradingStatus")
+    return {
+        "isLocked": status.get("isLocked"),
+        "triggerCondition": status.get("triggerCondition"),
+        "indicators": status.get("indicators", {}),
+        "updateTime": status.get("updateTime"),
+    }
+
+
+def probe_account_config() -> dict[str, Any]:
+    print("→ GET /papi/v1/um/accountConfig ...")
+    config = signed_get("/papi/v1/um/accountConfig")
+    return {
+        "dualSidePosition": config.get("dualSidePosition"),
+        "multiAssetsMargin": config.get("multiAssetsMargin"),
+    }
+
+
+def probe_symbol_config(symbol: str | None = None) -> dict[str, Any]:
+    symbol = (symbol or "BTCUSDT").upper()
+    print(f"→ GET /papi/v1/um/symbolConfig (symbol={symbol}) ...")
+    config = signed_get("/papi/v1/um/symbolConfig", {"symbol": symbol})
+    return {
+        "symbol": config.get("symbol"),
+        "isTradingEnabled": config.get("isTradingEnabled"),
+        "marginAsset": config.get("marginAsset"),
+        "leverage": config.get("leverage"),
+    }
+
+
 def probe_listen_key_lifecycle() -> dict[str, Any]:
     print("→ POST /papi/v1/listenKey (create) ...")
     result = signed_post("/papi/v1/listenKey")
@@ -299,7 +331,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     if args.list_all or args.positions:
         results["positions"] = probe_positions(args.symbol)
 
-    if args.listen_key_test:
+    if args.list_all or args.api_trading_status:
+        results["api_trading_status"] = probe_api_trading_status()
+
+    if args.list_all or args.account_config:
+        results["account_config"] = probe_account_config()
+
+    if args.list_all or args.symbol_config:
+        results["symbol_config"] = probe_symbol_config(args.symbol)
+
+    if args.list_all or args.listen_key_test:
         results["listen_key"] = probe_listen_key_lifecycle()
 
     return results
@@ -323,6 +364,21 @@ def main() -> int:
     )
     parser.add_argument("--symbol", help="Filter positions by symbol, e.g. BTCUSDT.")
     parser.add_argument(
+        "--api-trading-status",
+        action="store_true",
+        help="Probe /papi/v1/um/apiTradingStatus (trading lock/restriction).",
+    )
+    parser.add_argument(
+        "--account-config",
+        action="store_true",
+        help="Probe /papi/v1/um/accountConfig (position mode / asset mode).",
+    )
+    parser.add_argument(
+        "--symbol-config",
+        action="store_true",
+        help="Probe /papi/v1/um/symbolConfig (symbol trading/margin config).",
+    )
+    parser.add_argument(
         "--listen-key-test",
         action="store_true",
         help="Test listenKey create/keepalive/delete lifecycle.",
@@ -333,7 +389,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not any([args.list_all, args.account, args.balance, args.positions, args.listen_key_test]):
+    if not any(
+        [
+            args.list_all,
+            args.account,
+            args.balance,
+            args.positions,
+            args.api_trading_status,
+            args.account_config,
+            args.symbol_config,
+            args.listen_key_test,
+        ]
+    ):
         args.list_all = True
 
     try:

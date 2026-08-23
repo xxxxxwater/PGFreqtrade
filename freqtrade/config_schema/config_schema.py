@@ -1014,6 +1014,31 @@ CONF_SCHEMA = {
                             "minimum": 0,
                             "exclusiveMinimum": True,
                         },
+                        "wallet_mode": {
+                            "description": (
+                                "Binance Portfolio Margin wallet funding model. "
+                                "USDT_ONLY (default): only actual USDT/USDC free balance is "
+                                "usable as opening capital; BTC/ETH collateral is never "
+                                "converted into stake. PM_COLLATERAL_HAIRCUT: derive "
+                                "strategy-usable stake from the PAPI risk account available "
+                                "balance multiplied by collateral_haircut."
+                            ),
+                            "type": "string",
+                            "enum": ["USDT_ONLY", "PM_COLLATERAL_HAIRCUT"],
+                            "default": "USDT_ONLY",
+                        },
+                        "collateral_haircut": {
+                            "description": (
+                                "Conservative discount (0 < x <= 1) applied to the PAPI risk "
+                                "account available balance when wallet_mode is "
+                                "PM_COLLATERAL_HAIRCUT. Default 1.0 (no discount)."
+                            ),
+                            "type": "number",
+                            "minimum": 0,
+                            "exclusiveMinimum": True,
+                            "maximum": 1,
+                            "default": 1.0,
+                        },
                         "warning_uni_mmr": {
                             "description": (
                                 "Binance Portfolio Margin uniMMR warning threshold for RPC alerts."
@@ -1142,12 +1167,73 @@ CONF_SCHEMA = {
                         },
                         "max_daily_loss": {
                             "description": (
-                                "Maximum realized loss per UTC day before force-closing all "
-                                "positions and stopping the bot."
+                                "Maximum loss per UTC day before force-closing all positions "
+                                "and stopping the bot. By default only realized PnL is counted; "
+                                "set max_daily_loss_include_unrealized to also include "
+                                "unrealized PnL."
                             ),
                             "type": "number",
                             "minimum": 0,
                             "exclusiveMinimum": True,
+                        },
+                        "max_daily_loss_include_unrealized": {
+                            "description": (
+                                "Include unrealized PnL of open trades when evaluating "
+                                "max_daily_loss. Default: false (realized PnL only)."
+                            ),
+                            "type": "boolean",
+                            "default": False,
+                        },
+                        "risk_api_failure_action": {
+                            "description": (
+                                "Action when the PM risk API fails during the scheduled risk "
+                                "monitor. warn (default): block new orders and alert; "
+                                "pause: enter PAUSED state; stop: enter STOPPED state. "
+                                "New orders are always blocked (fail-closed)."
+                            ),
+                            "type": "string",
+                            "enum": ["warn", "pause", "stop"],
+                            "default": "warn",
+                        },
+                        "user_stream_fail_closed": {
+                            "description": (
+                                "When true (default), block new orders whenever the PM user "
+                                "data stream is unavailable (listenKey creation failed, stream "
+                                "not running, dropped events above threshold). "
+                                "Set to false only if a degraded REST-recovery mode is intended."
+                            ),
+                            "type": "boolean",
+                            "default": True,
+                        },
+                        "allow_degraded_rest_recovery": {
+                            "description": (
+                                "Allow the bot to keep opening new orders using REST-only "
+                                "recovery when the PM user data stream is unavailable and "
+                                "user_stream_fail_closed is false. Default: false."
+                            ),
+                            "type": "boolean",
+                            "default": False,
+                        },
+                        "startup_consistency_mode": {
+                            "description": (
+                                "How to handle a startup mismatch between exchange PM positions/"
+                                "open orders and the local database. pause (default, safe): "
+                                "alert and enter PAUSED state; report: alert only; cancel: "
+                                "alert, cancel exchange open orders with no local match and "
+                                "enter PAUSED if unmatched positions remain."
+                            ),
+                            "type": "string",
+                            "enum": ["pause", "report", "cancel"],
+                            "default": "pause",
+                        },
+                        "emergency_close_retries": {
+                            "description": (
+                                "Maximum number of attempts to force-close each open position "
+                                "during a PM emergency close. Default: 3."
+                            ),
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 3,
                         },
                     },
                 },

@@ -3,6 +3,8 @@ This module manages webhook communication
 """
 
 import logging
+import queue
+import threading
 import time
 from typing import Any
 
@@ -36,13 +38,87 @@ class Webhook(RPCHandler):
         self._retries = self._config["webhook"].get("retries", 0)
         self._retry_delay = self._config["webhook"].get("retry_delay", 0.1)
         self._timeout = self._config["webhook"].get("timeout", 10)
+        self._init_sender_queue(self._config["webhook"].get("queue_maxsize", 100))
+
+    def _init_sender_queue(self, queue_maxsize: int = 100) -> None:
+        """
+        Start the background sender queue. Outbound HTTP is sent on a dedicated daemon
+        thread so synchronous requests (with their timeout/retries) never block the
+        trading main loop. Also used by the Discord subclass.
+        """
+        self._queue_maxsize = int(queue_maxsize)
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self._queue_maxsize)
+        self._stop_event = threading.Event()
+        self._sender_thread = threading.Thread(
+            name="webhook_sender", target=self._sender_loop, daemon=True
+        )
+        self._sender_thread.start()
+
+        self._sent = 0
+        self._failed = 0
+        self._dropped = 0
 
     def cleanup(self) -> None:
         """
-        Cleanup pending module resources.
-        This will do nothing for webhooks, they will simply not be called anymore
+        Stop the background sender thread. Pending queued messages are flushed
+        synchronously first, then the thread is stopped.
         """
-        pass
+        self._drain_queue()
+        self._stop_event.set()
+        if self._sender_thread and self._sender_thread.is_alive():
+            self._sender_thread.join(timeout=self._timeout + 1)
+        self._sender_thread = None  # type: ignore[assignment]
+
+    def _drain_queue(self) -> None:
+        """Synchronously send all currently queued messages (tests and shutdown)."""
+        while True:
+            try:
+                payload = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._send_msg(payload)
+                self._sent += 1
+            except Exception:
+                self._failed += 1
+                logger.exception("Failed to send webhook message.")
+
+    def _enqueue(self, payload: dict[str, Any]) -> None:
+        """Queue a payload for the background sender; drop + count when full."""
+        try:
+            self._queue.put_nowait(payload)
+        except queue.Full:
+            self._dropped += 1
+            logger.warning(
+                "Webhook queue full (%d); dropping message. Total dropped: %d",
+                self._queue_maxsize,
+                self._dropped,
+            )
+
+    def _sender_loop(self) -> None:
+        """Background worker: drain the queue and send each payload."""
+        while not self._stop_event.is_set():
+            try:
+                payload = self._queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            try:
+                self._send_msg(payload)
+                self._sent += 1
+            except Exception:
+                self._failed += 1
+                logger.exception("Failed to send webhook message.")
+
+    def health(self) -> dict[str, Any]:
+        """Health/status for the API and bot health endpoints."""
+        return {
+            "module": self.name,
+            "queue_size": self._queue.qsize(),
+            "queue_maxsize": self._queue_maxsize,
+            "sent": self._sent,
+            "failed": self._failed,
+            "dropped": self._dropped,
+        }
 
     def _get_value_dict(self, msg: RPCSendMsg) -> dict[str, Any] | None:
         whconfig = self._config["webhook"]
@@ -96,7 +172,7 @@ class Webhook(RPCHandler):
                 return obj
 
     def send_msg(self, msg: RPCSendMsg) -> None:
-        """Send a message to telegram channel"""
+        """Queue a message for asynchronous delivery to the webhook."""
         try:
             valuedict = self._get_value_dict(msg)
 
@@ -105,9 +181,9 @@ class Webhook(RPCHandler):
                 return
 
             payload = self.recursive_format(valuedict, msg)
-            self._send_msg(payload)
+            self._enqueue(payload)
         except KeyError as exc:
-            logger.exception(
+            logger.error(
                 "Problem calling Webhook. Please check your webhook configuration. Exception: %s",
                 exc,
             )

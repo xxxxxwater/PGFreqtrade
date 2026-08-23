@@ -48,6 +48,7 @@ from freqtrade.misc import safe_value_fallback, safe_value_fallback2
 from freqtrade.mixins import LoggingMixin
 from freqtrade.persistence import Order, PairLocks, Trade, init_db
 from freqtrade.persistence.key_value_store import set_startup_time
+from freqtrade.persistence.pm_order_intent import PMOrderIntent
 from freqtrade.plugins.pairlistmanager import PairListManager
 from freqtrade.plugins.protectionmanager import ProtectionManager
 from freqtrade.resolvers import ExchangeResolver, StrategyResolver
@@ -236,12 +237,32 @@ class FreqtradeBot(LoggingMixin):
                 self._pm_listen_key = self.exchange.create_pm_listen_key()
                 if self._pm_listen_key:
                     logger.info("Binance PM listenKey created successfully.")
+                    self._pm_unblock_orders("listen_key_failed")
                     if hasattr(self.exchange, "start_pm_user_stream"):
                         self.exchange.start_pm_user_stream(self._pm_listen_key)
                 else:
                     logger.debug("Binance PM listenKey creation skipped (dry_run or not PM).")
         except Exception as e:
             logger.warning(f"Failed to create Binance PM listenKey: {e}")
+            if self._pm_stream_fail_closed():
+                self._pm_block_orders("listen_key_failed")
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM FAIL-CLOSED: listenKey creation failed: {e}. "
+                            "New orders BLOCKED until the user stream is restored."
+                        ),
+                    }
+                )
+
+    def _pm_stream_fail_closed(self) -> bool:
+        """Whether a broken user stream should block new orders (fail-closed)."""
+        risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
+        if risk_cfg.get("user_stream_fail_closed", True):
+            return True
+        # Only a non-fail-closed config with explicit degraded REST mode allows trading.
+        return not risk_cfg.get("allow_degraded_rest_recovery", False)
 
     def _pm_keepalive_listen_key(self) -> None:
         if not self._pm_listen_key:
@@ -269,6 +290,111 @@ class FreqtradeBot(LoggingMixin):
             self._pm_user_stream_restart_limit_warning_sent = False
         if not hasattr(self, "_pm_unmatched_stream_order_ids"):
             self._pm_unmatched_stream_order_ids: set[str] = set()
+        if not hasattr(self, "_pm_actual_order_map"):
+            # Real order id (after conditional trigger) -> local stoploss order id.
+            # Populated whenever fetch_stoploss_order resolves an actual order.
+            self._pm_actual_order_map: dict[str, str] = {}
+        if not hasattr(self, "_pm_orders_blocked_reasons"):
+            self._pm_orders_blocked_reasons: list[str] = []
+        if not hasattr(self, "_pm_unresolved_alert_sent"):
+            self._pm_unresolved_alert_sent = False
+        if not hasattr(self, "_pm_last_success_reconcile_time"):
+            self._pm_last_success_reconcile_time: datetime | None = None
+        if not hasattr(self, "_pm_last_reconcile_result"):
+            self._pm_last_reconcile_result: dict[str, Any] | None = None
+        if not hasattr(self, "_pm_risk_api_failure_sent"):
+            self._pm_risk_api_failure_sent = False
+        if not hasattr(self, "_pm_user_stream_state"):
+            # SYNCING -> HEALTHY | DEGRADED | FAILED
+            self._pm_user_stream_state = "SYNCING"
+            # Fail-closed from the very first moment: block new orders until the first
+            # health evaluation confirms the stream is HEALTHY (not just "not yet checked").
+            if self._pm_stream_fail_closed() and not self.config.get("dry_run", True):
+                if "user_stream_unavailable" not in self._pm_orders_blocked_reasons:
+                    self._pm_orders_blocked_reasons.append("user_stream_unavailable")
+
+    def _pm_get_user_stream_state(self) -> str:
+        """Explicit PM user stream health state (SYNCING/HEALTHY/DEGRADED/FAILED)."""
+        return getattr(self, "_pm_user_stream_state", "SYNCING")
+
+    def _pm_block_orders(self, reason: str) -> None:
+        """Block new non-reduce-only PM orders for a given reason (fail-closed)."""
+        self._pm_init_user_stream_state()
+        if reason not in self._pm_orders_blocked_reasons:
+            self._pm_orders_blocked_reasons.append(reason)
+
+    def _pm_unblock_orders(self, reason: str) -> None:
+        """Remove a previously set order-blocking reason."""
+        self._pm_init_user_stream_state()
+        if reason in self._pm_orders_blocked_reasons:
+            self._pm_orders_blocked_reasons.remove(reason)
+
+    def _pm_blocked_order_reasons(self) -> list[str]:
+        """
+        Reasons that currently block opening new PM orders (empty list = allowed).
+
+        In live PM mode this ALWAYS consults the authoritative durable intent store:
+        any PENDING/UNKNOWN intent blocks entries (the memory list alone is not
+        sufficient). An unreadable store is itself a blocking reason (fail-closed).
+        """
+        reasons = list(getattr(self, "_pm_orders_blocked_reasons", []))
+        if self._pm_db_gate_active():
+            self._pm_init_user_stream_state()
+            try:
+                if PMOrderIntent.has_unresolved():
+                    if "unresolved_intent" not in reasons:
+                        reasons.append("unresolved_intent")
+                    if not self._pm_unresolved_alert_sent:
+                        self._pm_unresolved_alert_sent = True
+                        try:
+                            self.rpc.send_msg(
+                                {
+                                    "type": RPCMessageType.WARNING,
+                                    "status": (
+                                        "PM FAIL-CLOSED: unresolved order intents exist in "
+                                        "the database. New exposure-increasing orders are "
+                                        "BLOCKED until /pm_recover resolves them."
+                                    ),
+                                }
+                            )
+                        except Exception:
+                            pass
+                else:
+                    self._pm_unresolved_alert_sent = False
+            except Exception:
+                if "intent_store_unavailable" not in reasons:
+                    reasons.append("intent_store_unavailable")
+        return reasons
+
+    def _pm_db_gate_active(self) -> bool:
+        """Whether the durable-intent DB gate applies (live PM only)."""
+        return (
+            getattr(self, "trading_mode", None) == TradingMode.FUTURES
+            and not self.config.get("dry_run", True)
+            and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+        )
+
+    def _pm_has_unresolved_intents(self) -> bool:
+        """Authoritative unresolved-intent check (store failure => True, fail-closed)."""
+        try:
+            return PMOrderIntent.has_unresolved()
+        except Exception:
+            return True
+
+    def _pm_unresolved_intent_count(self) -> int:
+        try:
+            return len(PMOrderIntent.get_unresolved())
+        except Exception:
+            return -1
+
+    def _pm_risk_failure_action(self) -> str:
+        """Configured action when the PM risk API fails: warn (default) | pause | stop."""
+        action = (
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("risk_api_failure_action", "warn")
+        )
+        return str(action).lower() if action in {"warn", "pause", "stop"} else "warn"
 
     def _pm_pair_from_exchange_symbol(self, symbol_id: str | None) -> str | None:
         if not symbol_id:
@@ -303,20 +429,150 @@ class FreqtradeBot(LoggingMixin):
 
         entry = order_index.get(order_id)
         if entry is None:
-            self._pm_init_user_stream_state()
+            return self._pm_handle_unmatched_order_trade_update(order_id, order_data, pair)
+
+        trade, order = entry
+        # Stoploss orders are PM conditional orders: their lifecycle must be resolved
+        # through the conditional endpoints (and the triggered real order), never
+        # through a plain /um/order fetch with the strategy id.
+        if order.ft_order_side == "stoploss":
+            with self._exit_lock:
+                exchange_order = self.exchange.fetch_stoploss_order(order_id, trade.pair)
+                self._pm_record_actual_order(exchange_order, order_id)
+                self.update_trade_state(
+                    trade,
+                    order_id,
+                    exchange_order,
+                    stoploss_order=True,
+                )
+        else:
+            with self._exit_lock:
+                exchange_order = self.exchange.fetch_order(order_id, trade.pair)
+                self.update_trade_state(
+                    trade,
+                    order_id,
+                    exchange_order,
+                    stoploss_order=False,
+                )
+        logger.info(
+            f"PM user stream reconciled order {order_id} on {trade.pair}: "
+            f"{exchange_order.get('status')}."
+        )
+        return True
+
+    def _pm_record_actual_order(self, exchange_order: CcxtOrder | dict, strategy_id: str) -> None:
+        """Remember the real order id behind a triggered conditional strategy."""
+        self._pm_init_user_stream_state()
+        actual_id = exchange_order.get("id_stop")
+        if actual_id:
+            self._pm_actual_order_map[str(actual_id)] = strategy_id
+
+    def _pm_handle_unmatched_order_trade_update(
+        self, order_id: str, order_data: dict[str, Any], pair: str
+    ) -> bool:
+        """
+        Handle a user-stream order event that did not match a local open order id.
+
+        Fail-closed resolution order:
+        1. The real order of a triggered local conditional stoploss (actualOrderId map)
+           -> reconcile through the conditional lifecycle.
+        2. An order carrying one of OUR client ids (ft*/st* prefixes) -> we own it but
+           lost track -> block new orders + full recovery + alert.
+        3. A foreign order (no client id, e.g. placed manually) -> warn only.
+        """
+        self._pm_init_user_stream_state()
+        strategy_id = self._pm_actual_order_map.get(order_id)
+        if strategy_id is not None:
+            # Real order event for a locally known conditional stoploss.
+            for trade in Trade.get_open_trades():
+                if any(sl.order_id == strategy_id for sl in trade.open_sl_orders):
+                    with self._exit_lock:
+                        exchange_order = self.exchange.fetch_stoploss_order(
+                            strategy_id, trade.pair
+                        )
+                        self._pm_record_actual_order(exchange_order, strategy_id)
+                        self.update_trade_state(
+                            trade, strategy_id, exchange_order, stoploss_order=True
+                        )
+                    logger.info(
+                        f"PM user stream reconciled triggered stoploss {strategy_id} "
+                        f"via real order {order_id} on {trade.pair}."
+                    )
+                    return True
+            logger.warning(
+                f"PM user stream: actual order {order_id} maps to strategy {strategy_id} "
+                "but no local stoploss order matches; keeping the order block active."
+            )
+            return False
+
+        client_order_id = str(order_data.get("c") or "")
+
+        # P0-5: the in-memory actual-order map may not be rebuilt yet (e.g. right after
+        # a restart). Before declaring this event foreign, query the conditional
+        # history of every local open stoploss on the same pair - a triggered child
+        # order reports its real ``orderId`` there. A failed lookup is fail-closed:
+        # we can never silently ignore an order that may belong to this bot.
+        child_lookup_failed = False
+        for trade in Trade.get_open_trades():
+            if trade.pair != pair:
+                continue
+            for sl in trade.open_sl_orders:
+                try:
+                    exchange_order = self.exchange.fetch_stoploss_order(sl.order_id, pair)
+                except Exception as e:
+                    child_lookup_failed = True
+                    logger.warning(
+                        f"PM user stream: could not resolve stoploss {sl.order_id} "
+                        f"({pair}) while classifying order event {order_id}: {e}"
+                    )
+                    continue
+                self._pm_record_actual_order(exchange_order, sl.order_id)
+                if str(exchange_order.get("id_stop") or "") == order_id:
+                    # The event IS the real child order of a local conditional stoploss.
+                    with self._exit_lock:
+                        self.update_trade_state(
+                            trade, sl.order_id, exchange_order, stoploss_order=True
+                        )
+                    logger.info(
+                        f"PM user stream: classified order event {order_id} as the real "
+                        f"order of local stoploss {sl.order_id} on {pair} (post-restart "
+                        "rebuild)."
+                    )
+                    return True
+        if child_lookup_failed:
+            # Fail-closed: we could not rule out that this order belongs to this bot.
+            if order_id not in self._pm_unmatched_stream_order_ids:
+                self._pm_unmatched_stream_order_ids.add(order_id)
+            self._pm_block_orders("reconciliation_incomplete")
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM User Stream FAIL-CLOSED: order event {order_id} on {pair} "
+                        "could not be classified because a conditional-history lookup "
+                        "failed. New orders BLOCKED until reconciliation succeeds."
+                    ),
+                }
+            )
+            return False
+
+        if client_order_id.startswith(("ft", "st")):
+            # Ours, but not in the local index -> we lost track of it.
             if len(self._pm_unmatched_stream_order_ids) > 1000:
                 self._pm_unmatched_stream_order_ids.clear()
             if order_id not in self._pm_unmatched_stream_order_ids:
                 self._pm_unmatched_stream_order_ids.add(order_id)
-                self.rpc.send_msg(
-                    {
-                        "type": RPCMessageType.WARNING,
-                        "status": (
-                            f"PM User Stream WARNING: order event {order_id} on {pair} "
-                            "did not match a local open order. Running PM order recovery."
-                        ),
-                    }
-                )
+            self._pm_block_orders("unmatched_stream_order")
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM User Stream FAIL-CLOSED: order event {order_id} "
+                        f"(clientId {client_order_id}) on {pair} did not match a local "
+                        "open order. New orders are BLOCKED until /pm_recover succeeds."
+                    ),
+                }
+            )
             if (
                 self.config.get("exchange", {})
                 .get("portfolio_margin_risk", {})
@@ -325,20 +581,15 @@ class FreqtradeBot(LoggingMixin):
                 self._pm_order_recovery()
             return False
 
-        trade, order = entry
-        with self._exit_lock:
-            exchange_order = self.exchange.fetch_order(order_id, trade.pair)
-            self.update_trade_state(
-                trade,
-                order_id,
-                exchange_order,
-                stoploss_order=order.ft_order_side == "stoploss",
-            )
-        logger.info(
-            f"PM user stream reconciled order {order_id} on {trade.pair}: "
-            f"{exchange_order.get('status')}."
+        if len(self._pm_unmatched_stream_order_ids) > 1000:
+            self._pm_unmatched_stream_order_ids.clear()
+        if order_id not in self._pm_unmatched_stream_order_ids:
+            self._pm_unmatched_stream_order_ids.add(order_id)
+        logger.warning(
+            f"PM user stream: ignoring foreign order event {order_id} on {pair} "
+            f"(clientId '{client_order_id}') - not placed by this bot."
         )
-        return True
+        return False
 
     @staticmethod
     def _pm_stream_time(value: str | None) -> datetime | None:
@@ -422,18 +673,22 @@ class FreqtradeBot(LoggingMixin):
 
             dropped = int(stats.get("events_dropped") or 0)
             if dropped > self._pm_user_stream_last_events_dropped:
+                # Dropped events mean the local view may be stale: go DEGRADED immediately,
+                # block new orders and force a full reconciliation.
+                self._pm_user_stream_state = "DEGRADED"
+                self._pm_block_orders("user_stream_events_dropped")
+                self._pm_user_stream_last_events_dropped = dropped
+                self._pm_order_recovery()
                 self.rpc.send_msg(
                     {
                         "type": RPCMessageType.WARNING,
                         "status": (
                             f"PM User Stream CRITICAL: dropped events increased from "
                             f"{self._pm_user_stream_last_events_dropped} to {dropped}. "
-                            "Running order recovery."
+                            "Stream state=DEGRADED; new orders BLOCKED; running order recovery."
                         ),
                     }
                 )
-                self._pm_user_stream_last_events_dropped = dropped
-                self._pm_order_recovery()
 
             parse_errors = int(stats.get("parse_errors") or 0)
             if parse_errors > self._pm_user_stream_last_parse_errors:
@@ -448,26 +703,94 @@ class FreqtradeBot(LoggingMixin):
                 )
                 self._pm_user_stream_last_parse_errors = parse_errors
 
+            # --- Fail-closed stream health gate ---
+            stream_healthy = True
+            restart_limit_reached = False
             if not stats.get("running"):
+                stream_healthy = False
                 self._pm_restart_user_stream("stream thread is not running")
-                return
-
-            disconnected_at = self._pm_stream_time(stats.get("last_disconnected_at"))
-            max_disconnected_seconds = int(
-                risk_cfg.get("user_stream_disconnected_restart_seconds", 120)
-            )
-            if (
-                not stats.get("connected")
-                and disconnected_at
-                and datetime.now(UTC) - disconnected_at
-                > timedelta(seconds=max_disconnected_seconds)
-            ):
-                self._pm_restart_user_stream(
-                    "stream has been disconnected for "
-                    f">{max_disconnected_seconds}s; last_error={stats.get('last_error')}"
+            elif not stats.get("connected"):
+                disconnected_at = self._pm_stream_time(stats.get("last_disconnected_at"))
+                max_disconnected_seconds = int(
+                    risk_cfg.get("user_stream_disconnected_restart_seconds", 120)
                 )
+                if (
+                    disconnected_at
+                    and datetime.now(UTC) - disconnected_at
+                    > timedelta(seconds=max_disconnected_seconds)
+                ):
+                    stream_healthy = False
+                    self._pm_restart_user_stream(
+                        "stream has been disconnected for "
+                        f">{max_disconnected_seconds}s; last_error={stats.get('last_error')}"
+                    )
+
+            if queued >= queue_warning_size:
+                # A growing backlog means events may be delayed or dropped - treat as unhealthy.
+                stream_healthy = False
+
+            # Restart-limit reached means the stream can no longer self-heal.
+            now = datetime.now(UTC)
+            one_hour_ago = now - timedelta(hours=1)
+            recent_restarts = [
+                t for t in self._pm_user_stream_restarts if t > one_hour_ago
+            ]
+            restart_limit = int(risk_cfg.get("user_stream_max_restarts_per_hour", 3))
+            restart_limit_reached = len(recent_restarts) >= restart_limit
+
+            if restart_limit_reached and not stream_healthy:
+                self._pm_user_stream_state = "FAILED"
+            elif stream_healthy:
+                self._pm_user_stream_state = "HEALTHY"
+            else:
+                self._pm_user_stream_state = "DEGRADED"
+
+            if self._pm_stream_fail_closed():
+                if stream_healthy:
+                    # Stream restored: unblocking requires a SUCCESSFUL reconciliation
+                    # (no errors, all local open orders resolved) AND no unresolved
+                    # order intents. A connected WebSocket alone never unblocks.
+                    result = self._pm_reconcile_open_orders()
+                    if not result["errors"] and not self._pm_has_unresolved_intents():
+                        self._pm_unblock_orders("user_stream_unavailable")
+                        self._pm_unblock_orders("user_stream_events_dropped")
+                        self._pm_unblock_orders("reconciliation_incomplete")
+                    else:
+                        self._pm_block_orders("reconciliation_incomplete")
+                        self.rpc.send_msg(
+                            {
+                                "type": RPCMessageType.WARNING,
+                                "status": (
+                                    "PM FAIL-CLOSED: user stream is connected but "
+                                    "reconciliation did not complete cleanly "
+                                    f"({len(result['errors'])} error(s), unresolved "
+                                    f"intents={self._pm_unresolved_intent_count()}). "
+                                    "New orders stay BLOCKED (reconciliation_incomplete)."
+                                ),
+                            }
+                        )
+                else:
+                    self._pm_block_orders("user_stream_unavailable")
+                    self.rpc.send_msg(
+                        {
+                            "type": RPCMessageType.WARNING,
+                            "status": (
+                                f"PM FAIL-CLOSED: user stream unhealthy "
+                                f"(state={self._pm_user_stream_state}, "
+                                f"running={stats.get('running')}, "
+                                f"connected={stats.get('connected')}, "
+                                f"queued={queued}). New orders BLOCKED until the stream "
+                                "recovers and reconciliation completes."
+                            ),
+                        }
+                    )
         except Exception as e:
             logger.warning(f"PM user stream health check failed: {e}")
+            self._pm_user_stream_state = "DEGRADED"
+            # Fail-closed: an unreadable health status must block new orders, not just
+            # degrade the state silently.
+            if self._pm_stream_fail_closed():
+                self._pm_block_orders("user_stream_unavailable")
 
     def _pm_rebuild_user_stream(self) -> None:
         self.rpc.send_msg(
@@ -577,11 +900,31 @@ class FreqtradeBot(LoggingMixin):
                 return
             risk = self.exchange.get_pm_risk_summary()
             if not risk.get("enabled"):
+                self._pm_unblock_orders("risk_check_failed")
                 return
+
+            # Risk data is available - clear any previous risk-API failure block.
+            self._pm_unblock_orders("risk_check_failed")
+            self._pm_risk_api_failure_sent = False
 
             risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
             uni_mmr = risk.get("uni_mmr")
             account_status = risk.get("account_status")
+
+            # Missing critical risk data while configured => fail-closed
+            if risk_cfg.get("min_uni_mmr") is not None and uni_mmr is None:
+                self._pm_block_orders("risk_data_missing")
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            "PM Risk FAIL-CLOSED: uniMMR missing while min_uni_mmr is "
+                            "configured. New orders BLOCKED."
+                        ),
+                    }
+                )
+            else:
+                self._pm_unblock_orders("risk_data_missing")
 
             if account_status and account_status != "NORMAL":
                 self.rpc.send_msg(
@@ -651,6 +994,8 @@ class FreqtradeBot(LoggingMixin):
                         ).scalar_one()
                         or 0.0
                     )
+                    if risk_cfg.get("max_daily_loss_include_unrealized", False):
+                        daily_pnl += self._pm_unrealized_pnl()
                 except Exception:
                     daily_pnl = 0.0
                 if daily_pnl < -float(max_daily_loss):
@@ -669,78 +1014,614 @@ class FreqtradeBot(LoggingMixin):
 
         except Exception as e:
             logger.warning(f"PM risk monitor check failed: {e}")
+            # Fail-closed: block new orders on any risk API exception.
+            self._pm_block_orders("risk_check_failed")
+            action = self._pm_risk_failure_action()
+            if action == "stop":
+                self.state = State.STOPPED
+            elif action == "pause":
+                self.state = State.PAUSED
+            if not self._pm_risk_api_failure_sent:
+                self._pm_risk_api_failure_sent = True
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM Risk monitor FAILED (fail-closed): {e}. "
+                            f"New orders BLOCKED. Failure action: {action}."
+                        ),
+                    }
+                )
+
+    def _pm_unrealized_pnl(self) -> float:
+        """Sum of unrealized PnL across open PM trades (in stake currency)."""
+        total = 0.0
+        for trade in Trade.get_open_trades():
+            try:
+                current_rate = self.exchange.get_rate(
+                    trade.pair, side="exit", is_short=trade.is_short, refresh=False
+                )
+                total += trade.calc_profit(current_rate)
+            except Exception as e:
+                logger.debug(f"Could not calculate unrealized PnL for {trade.pair}: {e}")
+        return total
 
     def _pm_emergency_close_all(self) -> None:
-        open_trades = Trade.get_open_trades()
+        """
+        Force-close all open PM positions with market exit orders.
+
+        Idempotent: already-flat trades are skipped. Each trade gets a bounded number of
+        retries (emergency_close_retries, default 3). A failure is reported via RPC and is
+        never falsely reported as closed.
+        """
+        open_trades = [t for t in Trade.get_open_trades() if t.is_open]
         if not open_trades:
             return
+        risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
+        max_retries = int(risk_cfg.get("emergency_close_retries", 3))
         closed = 0
         failed = 0
-        for trade in open_trades:
-            try:
-                if self._safe_force_exit(trade):
+        failed_details: list[str] = []
+        with self._exit_lock:
+            for trade in open_trades:
+                if not trade.is_open or not trade.has_open_position:
+                    # Already flat - nothing to close.
+                    closed += 1
+                    continue
+                success = False
+                last_error = "unknown"
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        if self._safe_force_exit(trade):
+                            success = True
+                            break
+                        last_error = f"attempt {attempt} returned False"
+                    except Exception as e:
+                        last_error = f"attempt {attempt}: {e}"
+                    logger.warning(
+                        f"PM emergency close retry {attempt}/{max_retries} for {trade.pair}: "
+                        f"{last_error}"
+                    )
+                if success:
                     closed += 1
                 else:
                     failed += 1
-            except Exception:
-                failed += 1
+                    failed_details.append(f"{trade.pair}: {last_error}")
         Trade.commit()
         logger.warning(
-            f"PM emergency close: {closed} positions closed, {failed} failed, "
+            f"PM emergency close: {closed} closed, {failed} failed, "
             f"out of {len(open_trades)} total."
         )
+        if failed:
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM EMERGENCY CLOSE PARTIAL FAILURE: {failed} position(s) could NOT "
+                        f"be closed and remain OPEN: {', '.join(failed_details[:5])}. "
+                        "Manual intervention is required."
+                    ),
+                }
+            )
 
     def _safe_force_exit(self, trade) -> bool:
-        try:
-            current_rate = self.exchange.get_rate(
-                trade.pair, side="exit", is_short=trade.is_short, refresh=True
-            )
-            return self.execute_trade_exit(
-                trade,
-                limit=current_rate,
-                exit_check=ExitCheckTuple(exit_type=ExitType.EMERGENCY_EXIT),
-                ordertype=self.strategy.order_types.get("emergency_exit", "market"),
-            )
-        except Exception as e:
-            logger.exception(f"PM emergency exit failed for {trade.pair}: {e}")
-            return False
+        """
+        Submit a reduceOnly emergency market exit for a trade. Raises on failure so the
+        caller can retry and report accurately (never falsely report as closed).
+        """
+        current_rate = self.exchange.get_rate(
+            trade.pair, side="exit", is_short=trade.is_short, refresh=True
+        )
+        return self.execute_trade_exit(
+            trade,
+            limit=current_rate,
+            exit_check=ExitCheckTuple(exit_type=ExitType.EMERGENCY_EXIT),
+            ordertype=self.strategy.order_types.get("emergency_exit", "market"),
+        )
 
-    def _pm_order_recovery(self) -> None:
+    def _pm_reconcile_open_orders(self) -> dict[str, Any]:
+        """
+        Reconcile all open orders for open PM trades against the exchange (PAPI).
+
+        Uses the same full state-update path as normal fills (update_trade_state), so a fill
+        updates the Trade lifecycle (open/closed), order status, filled amount, fees, realized
+        PnL, exit time, wallet, notifications and protections.
+
+        Idempotent: once an order is closed locally it is removed from ``trade.open_orders``,
+        so repeated recovery does not re-process it. Shared by the user-stream event path,
+        the scheduled recovery and the Telegram/API manual recovery.
+        """
+        result: dict[str, Any] = {
+            "open_trades": 0,
+            "checked": 0,
+            "reconciled": 0,
+            "mismatches": [],
+            "errors": [],
+        }
         try:
             if (
                 not hasattr(self.exchange, "_is_portfolio_margin")
                 or not self.exchange._is_portfolio_margin()
             ):
-                return
+                return result
             open_trades = Trade.get_open_trades()
-            mismatch_count = 0
+            result["open_trades"] = len(open_trades)
             for trade in open_trades:
-                for order in trade.open_orders:
+                # ``trade.open_orders`` excludes stoploss orders; reconcile both.
+                reconcile_orders = list(trade.open_orders) + list(trade.open_sl_orders)
+                for order in reconcile_orders:
+                    result["checked"] += 1
                     try:
-                        exchange_order = self.exchange.fetch_order(order.order_id, trade.pair)
+                        if order.ft_order_side == "stoploss":
+                            # Conditional stoploss: resolve strategy status AND the
+                            # triggered real order (filled/average/cost/fee/trades).
+                            exchange_order = self.exchange.fetch_stoploss_order(
+                                order.order_id, trade.pair
+                            )
+                            self._pm_record_actual_order(exchange_order, order.order_id)
+                        else:
+                            exchange_order = self.exchange.fetch_order(order.order_id, trade.pair)
                         if exchange_order.get("status") != order.status:
+                            mismatch_detail = (
+                                f"{order.order_id}({trade.pair}): DB={order.status} "
+                                f"Exchange={exchange_order.get('status')}"
+                            )
+                            result["mismatches"].append(mismatch_detail)
                             logger.warning(
                                 f"PM order state mismatch for {order.order_id} "
                                 f"({trade.pair}): DB={order.status}, "
                                 f"Exchange={exchange_order.get('status')}"
                             )
-                            trade.update_order(exchange_order)
-                            mismatch_count += 1
+                        # Full lifecycle update - same path as a normal fill.
+                        self.update_trade_state(
+                            trade,
+                            order.order_id,
+                            action_order=exchange_order,
+                            stoploss_order=order.ft_order_side == "stoploss",
+                            send_msg=True,
+                        )
+                        result["reconciled"] += 1
                     except Exception as e:
+                        result["errors"].append(f"{order.order_id}: {e}")
                         logger.debug(f"PM order recovery check failed for {order.order_id}: {e}")
             Trade.commit()
-            if mismatch_count > 0:
+        except Exception as e:
+            logger.warning(f"PM order recovery check failed: {e}")
+            result["errors"].append(f"recovery: {e}")
+        result["unresolved_intents"] = self._pm_unresolved_intent_count()
+        if not result["errors"]:
+            self._pm_init_user_stream_state()
+            self._pm_last_success_reconcile_time = datetime.now(UTC)
+            result["success"] = True
+        else:
+            result["success"] = False
+        self._pm_last_reconcile_result = result
+        return result
+
+    def _pm_order_recovery(self, clear_unmatched_block: bool = False) -> None:
+        result = self._pm_reconcile_open_orders()
+        if result["mismatches"]:
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM Order Recovery: {len(result['mismatches'])} order state "
+                        f"mismatch(es) reconciled across {result['open_trades']} open trades."
+                    ),
+                }
+            )
+        if result["errors"]:
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM Order Recovery: {len(result['errors'])} order(s) could NOT be "
+                        "reconciled. New orders stay BLOCKED (fail-closed). "
+                        f"{'; '.join(result['errors'][:3])}"
+                    ),
+                }
+            )
+        if clear_unmatched_block and not result["errors"]:
+            # Explicit manual recovery that completed cleanly -> clear the
+            # unmatched-stream-order block.
+            self._pm_unblock_orders("unmatched_stream_order")
+
+    def _pm_has_open_trade_for(self, pair: str, side: str | None) -> bool:
+        """Whether a local open trade exists for an exchange position (pair+side)."""
+        for trade in Trade.get_open_trades():
+            if trade.pair != pair or not trade.is_open:
+                continue
+            if side is None:
+                return True
+            if trade.is_short == (side == "short"):
+                return True
+        return False
+
+    def _pm_rebuild_actual_order_map(self) -> None:
+        """
+        Rebuild the real-order-id -> strategy-id map from PERSISTENT local data.
+
+        For every local open stoploss order, resolve the conditional lifecycle; a
+        triggered strategy reports its real ``orderId`` (id_stop) which is then
+        mapped. This runs at startup BEFORE the user stream is released, so a child
+        ORDER_TRADE_UPDATE arriving right after restart is never classified as
+        foreign. Lookup failures block new orders (fail-closed).
+        """
+        self._pm_init_user_stream_state()
+        failures = 0
+        for trade in Trade.get_open_trades():
+            for sl in trade.open_sl_orders:
+                try:
+                    exchange_order = self.exchange.fetch_stoploss_order(sl.order_id, trade.pair)
+                    self._pm_record_actual_order(exchange_order, sl.order_id)
+                except Exception as e:
+                    failures += 1
+                    logger.warning(
+                        f"PM startup: could not resolve stoploss {sl.order_id} "
+                        f"({trade.pair}) to rebuild the actual-order map: {e}"
+                    )
+        if failures:
+            self._pm_block_orders("reconciliation_incomplete")
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM FAIL-CLOSED: {failures} stoploss order(s) could not be "
+                        "resolved at startup to rebuild the actual-order map. New "
+                        "orders BLOCKED until reconciliation succeeds."
+                    ),
+                }
+            )
+        else:
+            self._pm_unblock_orders("reconciliation_incomplete")
+
+    def _pm_recover_pending_intents(self) -> dict[str, Any]:
+        """
+        Resolve order intents persisted before a crash/restart (idempotency recovery).
+
+        * Intent definitively absent on the exchange -> clear it.
+        * Intent exists on the exchange -> clear it and alert for reconciliation
+          (the startup consistency check catches orders missing from the local
+          database).
+        * Exchange not queryable -> keep the intent and BLOCK new orders (fail-closed).
+        * Intent store unreadable -> PAUSE the bot and BLOCK (fail-closed).
+
+        Returns the recovery report.
+        """
+        report: dict[str, Any] = {
+            "checked": 0,
+            "cleared": 0,
+            "existed": 0,
+            "unresolved": 0,
+            "store_error": None,
+        }
+        if not hasattr(self.exchange, "list_pm_pending_intents"):
+            return report
+        try:
+            intents = self.exchange.list_pm_pending_intents()
+        except Exception as e:
+            # Fail-closed: an unreadable intent store must never be treated as empty.
+            logger.warning(f"Could not read PM pending order intents: {e}")
+            report["store_error"] = f"{e.__class__.__name__}: {e}"
+            self.state = State.PAUSED
+            self._pm_block_orders("intent_store_unavailable")
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        "PM FAIL-CLOSED: the order intent store could not be read at "
+                        f"startup ({e}). Bot PAUSED; new orders BLOCKED."
+                    ),
+                }
+            )
+            return report
+        if not intents:
+            return report
+
+        for intent in intents:
+            report["checked"] += 1
+            client_id = str(intent.get("client_id") or "")
+            try:
+                result = self.exchange.resolve_pm_pending_intent(intent)
+            except Exception as e:
+                result = {
+                    "resolved": False,
+                    "uncertain": True,
+                    "client_id": client_id,
+                    "error": f"{e.__class__.__name__}: {e}",
+                }
+            if result.get("uncertain"):
+                report["unresolved"] += 1
+                continue
+            if result.get("exists") is False:
+                try:
+                    self.exchange.clear_pm_pending_intent(client_id)
+                except Exception as e:
+                    logger.warning(f"Could not clear resolved PM intent {client_id}: {e}")
+                    report["unresolved"] += 1
+                    continue
+                report["cleared"] += 1
+                logger.info(
+                    f"PM pending intent {client_id} resolved: order does not exist on the "
+                    "exchange (it was never placed). Intent cleared."
+                )
+            else:
+                report["existed"] += 1
+                try:
+                    self.exchange.clear_pm_pending_intent(client_id)
+                except Exception as e:
+                    logger.warning(f"Could not clear resolved PM intent {client_id}: {e}")
+                    report["unresolved"] += 1
+                    continue
+                logger.warning(
+                    f"PM pending intent {client_id} resolved: the order EXISTS on the "
+                    "exchange. It will be matched against the local database by the "
+                    "startup consistency check."
+                )
+
+        if report["unresolved"]:
+            self._pm_block_orders("pending_intent_unresolved")
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM FAIL-CLOSED: {report['unresolved']} persisted order "
+                        "intent(s) could NOT be resolved against the exchange after "
+                        "restart. New orders are BLOCKED until /pm_recover succeeds."
+                    ),
+                }
+            )
+        else:
+            self._pm_unblock_orders("pending_intent_unresolved")
+        if report["existed"]:
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM Restart Recovery: {report['existed']} order(s) placed before "
+                        "the restart exist on the exchange and are now matched against "
+                        "the local database."
+                    ),
+                }
+            )
+        return report
+
+    def _pm_startup_consistency_check(self) -> dict[str, Any]:
+        """
+        Compare exchange (PAPI) positions, normal open orders AND conditional
+        (stoploss) open orders against the local database.
+
+        Never mutates the exchange or the database; it only reports mismatches. The caller
+        decides what to do based on ``startup_consistency_mode``.
+        """
+        result: dict[str, Any] = {
+            "status": "consistent",
+            "exchange_positions": [],
+            "exchange_open_orders": [],
+            "exchange_conditional_orders": [],
+            "unknown_positions": [],
+            "unknown_orders": [],
+            "unknown_conditional_orders": [],
+        }
+        try:
+            positions = self.exchange.fetch_positions()
+            for position in positions:
+                contracts = position.get("contracts", 0) or 0
+                pair = position.get("symbol")
+                if not contracts or not pair:
+                    continue
+                result["exchange_positions"].append(
+                    {"pair": pair, "side": position.get("side"), "contracts": contracts}
+                )
+                if not self._pm_has_open_trade_for(pair, position.get("side")):
+                    result["unknown_positions"].append(
+                        {"pair": pair, "side": position.get("side"), "contracts": contracts}
+                    )
+
+            open_trades = Trade.get_open_trades()
+            known_order_ids = {
+                order.order_id
+                for trade in open_trades
+                for order in trade.open_orders
+            }
+            known_strategy_ids = {
+                order.order_id
+                for trade in open_trades
+                for order in trade.open_sl_orders
+            }
+            open_orders = self.exchange.fetch_open_orders()
+            for order in open_orders:
+                order_id = str(order.get("id") or "")
+                symbol = order.get("symbol")
+                if not order_id:
+                    continue
+                result["exchange_open_orders"].append(
+                    {"order_id": order_id, "symbol": symbol}
+                )
+                if order_id not in known_order_ids and order_id not in known_strategy_ids:
+                    result["unknown_orders"].append(
+                        {"order_id": order_id, "symbol": symbol}
+                    )
+
+            # Conditional (stoploss) open orders live on a separate PAPI endpoint and
+            # are identified by strategy ids - never mix them with normal order ids.
+            conditional_orders = self.exchange.fetch_open_conditional_orders()
+            for order in conditional_orders:
+                strategy_id = str(order.get("id") or "")
+                symbol = order.get("symbol")
+                if not strategy_id:
+                    continue
+                result["exchange_conditional_orders"].append(
+                    {"order_id": strategy_id, "symbol": symbol}
+                )
+                if strategy_id not in known_strategy_ids:
+                    result["unknown_conditional_orders"].append(
+                        {"order_id": strategy_id, "symbol": symbol}
+                    )
+        except Exception as e:
+            logger.warning(f"PM startup consistency check failed: {e}")
+            result["status"] = "error"
+            result["error"] = f"{e.__class__.__name__}: {e}"
+            return result
+
+        if (
+            result["unknown_positions"]
+            or result["unknown_orders"]
+            or result["unknown_conditional_orders"]
+        ):
+            result["status"] = "mismatch"
+        return result
+
+    def _pm_apply_startup_consistency(self, result: dict[str, Any]) -> None:
+        """Apply the configured startup_consistency_mode to a consistency report."""
+        if result["status"] == "error":
+            # The consistency check itself failed - never start trading blind.
+            self.state = State.PAUSED
+            self._pm_block_orders("startup_consistency_error")
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        "PM FAIL-CLOSED: startup consistency check could not complete "
+                        f"({result.get('error')}). Bot PAUSED; new orders BLOCKED."
+                    ),
+                }
+            )
+            return
+        if result["status"] != "mismatch":
+            return
+
+        risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
+        mode = str(risk_cfg.get("startup_consistency_mode", "pause")).lower()
+        unknown_positions = result.get("unknown_positions", [])
+        unknown_orders = result.get("unknown_orders", [])
+        unknown_conditional_orders = result.get("unknown_conditional_orders", [])
+
+        self.rpc.send_msg(
+            {
+                "type": RPCMessageType.WARNING,
+                "status": (
+                    "PM STARTUP CONSISTENCY MISMATCH: "
+                    f"{len(unknown_positions)} exchange position(s), "
+                    f"{len(unknown_orders)} open order(s) and "
+                    f"{len(unknown_conditional_orders)} conditional order(s) have no "
+                    f"local database match. Mode={mode}."
+                ),
+            }
+        )
+
+        if mode == "cancel":
+            cancelled = 0
+            failed = 0
+            for order in unknown_orders:
+                pair = order.get("symbol")
+                order_id = order.get("order_id")
+                if not pair or not order_id:
+                    failed += 1
+                    continue
+                try:
+                    result = self.exchange.cancel_order(order_id, pair)
+                    if isinstance(result, dict) and str(result.get("status") or "").lower() not in {
+                        "canceled",
+                        "closed",
+                    }:
+                        # Non-terminal result: the order may still be live -> unsafe.
+                        failed += 1
+                        logger.warning(
+                            f"PM startup consistency: cancel of order {order_id} returned "
+                            f"non-terminal status {result.get('status')}."
+                        )
+                    else:
+                        cancelled += 1
+                except Exception as e:
+                    failed += 1
+                    logger.warning(f"Could not cancel unmatched PM order {order_id}: {e}")
+            for order in unknown_conditional_orders:
+                pair = order.get("symbol")
+                strategy_id = order.get("order_id")
+                if not pair or not strategy_id:
+                    failed += 1
+                    continue
+                try:
+                    # Conditional orders MUST be cancelled through the conditional
+                    # DELETE endpoint - the strategy id is not a valid /um/order id.
+                    result = self.exchange.cancel_stoploss_order(strategy_id, pair)
+                    if isinstance(result, dict) and str(result.get("status") or "").lower() not in {
+                        "canceled",
+                        "closed",
+                    }:
+                        failed += 1
+                        logger.warning(
+                            f"PM startup consistency: cancel of conditional {strategy_id} "
+                            f"returned non-terminal status {result.get('status')}."
+                        )
+                    else:
+                        cancelled += 1
+                except Exception as e:
+                    failed += 1
+                    logger.warning(
+                        f"Could not cancel unmatched PM conditional order {strategy_id}: {e}"
+                    )
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM startup consistency: cancelled {cancelled} unmatched open "
+                        f"order(s) ({failed} failures)."
+                    ),
+                }
+            )
+
+            # P0-4: issuing the cancel request is NOT proof of safety. Re-query the
+            # exchange: only a clean second check may allow the bot to continue.
+            verify = self._pm_startup_consistency_check()
+            if verify["status"] == "consistent" and failed == 0:
+                logger.info(
+                    "PM startup consistency (cancel mode): second check clean; "
+                    "proceeding without blocking."
+                )
+            else:
+                self.state = State.PAUSED
+                self._pm_block_orders("startup_consistency_mismatch")
                 self.rpc.send_msg(
                     {
                         "type": RPCMessageType.WARNING,
                         "status": (
-                            f"PM Order Recovery: {mismatch_count} order state "
-                            f"mismatch(es) reconciled across {len(open_trades)} open trades."
+                            "PM FAIL-CLOSED (startup cancel mode): "
+                            f"{failed} cancel failure(s); second consistency check "
+                            f"status={verify['status']}. Bot PAUSED; new orders BLOCKED "
+                            "until unknown orders are gone on the exchange."
                         ),
                     }
                 )
-        except Exception as e:
-            logger.warning(f"PM order recovery check failed: {e}")
+
+        if mode in {"pause", "cancel"} and unknown_positions:
+            # Unmatched exchange positions cannot be auto-resolved safely - pause.
+            self.state = State.PAUSED
+            self._pm_block_orders("startup_consistency_mismatch")
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        "PM FAIL-CLOSED: exchange positions exist without local trade "
+                        "records. Bot PAUSED; new orders BLOCKED. Manual reconciliation "
+                        "required before resuming."
+                    ),
+                }
+            )
+        elif mode == "pause" and (unknown_orders or unknown_conditional_orders):
+            self.state = State.PAUSED
+            self._pm_block_orders("startup_consistency_mismatch")
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        "PM FAIL-CLOSED: exchange open orders (normal or conditional) "
+                        "exist without local order records. Bot PAUSED; new orders "
+                        "BLOCKED. Manual reconciliation required before resuming."
+                    ),
+                }
+            )
 
     def _pm_cleanup_stream_and_listen_key(self) -> None:
         if hasattr(self.exchange, "stop_pm_user_stream"):
@@ -805,6 +1686,25 @@ class FreqtradeBot(LoggingMixin):
         self.startup_update_open_orders()
         self.update_all_liquidation_prices()
         self.update_funding_fees()
+
+        if (
+            self.trading_mode == TradingMode.FUTURES
+            and not self.config["dry_run"]
+            and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+        ):
+            # 1) Resolve persisted order intents from before a crash/restart so a
+            #    timeout-uncertain order can never be resubmitted twice.
+            self._pm_recover_pending_intents()
+            # 2) Rebuild the real-order-id -> strategy-id map from the persistent
+            #    local stoploss orders BEFORE the listenKey/user stream may deliver
+            #    child-order events (post-restart child events must never be
+            #    classified as foreign).
+            self._pm_rebuild_actual_order_map()
+            # 3) Fail-closed startup consistency check: exchange (PAPI) positions / open
+            #    orders / conditional stoploss orders must match the local database
+            #    before the bot may open new orders.
+            consistency = self._pm_startup_consistency_check()
+            self._pm_apply_startup_consistency(consistency)
 
         if (
             self.trading_mode == TradingMode.FUTURES
@@ -1177,6 +2077,14 @@ class FreqtradeBot(LoggingMixin):
         """
         trades_created = 0
 
+        if self._pm_blocked_order_reasons():
+            self.log_once(
+                "Not creating new trades. PM orders blocked: "
+                + ", ".join(self._pm_blocked_order_reasons()),
+                logger.info,
+            )
+            return trades_created
+
         whitelist = deepcopy(self.active_pair_whitelist)
         if not whitelist:
             self.log_once("Active pair whitelist is empty.", logger.info)
@@ -1451,6 +2359,18 @@ class FreqtradeBot(LoggingMixin):
         :return: True if an entry order is created, False if it fails.
         :raise: DependencyException or it's subclasses like ExchangeError.
         """
+        # Fail-closed PM gate - single unified entry for strategy entries, DCA / position
+        # adjustments, Telegram/API force-entry and recovery re-entries. Never increase
+        # risk exposure while the PM user stream is unavailable, the startup consistency
+        # check failed, or any other configured order-block reason is active.
+        if self._pm_blocked_order_reasons():
+            self.log_once(
+                "Refusing to open a new entry. PM orders blocked: "
+                + ", ".join(self._pm_blocked_order_reasons()),
+                logger.warning,
+            )
+            return False
+
         time_in_force = self.strategy.order_time_in_force["entry"]
 
         side: BuySell = "sell" if is_short else "buy"

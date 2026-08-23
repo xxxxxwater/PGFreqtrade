@@ -22,13 +22,14 @@ class Discord(Webhook):
         self._retries = 1
         self._retry_delay = 0.1
         self._timeout = self._config["discord"].get("timeout", 10)
+        # Start the shared async sender queue (background thread, non-blocking).
+        self._init_sender_queue(config["discord"].get("queue_maxsize", 100))
 
     def cleanup(self) -> None:
         """
-        Cleanup pending module resources.
-        This will do nothing for webhooks, they will simply not be called anymore
+        Cleanup pending module resources (stops the background sender thread).
         """
-        pass
+        super().cleanup()
 
     def send_msg(self, msg) -> None:
         if fields := self._config["discord"].get(msg["type"].value):
@@ -56,6 +57,6 @@ class Discord(Webhook):
                     v = v.format(**msg)
                     embeds[0]["fields"].append({"name": k, "value": v, "inline": True})
 
-            # Send the message to discord channel
+            # Send the message to discord channel (async, non-blocking queue).
             payload = {"embeds": embeds}
-            self._send_msg(payload)
+            self._enqueue(payload)

@@ -537,6 +537,42 @@ The WebSocket stream is the fast path. Scheduled REST recovery remains enabled a
 the safety net for disconnects, missed events, process restarts, or delayed Binance
 order state propagation.
 
+## Market data: kline WebSocket vs REST
+
+The code enables the kline WebSocket as the PRIMARY market-data channel for
+Binance futures (`ws_enabled: true`, ccxt pro `watch_ohlcv`); REST remains for
+startup backfill, gap repair and validation, and every refresh falls back to
+REST automatically when the watch buffer is not fresh.
+
+**Production deployment note (2026-09-04):** this was not a network-path
+failure. Binance split the USD-M Futures stream host into `/public`, `/market`
+and `/private` routes. Kline streams are regular **market** data. The old root
+`wss://fstream.binance.com/ws` still completes its TLS/WS handshake and ACKs a
+`SUBSCRIBE`, but it no longer pushes `@kline_*` frames. ccxt-pro 4.5.35 still
+ships that legacy root URL.
+
+The PM adapter therefore rewrites only that legacy CCXT-Pro futures URL to
+`wss://fstream.binance.com/market/ws` before `watch_ohlcv` begins. It preserves
+newer CCXT, proxy and testnet endpoints. Keep `exchange.enable_ws: true`: Kline
+WS is again the primary source; REST remains only for startup backfill, gap
+repair and validation. A local wire probe now receives a `@kline_5m` frame from
+the `/market` endpoint, while the former root URL receives no frame.
+
+Re-run the diagnostic on the host:
+
+```bash
+python - <<'EOF'
+import asyncio, websockets
+async def main():
+    async with websockets.connect("wss://fstream.binance.com/market/ws/0", open_timeout=8) as ws:
+        await ws.send('{"method":"SUBSCRIBE","params":["btcusdt@kline_5m"],"id":1}')
+        await ws.recv()  # subscription ACK
+        msg = await asyncio.wait_for(ws.recv(), timeout=10)  # kline event
+        print("OK:", str(msg)[:120])
+asyncio.run(main())
+EOF
+```
+
 ## Deployment
 
 The repository ships a runnable dry-run example:
@@ -610,6 +646,7 @@ Production must only run a reviewed image digest. Record every promotion here:
 
 | Date | Source commit | Image digest (`docker inspect --format='{{index .RepoDigests 0}}' ...`) | Python | CCXT | FastAPI | Notes |
 |------|---------------|------------------------------------------------------------------------|--------|------|---------|-------|
+| 2026-09-04 | `2c2f7bb94` | local build `pmbinancejp-native:release-2806f8982` image ID `29b1f65bf73e` (no registry; archive sha256 `6aecf382…`) | 3.13.11 | 4.5.35 | 0.128.0 | PM native release: P0 hardening + durable watermark + true single-flight + single-instance lock. Built on-host from the release tree; pre-cutover dump sha256 `b52e24fa…`. Gate: 4342 passed container suite, PG17 fault injection 4/4, migration rehearsal OK. |
 | _example_ | `a627799b4` | `sha256:...` | 3.12 | 4.5.35 | 0.128.0 | reviewed; do not copy - fill in the real digest |
 
 Upgrade procedure (never let a new image auto-replace production):

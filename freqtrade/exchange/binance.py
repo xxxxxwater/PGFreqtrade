@@ -149,6 +149,15 @@ class Binance(Exchange):
         (TradingMode.FUTURES, MarginMode.ISOLATED),
     ]
 
+    # Binance split the USD-M Futures stream host into routed endpoints in 2026.
+    # Klines are regular market data and must use ``/market``.  ccxt-pro 4.5.35
+    # still initialises ``future`` with the retired root ``.../ws`` URL, which
+    # acknowledges a SUBSCRIBE request but never pushes kline frames.  Keep the
+    # override narrowly scoped to that legacy production URL so user-supplied
+    # custom endpoints and testnet endpoints retain their own semantics.
+    _PM_FUTURES_MARKET_WS_URL = "wss://fstream.binance.com/market/ws"
+    _LEGACY_FUTURES_WS_URL = "wss://fstream.binance.com/ws"
+
     @property
     def _pm_user_stream_lock(self) -> RLock:
         """
@@ -196,6 +205,44 @@ class Binance(Exchange):
         )
         super().__init__(*args, **kwargs)
         self._spot_delist_schedule_cache: FtTTLCache = FtTTLCache(maxsize=100, ttl=300)
+
+    def _init_ccxt(
+        self, exchange_config: dict[str, Any], sync: bool, ccxt_kwargs: dict[str, Any]
+    ) -> ccxt.Exchange:
+        """Initialise CCXT, then route legacy PM futures kline WS clients correctly."""
+        api = super()._init_ccxt(exchange_config, sync, ccxt_kwargs)
+        if not sync:
+            self._configure_pm_futures_market_ws(api)
+        return api
+
+    def _configure_pm_futures_market_ws(self, api: Any) -> None:
+        """
+        Move legacy CCXT-Pro PM futures market-data connections to ``/market``.
+
+        Binance's routed Futures WS service accepts the old root URL and its
+        subscription ACK, but the root has exposed only ``/public`` streams
+        since the migration.  Kline streams belong to ``/market``.  Do not
+        replace an explicit non-production URL: operators may use a testnet,
+        a proxy or a newer CCXT version that already supplies the route.
+        """
+        if not self._is_portfolio_margin():
+            return
+        try:
+            ws_urls = api.urls["api"]["ws"]
+            configured_url = str(ws_urls.get("future") or "").rstrip("/")
+            if configured_url != self._LEGACY_FUTURES_WS_URL:
+                return
+            ws_urls["future"] = self._PM_FUTURES_MARKET_WS_URL
+            logger.info(
+                "PM futures market-data WebSocket migrated from legacy %s to %s.",
+                self._LEGACY_FUTURES_WS_URL,
+                self._PM_FUTURES_MARKET_WS_URL,
+            )
+        except (AttributeError, KeyError, TypeError):
+            # The regular REST/PAPI transport remains available.  Do not make
+            # exchange construction fail just because a future CCXT shape has
+            # changed; ExchangeWS will surface a normal health/fallback error.
+            logger.warning("Could not configure the PM futures market-data WebSocket route.")
 
     def _is_portfolio_margin(self) -> bool:
         return bool(getattr(self, "_portfolio_margin", False))

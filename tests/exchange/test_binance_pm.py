@@ -6,6 +6,7 @@ HTTP fallback, clientOrderId idempotency and the PM order-query surface.
 """
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import ccxt
@@ -92,6 +93,44 @@ def test_papi_request_uses_papi_namespace(default_conf_usdt, mocker):
     assert exchange._api.request.call_args[0][1] == "papi"
     assert exchange._api.request.call_args[0][2] == "POST"
     assert getattr(exchange, "_last_papi_success_time", None) is not None
+
+
+def test_pm_futures_kline_ws_uses_binance_market_route(default_conf_usdt, mocker):
+    """
+    Klines are /market streams after Binance's Futures WS route split.
+
+    ccxt-pro 4.5.35 still exposes the old root ``.../ws`` value.  That route
+    accepts SUBSCRIBE but does not deliver ``@kline`` frames, so PM must migrate
+    it before ExchangeWS calls watch_ohlcv.
+    """
+    exchange = get_patched_pm_exchange(mocker, default_conf_usdt)
+    api = SimpleNamespace(
+        urls={"api": {"ws": {"future": "wss://fstream.binance.com/ws"}}}
+    )
+
+    exchange._configure_pm_futures_market_ws(api)
+
+    assert api.urls["api"]["ws"]["future"] == "wss://fstream.binance.com/market/ws"
+
+
+@pytest.mark.parametrize(
+    "future_url",
+    [
+        "wss://fstream.binance.com/market/ws",
+        "wss://fstream.binancefuture.com/ws",
+        "wss://proxy.example.test/futures/ws",
+    ],
+)
+def test_pm_futures_kline_ws_preserves_nonlegacy_override(
+    default_conf_usdt, mocker, future_url
+):
+    """A newer CCXT, testnet or explicit operator endpoint is never overwritten."""
+    exchange = get_patched_pm_exchange(mocker, default_conf_usdt)
+    api = SimpleNamespace(urls={"api": {"ws": {"future": future_url}}})
+
+    exchange._configure_pm_futures_market_ws(api)
+
+    assert api.urls["api"]["ws"]["future"] == future_url
 
 
 def test_pm_tradable_pairs_uses_account_symbol_configuration(default_conf_usdt, mocker):

@@ -1,0 +1,58 @@
+{
+  "strategy_name": "VWAP_V4",
+  "params": {
+    "stoploss": {
+      "stoploss": -0.35
+    },
+    "trailing": {
+      "trailing_stop": false,
+      "trailing_stop_positive": 0.02,
+      "trailing_stop_positive_offset": 0.1,
+      "trailing_only_offset_is_reached": true
+    },
+    "max_open_trades": {
+      "max_open_trades": 4
+    },
+    "sell": {
+      "base_nb_candles_sell": 22,
+      "high_offset": 1.012,
+      "high_offset_2": 1.016,
+      "pHSL": -0.35,
+      "pPF_1": 0.012,
+      "pPF_2": 0.07,
+      "pSL_1": 0.015,
+      "pSL_2": 0.068,
+      "sell_deadfish_bb_factor": 1.089,
+      "sell_deadfish_bb_width": 0.11,
+      "sell_deadfish_profit": -0.107,
+      "sell_deadfish_volume_factor": 1.761,
+      "sell_trail_down_1": 0.03,
+      "sell_trail_down_2": 0.015,
+      "sell_trail_profit_max_1": 0.4,
+      "sell_trail_profit_max_2": 0.11,
+      "sell_trail_profit_min_1": 0.1,
+      "sell_trail_profit_min_2": 0.04
+    },
+    "buy": {
+      "buy_bb_delta": 0.025,
+      "buy_bb_factor": 0.995,
+      "buy_bb_width": 0.095,
+      "buy_bb_width_1h": 0.3,
+      "buy_cci": -133,
+      "buy_cci_length": 25,
+      "buy_closedelta": 15.0,
+      "buy_rmi": 35,
+      "buy_rmi_length": 8,
+      "buy_roc_1h": 10,
+      "buy_srsi_fk": 25
+    },
+    "roi": {
+      "0": 0.224,
+      "14": 0.076,
+      "28": 0.04,
+      "120": 0
+    }
+  },
+  "ft_stratparam_v": 1,
+  "export_time": "2026-08-29 10:02:07.859855+00:00"
+}

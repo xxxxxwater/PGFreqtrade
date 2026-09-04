@@ -1223,8 +1223,9 @@ class RPC:
         outbox_stats: dict[str, Any] = {}
         signal_ledger_rows: int | None = None
         governor_stats: dict[str, Any] | None = None
+        watermark_gaps: dict[str, Any] = {}
         try:
-            from freqtrade.persistence import PMOutbox, PMSignalLedger
+            from freqtrade.persistence import PMCandleWatermark, PMOutbox, PMSignalLedger
 
             outbox_stats = {
                 state: PMOutbox.session.query(PMOutbox)
@@ -1233,8 +1234,30 @@ class RPC:
                 for state in ("PENDING", "ACKED", "LINKED", "RECONCILED", "REJECTED", "DEAD")
             }
             signal_ledger_rows = PMSignalLedger.session.query(PMSignalLedger).count()
+            active_gaps = (
+                PMCandleWatermark.session.query(PMCandleWatermark)
+                .filter(PMCandleWatermark.gap_expected_open_time.isnot(None))
+                .all()
+            )
+            watermark_gaps = {
+                "active": len(active_gaps),
+                "pairs": [
+                    {
+                        "pair": gap.pair,
+                        "timeframe": gap.timeframe,
+                        "expected_open": (
+                            gap.gap_expected_open_time.isoformat()
+                            if gap.gap_expected_open_time
+                            else None
+                        ),
+                        "reason": gap.gap_reason,
+                        "since": gap.gap_detected_at.isoformat() if gap.gap_detected_at else None,
+                    }
+                    for gap in active_gaps[:20]
+                ],
+            }
         except Exception:
-            logger.debug("Could not include PM outbox / ledger stats in pm_status.")
+            logger.debug("Could not include PM outbox / ledger / watermark stats in pm_status.")
         governor = getattr(self._freqtrade.exchange, "_pm_governor_inst", None)
         if governor is not None and hasattr(governor, "stats"):
             governor_stats = governor.stats()
@@ -1260,6 +1283,7 @@ class RPC:
             ],
             "outbox": outbox_stats,
             "signal_ledger_rows": signal_ledger_rows,
+            "candle_watermark_gaps": watermark_gaps,
             "papi_governor": governor_stats,
         }
 

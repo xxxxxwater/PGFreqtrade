@@ -481,7 +481,19 @@ class FreqtradeBot(LoggingMixin):
         if order.ft_order_side == "stoploss":
             with self._exit_lock:
                 strategy_id = str(order.order_id)
-                exchange_order = self.exchange.fetch_stoploss_order(strategy_id, trade.pair)
+                try:
+                    exchange_order = self.exchange.fetch_stoploss_order(strategy_id, trade.pair)
+                except InvalidOrderException:
+                    # The conditional is definitively gone (triggered or
+                    # canceled). Mark it canceled locally - never re-raise:
+                    # a redelivered event must not fail the batch repeatedly.
+                    logger.warning(
+                        f"PM user stream: stoploss {strategy_id} on {trade.pair} no longer "
+                        "exists on the exchange; marking canceled locally."
+                    )
+                    order.ft_is_open = False
+                    order.status = "canceled"
+                    return True
                 self._pm_record_actual_order(exchange_order, strategy_id)
                 self.update_trade_state(
                     trade,
@@ -3261,9 +3273,17 @@ class FreqtradeBot(LoggingMixin):
                 )
                 self.update_trade_state(trade, oslo.order_id, co, stoploss_order=True)
             except InvalidOrderException:
-                logger.exception(
-                    f"Could not cancel stoploss order {oslo.order_id} for pair {trade.pair}"
+                # The exchange definitively no longer has this conditional
+                # (already triggered/canceled, e.g. auto-removed when the
+                # position went flat). Mark it canceled locally so the trade
+                # state stays consistent and redelivered stream events stop
+                # retrying the cancel forever.
+                logger.warning(
+                    f"Stoploss order {oslo.order_id} for pair {trade.pair} no longer "
+                    "exists on the exchange; marking it canceled locally."
                 )
+                oslo.ft_is_open = False
+                oslo.status = "canceled"
         return trade
 
     def get_valid_enter_price_and_stake(

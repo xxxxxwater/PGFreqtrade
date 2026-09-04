@@ -289,6 +289,37 @@ def test_cancel_stoploss_order_pm_routes_to_algo_order(default_conf_usdt, mocker
     assert result["status"] == "canceled"
 
 
+def test_cancel_stoploss_order_gone_is_definitive_no_retry(default_conf_usdt, mocker):
+    """
+    -2011 (Unknown order sent) means the conditional is DEFINITIVELY gone.
+    It must surface as InvalidOrderException (never retried by the @retrier
+    layer) so a redelivered ORDER_TRADE_UPDATE cannot produce a 5x retry
+    storm for every event.
+    """
+    exchange = get_patched_pm_exchange(mocker, default_conf_usdt)
+    exchange._papi_request = MagicMock(
+        side_effect=ccxt.OperationRejected('binance {"code":-2011,"msg":"Unknown order sent."}')
+    )
+
+    with pytest.raises(InvalidOrderException, match="no longer exists"):
+        exchange.cancel_stoploss_order("stabc", "ETH/USDT:USDT")
+
+    # The @retrier wrapper must have called the underlying method exactly once.
+    assert exchange._papi_request.call_count == 1
+
+
+def test_cancel_stoploss_order_transient_error_still_temporary(default_conf_usdt, mocker):
+    """A genuinely transient error keeps its retryable classification."""
+    exchange = get_patched_pm_exchange(mocker, default_conf_usdt)
+    exchange._papi_request = MagicMock(
+        side_effect=ccxt.ExchangeError("binance temporary gateway failure")
+    )
+
+    with pytest.raises(TemporaryError, match="Could not cancel Binance PM stoploss"):
+        exchange.cancel_stoploss_order("stabc", "ETH/USDT:USDT")
+
+
+
 def test_cancel_order_pm_strips_stop_flag(default_conf_usdt, mocker):
     exchange = get_patched_pm_exchange(mocker, default_conf_usdt)
     exchange._papi_request = MagicMock(return_value=PM_ORDER)

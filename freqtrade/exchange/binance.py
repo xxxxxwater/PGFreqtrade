@@ -3316,6 +3316,16 @@ class Binance(Exchange):
         except ccxt.DDoSProtection as e:
             raise DDosProtection(e) from e
         except (ccxt.OperationFailed, ccxt.ExchangeError) as e:
+            # -2011/-2012/-2013/-4003 mean the algo order is DEFINITIVELY gone
+            # (already canceled, triggered or expired). Retrying can never
+            # succeed and turns every redelivered ORDER_TRADE_UPDATE into a
+            # 5x retry storm - classify as InvalidOrderException (no retry)
+            # so callers mark the local order canceled and move on.
+            if self._pm_order_not_found(e):
+                raise InvalidOrderException(
+                    f"Binance PM stoploss order {order_id} on {pair} no longer exists "
+                    "(already canceled or triggered)."
+                ) from e
             raise TemporaryError(
                 f"Could not cancel Binance PM stoploss order due to {e.__class__.__name__}. "
                 f"Message: {e}"

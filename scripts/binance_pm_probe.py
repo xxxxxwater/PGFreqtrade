@@ -381,12 +381,22 @@ def probe_client_order_id(client_id: str, symbol: str | None = None) -> dict[str
         outcome["regular_order"] = {
             "skipped": "pass --symbol to query /um/order by origClientOrderId"
         }
-    try:
-        outcome["conditional_order"] = signed_get(
-            "/papi/v1/um/algo/algoOrder", {"algoId": client_id}
-        )
-    except ProbeError as exc:
-        outcome["conditional_order"] = {"error": str(exc)}
+    # Conditional algo lookup: the endpoint accepts clientAlgoId (string) or
+    # algoId (numeric exchange id) - try the matching variant.
+    if client_id.isdigit():
+        try:
+            outcome["conditional_order"] = signed_get(
+                "/papi/v1/um/algo/algoOrder", {"algoId": int(client_id)}
+            )
+        except ProbeError as exc:
+            outcome["conditional_order"] = {"error": str(exc)}
+    else:
+        try:
+            outcome["conditional_order"] = signed_get(
+                "/papi/v1/um/algo/algoOrder", {"clientAlgoId": client_id}
+            )
+        except ProbeError as exc:
+            outcome["conditional_order"] = {"error": str(exc)}
     return outcome
 
 

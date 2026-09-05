@@ -33,10 +33,55 @@ def test_persist_and_read_roundtrip(tmp_path):
     conf = live_conf(tmp_path)
     assert read_persisted_state(conf) == PersistedState()
     for state in (State.PAUSED, State.RUNNING, State.STOPPED):
-        persist_state(conf, state)
+        assert persist_state(conf, state) is True
         assert read_persisted_state(conf) == PersistedState(state=state)
     # File lives under user_data/.freqtrade/state (the bind-mounted volume).
     assert (tmp_path / ".freqtrade" / "state").is_file()
+
+
+def test_persist_fsyncs_file_and_directory(tmp_path, mocker):
+    """Atomic rename is not power-loss durable by itself: the file must be
+    fsynced before the rename and the directory afterwards."""
+    from freqtrade import state_persistence
+
+    fsync = mocker.patch("os.fsync")
+    replace = mocker.patch("os.replace")
+    conf = live_conf(tmp_path)
+    assert persist_state(conf, State.PAUSED) is True
+    assert fsync.call_count >= 1  # file fsync (directory fsync best-effort)
+    replace.assert_called_once()
+
+
+def test_persist_failure_returns_false(tmp_path, mocker, caplog):
+    """A failed write must be VISIBLE to the caller, not just warned about."""
+    mocker.patch("freqtrade.state_persistence.open", side_effect=OSError("disk full"))
+    conf = live_conf(tmp_path)
+    assert persist_state(conf, State.PAUSED) is False
+    assert "Could not persist bot state" in caplog.text
+
+
+def test_disabled_persistence_reports_success(tmp_path):
+    """Nothing to persist is not a failure: dry-run / disabled return True."""
+    conf = live_conf(tmp_path)
+    conf["dry_run"] = True
+    assert persist_state(conf, State.PAUSED) is True
+    conf["dry_run"] = False
+    conf["internals"]["persist_state"] = False
+    assert persist_state(conf, State.PAUSED) is True
+
+
+def test_valid_json_non_object_is_corrupt(tmp_path):
+    """`[]` is valid JSON but not a state record - corrupt, never an exception."""
+    conf = live_conf(tmp_path)
+    state_file_path(conf).parent.mkdir(parents=True)
+    state_file_path(conf).write_text("[]", encoding="utf-8")
+    result = read_persisted_state(conf)
+    assert result.corrupt is True
+    assert result.state is None
+
+    state_file_path(conf).write_text('"RUNNING"', encoding="utf-8")
+    result = read_persisted_state(conf)
+    assert result.corrupt is True
 
 
 def test_stopped_is_persisted_not_deleted(tmp_path):
@@ -112,6 +157,26 @@ def test_set_state_persists_synchronously(mocker, default_conf_usdt, tmp_path):
     assert read_persisted_state(conf) == PersistedState(state=State.PAUSED)
     bot.set_state(State.STOPPED)
     assert read_persisted_state(conf) == PersistedState(state=State.STOPPED)
+
+
+def test_set_state_alerts_when_persist_fails(mocker, default_conf_usdt, tmp_path, caplog):
+    """A state change that did NOT reach disk must alarm the operator: a
+    restart could resurrect the previous (stale) state."""
+    from tests.conftest import get_patched_freqtradebot
+
+    mocker.patch(
+        "freqtrade.freqtradebot.persist_state", return_value=False
+    )
+    conf = default_conf_usdt.copy()
+    conf["dry_run"] = False
+    conf["user_data_dir"] = tmp_path
+    conf["exchange"]["portfolio_margin"] = False
+    mocker.patch("freqtrade.exchange.binance.Binance.validate_config", MagicMock())
+    bot = get_patched_freqtradebot(mocker, conf)
+
+    bot.set_state(State.PAUSED)
+    assert bot.state == State.PAUSED  # in-memory change still applies
+    assert "could not persist bot state PAUSED" in caplog.text
 
 
 def test_rpc_pause_and_start_persist(mocker):

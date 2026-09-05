@@ -1,4 +1,4 @@
-﻿"""
+"""
 Freqtrade is the main module of this bot. It contains the FreqtradeBot class.
 """
 
@@ -2323,11 +2323,34 @@ class FreqtradeBot(LoggingMixin):
 
         Persisting at the assignment site means a crash in the window between
         a pause/stop decision and the next worker iteration can never lose
-        that decision.  Dry-run and disabled persistence are no-ops.
+        that decision.  When the write FAILS the state change still takes
+        effect in memory, but the failure is logged CRITICAL and pushed to
+        the operator: a restart could resurrect the previous (stale) state.
         """
         self.state = state
-        if hasattr(self, "config"):
-            persist_state(self.config, state)
+        if not hasattr(self, "config"):
+            return
+        if persist_state(self.config, state) is False:
+            logger.critical(
+                f"CRITICAL: could not persist bot state {state.name} to disk. "
+                "A restart before the next successful write may restore the "
+                "previous state."
+            )
+            rpc = getattr(self, "rpc", None)
+            if rpc is not None:
+                try:
+                    rpc.send_msg(
+                        {
+                            "type": RPCMessageType.WARNING,
+                            "status": (
+                                f"CRITICAL: state {state.name} could not be persisted "
+                                "to disk. The change is active in memory only; a "
+                                "restart may restore the previous state."
+                            ),
+                        }
+                    )
+                except Exception:  # alerting must never break the state change
+                    logger.exception("Could not send state-persistence failure alert")
 
     def cleanup(self) -> None:
         """

@@ -136,10 +136,17 @@ restore_smoke() {
     done
 
     # Key referential sanity: order rows must reference an existing trade.
-    ORPHANS=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \
-        "SELECT count(*) FROM orders WHERE ft_trade_id IS NOT NULL AND ft_trade_id NOT IN (SELECT id FROM trades)" 2>/dev/null)
+    # The query exit code is checked AND only an explicit numeric "0" is
+    # accepted - an empty/failed query must fail the smoke test, never pass.
+    ORPHANS=""
+    if ! ORPHANS=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \
+        "SELECT count(*) FROM orders WHERE ft_trade_id IS NOT NULL AND ft_trade_id NOT IN (SELECT id FROM trades)" 2>/dev/null); then
+        dropdb -w -h "$PG_HOST" -U "$PG_USER" --if-exists "$SCRATCH" 2>/dev/null || true
+        fail "restore smoke: orphan-check query failed"
+        return 1
+    fi
     dropdb -w -h "$PG_HOST" -U "$PG_USER" "$SCRATCH" 2>/dev/null || true
-    if [ "$ORPHANS" != "0" ] && [ -n "$ORPHANS" ]; then
+    if [ "$ORPHANS" != "0" ]; then
         fail "restore smoke: $ORPHANS orphaned order rows (ft_trade_id without trade)"
         return 1
     fi

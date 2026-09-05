@@ -51,10 +51,17 @@ def account_lock_path(env: dict[str, str], lock_dir: Path) -> Path | None:
     """
     Host-wide, ACCOUNT-level lock path derived from the exchange API key.
 
-    Any wrapper launched with the same API key resolves to the same lock file
-    regardless of the deployment directory, so a stale/duplicate deployment on
-    this host can never run a second bot against the same account.  Returns
-    None when no API key is present (e.g. dry-run test invocations).
+    SCOPE (documented precisely): this provides mutual exclusion for wrappers
+    that (a) run on the SAME host, (b) use the SAME API key, and (c) share
+    the same lock directory (--account-lock-dir / PM_ACCOUNT_LOCK_DIR).
+    It does NOT protect against: a second API key for the same exchange
+    account, or a second machine.  Cross-machine protection requires a
+    stable account identifier plus a shared lease mechanism (e.g. DB
+    advisory lock in a shared database or a distributed lock service) and is
+    out of scope here; today the complementary guard is the API-key IP
+    whitelist on the Binance side.
+
+    Returns None when no API key is present (e.g. dry-run test invocations).
     """
     key = env.get("FREQTRADE__EXCHANGE__KEY") or env.get("BINANCE_PM_API_KEY")
     if not key:

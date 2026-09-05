@@ -17,8 +17,10 @@ Design rules:
     of silently falling back to the configured running state.
   - A valid persisted PAUSED/STOPPED overrides the configured default; a
     persisted RUNNING never overrides an explicit configuration.
-  - Every filesystem failure degrades to a warning; persistence must never
-    crash the trading loop.
+  - ``persist_state`` RETURNS a success flag: the caller must know when the
+    write failed, because a pause/stop that never reached disk can be lost
+    on the next restart.  The write is made power-loss-durable with fsync
+    (file before rename, directory after rename), not just atomic.
 """
 
 import json
@@ -60,33 +62,60 @@ def persistence_enabled(config: dict) -> bool:
     return bool(config.get("internals", {}).get("persist_state", True))
 
 
-def persist_state(config: dict, state: State) -> None:
-    """Atomically write the current RUNNING/PAUSED/STOPPED state to disk.
+def persist_state(config: dict, state: State) -> bool:
+    """Durably write the current RUNNING/PAUSED/STOPPED state to disk.
 
     Called synchronously at the moment of the state change (before any
     notification), so a crash right after a pause/stop decision can never
-    lose it.  Non-trading states (RELOAD_CONFIG) are ignored.
+    lose it.  Returns False when the state could NOT be persisted - the
+    caller must alert loudly, because a restart would restore the previous
+    (stale) state.  Non-trading states (RELOAD_CONFIG) and disabled
+    persistence are no-ops that return True (nothing to persist).
     """
     if not persistence_enabled(config):
-        return
+        return True
     if state not in (State.RUNNING, State.PAUSED, State.STOPPED):
-        return
+        return True
     path = state_file_path(config)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        payload = {
-            "state": state.name,
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        payload = json.dumps(
+            {
+                "state": state.name,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        # Power-loss durability: fsync the FILE before the atomic rename and
+        # fsync the DIRECTORY afterwards so the rename itself survives.
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, path)
+        try:
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass  # directory fsync unsupported on some platforms/filesystems
+        return True
     except Exception as exception:
-        logger.warning(f"Could not persist bot state: {exception}")
+        logger.critical(
+            f"Could not persist bot state {state.name} to {path}: {exception}. "
+            "A restart before the next successful write may restore the previous state."
+        )
+        return False
 
 
 def read_persisted_state(config: dict) -> PersistedState:
-    """Read the persisted state, distinguishing "no record" from "corrupt"."""
+    """Read the persisted state, distinguishing "no record" from "corrupt".
+
+    Any file that parses to something that is not a well-formed record
+    (including valid JSON like ``[]``) is CORRUPT, never silently ignored.
+    """
     if not persistence_enabled(config):
         return PersistedState()
     path = state_file_path(config)
@@ -94,14 +123,16 @@ def read_persisted_state(config: dict) -> PersistedState:
         if not path.is_file():
             return PersistedState()
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            logger.warning(f"Persisted bot state in {path} is not a JSON object")
+            return PersistedState(corrupt=True)
+        name = str(data.get("state", "")).upper()
+        if name in ("RUNNING", "PAUSED", "STOPPED"):
+            return PersistedState(state=State[name])
+        logger.warning(f"Persisted bot state in {path} has unknown value {name!r}")
+        return PersistedState(corrupt=True)
     except FileNotFoundError:
         return PersistedState()
     except Exception as exception:
         logger.warning(f"Persisted bot state in {path} is corrupt: {exception}")
         return PersistedState(corrupt=True)
-
-    name = str(data.get("state", "")).upper()
-    if name in ("RUNNING", "PAUSED", "STOPPED"):
-        return PersistedState(state=State[name])
-    logger.warning(f"Persisted bot state in {path} has unknown value {name!r}")
-    return PersistedState(corrupt=True)

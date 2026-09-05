@@ -84,6 +84,91 @@ def test_valid_json_non_object_is_corrupt(tmp_path):
     assert result.corrupt is True
 
 
+def test_directory_fsync_real_io_error_fails_persist(tmp_path, mocker, caplog):
+    """EIO on the directory fsync is a durability failure, never 'unsupported'."""
+    import errno as _errno
+
+    # Windows cannot open directories natively; fake the dir fd so the EIO
+    # branch is actually exercised.
+    mocker.patch("os.open", return_value=12345)
+    mocker.patch("os.close")
+    mocker.patch("os.fsync", side_effect=[None, OSError(_errno.EIO, "input/output error")])
+    conf = live_conf(tmp_path)
+    assert persist_state(conf, State.PAUSED) is False
+    assert "Could not persist bot state" in caplog.text
+
+
+def test_directory_fsync_unsupported_is_ignored(tmp_path, mocker):
+    """EINVAL/ENOTSUP mean the filesystem does not support dir fsync - success."""
+    import errno as _errno
+
+    mocker.patch("os.open", return_value=12345)
+    mocker.patch("os.close")
+    mocker.patch("os.fsync", side_effect=[None, OSError(_errno.EINVAL, "invalid argument")])
+    conf = live_conf(tmp_path)
+    assert persist_state(conf, State.PAUSED) is True
+    assert read_persisted_state(conf) == PersistedState(state=State.PAUSED)
+
+
+def test_invalidate_makes_read_corrupt(tmp_path):
+    """After a failed persist the old record is replaced by a corrupt marker,
+    so a restart boots PAUSED instead of restoring the stale state."""
+    from freqtrade.state_persistence import invalidate_state_file
+
+    conf = live_conf(tmp_path)
+    persist_state(conf, State.RUNNING)
+    assert invalidate_state_file(conf) is True
+    assert read_persisted_state(conf) == PersistedState(corrupt=True)
+
+
+def test_invalidate_failure_is_reported(tmp_path, mocker, caplog):
+    from freqtrade.state_persistence import invalidate_state_file
+
+    mocker.patch("freqtrade.state_persistence.Path.write_text", side_effect=OSError("disk full"))
+    conf = live_conf(tmp_path)
+    assert invalidate_state_file(conf) is False
+    assert "Could not invalidate stale bot state" in caplog.text
+
+
+def test_set_state_invalidates_then_worker_retry_recovers(mocker, default_conf_usdt, tmp_path):
+    """set_state on write failure: alert + tombstone + retry flag; the worker
+    self-heal re-persists the current state once the disk works again."""
+    from tests.conftest import get_patched_freqtradebot
+    from freqtrade import state_persistence
+    from freqtrade.worker import Worker
+
+    conf = default_conf_usdt.copy()
+    conf["dry_run"] = False
+    conf["user_data_dir"] = tmp_path
+    conf["exchange"]["portfolio_margin"] = False
+    mocker.patch("freqtrade.exchange.binance.Binance.validate_config", MagicMock())
+    bot = get_patched_freqtradebot(mocker, conf)
+
+    real_persist = state_persistence.persist_state
+    calls = {"n": 0}
+
+    def flaky(config, state):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return False
+        return real_persist(config, state)
+
+    mocker.patch("freqtrade.freqtradebot.persist_state", side_effect=flaky)
+
+    bot.set_state(State.PAUSED)
+    assert bot.state == State.PAUSED
+    assert bot._state_persist_failed is True
+    # The stale record was invalidated: a restart now reads corrupt -> PAUSED.
+    assert read_persisted_state(conf) == PersistedState(corrupt=True)
+
+    worker = Worker.__new__(Worker)
+    worker._config = conf
+    worker.freqtrade = bot
+    worker._retry_state_persist()
+    assert bot._state_persist_failed is False
+    assert read_persisted_state(conf) == PersistedState(state=State.PAUSED)
+
+
 def test_stopped_is_persisted_not_deleted(tmp_path):
     """An intentional /stop must survive a restart as STOPPED."""
     conf = live_conf(tmp_path)

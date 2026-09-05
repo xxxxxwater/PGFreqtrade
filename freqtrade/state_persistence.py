@@ -23,6 +23,7 @@ Design rules:
     (file before rename, directory after rename), not just atomic.
 """
 
+import errno
 import json
 import logging
 import os
@@ -62,6 +63,22 @@ def persistence_enabled(config: dict) -> bool:
     return bool(config.get("internals", {}).get("persist_state", True))
 
 
+def _directory_fsync_error_ignorable(exception: OSError) -> bool:
+    """Only "not supported" outcomes may be ignored for directory fsync.
+
+    A REAL I/O error on the directory fsync means the rename itself may not
+    survive power loss - that is a durability failure and must surface as a
+    persist failure, never be swallowed as success.
+    """
+    if exception.errno in (errno.EINVAL, errno.ENOTSUP):
+        return True
+    # Windows cannot open directories with os.open(); that is a platform
+    # limitation, not an I/O failure.
+    if os.name == "nt" and exception.errno == errno.EACCES:
+        return True
+    return False
+
+
 def persist_state(config: dict, state: State) -> bool:
     """Durably write the current RUNNING/PAUSED/STOPPED state to disk.
 
@@ -99,14 +116,41 @@ def persist_state(config: dict, state: State) -> bool:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        except OSError:
-            pass  # directory fsync unsupported on some platforms/filesystems
+        except OSError as exception:
+            if not _directory_fsync_error_ignorable(exception):
+                raise
         return True
     except Exception as exception:
         logger.critical(
             f"Could not persist bot state {state.name} to {path}: {exception}. "
             "A restart before the next successful write may restore the previous state."
         )
+        return False
+
+
+def invalidate_state_file(config: dict) -> bool:
+    """Best-effort fail-safe after a failed persist.
+
+    Overwrite the state record with a CORRUPT marker so a restart can never
+    resurrect the previous (stale) state: ``read_persisted_state`` reports
+    corrupt and the bot boots PAUSED (auto-trading blocked).  Returns False
+    when invalidation itself failed - in that case nothing more can be done
+    locally and only the CRITICAL log + operator alert remain.
+    """
+    if not persistence_enabled(config):
+        return True
+    path = state_file_path(config)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("corrupt - previous persist failed\n", encoding="utf-8")
+        try:
+            with open(path, "rb") as handle:
+                os.fsync(handle.fileno())
+        except OSError:
+            pass  # tombstone fsync is best-effort; content already replaced
+        return True
+    except Exception as exception:
+        logger.critical(f"Could not invalidate stale bot state at {path}: {exception}")
         return False
 
 

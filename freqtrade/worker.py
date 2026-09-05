@@ -18,6 +18,7 @@ from freqtrade.enums import RPCMessageType, State
 from freqtrade.exceptions import OperationalException, TemporaryError
 from freqtrade.exchange import timeframe_to_next_date
 from freqtrade.freqtradebot import FreqtradeBot
+from freqtrade.state_persistence import persist_state
 from freqtrade.util import PeriodicCache
 
 
@@ -72,6 +73,18 @@ class Worker:
             if self._config.get("internals", {}).get("sd_notify", False)
             else None
         )
+
+    def _retry_state_persist(self) -> None:
+        """Self-heal a previously failed state persist (see FreqtradeBot.set_state).
+
+        Called every worker iteration while the failure flag is set; the
+        state file was invalidated by set_state, so this re-persists the
+        CURRENT in-memory state until the disk write succeeds again.
+        """
+        if getattr(self.freqtrade, "_state_persist_failed", False):
+            if persist_state(self._config, self.freqtrade.state):
+                self.freqtrade._state_persist_failed = False
+                logger.warning("Recovered persisted bot state after an earlier write failure.")
 
     def _notify(self, message: str) -> None:
         """
@@ -151,6 +164,10 @@ class Worker:
             # Reset heartbeat timestamp to log the heartbeat message at
             # first throttling iteration when the state changes
             self._heartbeat_msg = 0
+
+        # Self-heal a previously failed state persist: retry every iteration
+        # until the current state is durably on disk again.
+        self._retry_state_persist()
 
         if state == State.STOPPED:
             # Ping systemd watchdog before sleeping in the stopped state

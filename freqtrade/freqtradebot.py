@@ -58,7 +58,7 @@ from freqtrade.persistence.pm_order_intent import PMOrderIntent
 from freqtrade.plugins.pairlistmanager import PairListManager
 from freqtrade.plugins.protectionmanager import ProtectionManager
 from freqtrade.resolvers import ExchangeResolver, StrategyResolver
-from freqtrade.state_persistence import persist_state, read_persisted_state
+from freqtrade.state_persistence import invalidate_state_file, persist_state, read_persisted_state
 from freqtrade.rpc import RPCManager
 from freqtrade.rpc.external_message_consumer import ExternalMessageConsumer
 from freqtrade.rpc.rpc_types import (
@@ -95,6 +95,9 @@ class FreqtradeBot(LoggingMixin):
 
         # Init bot state
         self.state = State.STOPPED
+        # True when the last set_state() could not be persisted; the worker
+        # retries persisting the current state until it succeeds.
+        self._state_persist_failed = False
 
         # Init objects
         self.config = config
@@ -2331,10 +2334,17 @@ class FreqtradeBot(LoggingMixin):
         if not hasattr(self, "config"):
             return
         if persist_state(self.config, state) is False:
+            self._state_persist_failed = True
+            invalidated = invalidate_state_file(self.config)
             logger.critical(
                 f"CRITICAL: could not persist bot state {state.name} to disk. "
-                "A restart before the next successful write may restore the "
-                "previous state."
+                + (
+                    "The previous state record was invalidated: a restart will "
+                    "start PAUSED (no auto-trading)."
+                    if invalidated
+                    else "The previous state record could NOT be invalidated: "
+                    "a restart may restore the previous state."
+                )
             )
             rpc = getattr(self, "rpc", None)
             if rpc is not None:
@@ -2344,13 +2354,21 @@ class FreqtradeBot(LoggingMixin):
                             "type": RPCMessageType.WARNING,
                             "status": (
                                 f"CRITICAL: state {state.name} could not be persisted "
-                                "to disk. The change is active in memory only; a "
-                                "restart may restore the previous state."
+                                "to disk. The change is active in memory only; "
+                                + (
+                                    "the previous state record was invalidated, so a "
+                                    "restart will start PAUSED."
+                                    if invalidated
+                                    else "the previous state record could not be "
+                                    "invalidated - a restart may restore it."
+                                )
                             ),
                         }
                     )
                 except Exception:  # alerting must never break the state change
                     logger.exception("Could not send state-persistence failure alert")
+        else:
+            self._state_persist_failed = False
 
     def cleanup(self) -> None:
         """

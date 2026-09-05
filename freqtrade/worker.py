@@ -18,6 +18,7 @@ from freqtrade.enums import RPCMessageType, State
 from freqtrade.exceptions import OperationalException, TemporaryError
 from freqtrade.exchange import timeframe_to_next_date
 from freqtrade.freqtradebot import FreqtradeBot
+from freqtrade.state_persistence import clear_persisted_state, persist_state
 from freqtrade.util import PeriodicCache
 
 
@@ -147,6 +148,15 @@ class Worker:
 
             if state == State.STOPPED:
                 self.freqtrade.check_for_open_trades()
+
+            # Persist the new state so a PAUSED bot stays PAUSED across a
+            # container restart or server reboot (production fail-safe).
+            # STOPPED clears the file: an intentional stop is never
+            # resurrected by an old persisted value.
+            if state == State.STOPPED:
+                clear_persisted_state(self._config)
+            else:
+                persist_state(self._config, state)
 
             # Reset heartbeat timestamp to log the heartbeat message at
             # first throttling iteration when the state changes

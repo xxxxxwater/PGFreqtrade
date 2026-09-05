@@ -31,7 +31,13 @@ from telegram import (
 )
 from telegram.constants import MessageLimit, ParseMode
 from telegram.error import BadRequest, NetworkError, TelegramError
-from telegram.ext import Application, CallbackContext, CallbackQueryHandler, CommandHandler
+from telegram.ext import (
+    Application,
+    CallbackContext,
+    CallbackQueryHandler,
+    CommandHandler,
+    TypeHandler,
+)
 from telegram.helpers import escape_markdown
 
 from freqtrade.__init__ import __version__
@@ -273,6 +279,13 @@ class Telegram(RPCHandler):
 
         self._app = self._init_telegram_app()
 
+        # Audit log EVERY inbound interaction (commands, plain messages and
+        # inline-button callbacks) before any handler runs.  Production
+        # requirement: trading-class commands (/fx, /pm_close, ...) must be
+        # traceable to a user and timestamp in the bot log.  Runs in group -1,
+        # i.e. BEFORE the real command handlers.
+        self._app.add_handler(TypeHandler(Update, self._log_inbound_update), group=-1)
+
         # Register command handler and start telegram message polling
         handles = [
             CommandHandler("status", self._status),
@@ -356,6 +369,40 @@ class Telegram(RPCHandler):
             [[x for x in sorted(h.commands)] for h in handles],
         )
         self._loop.run_until_complete(self._startup_telegram())
+
+    async def _log_inbound_update(self, update: Update, context: CallbackContext) -> None:
+        """
+        Audit-log every inbound Telegram interaction before its handler runs.
+
+        Covers text commands (e.g. /fx, /pm_close ...), plain messages and
+        inline-button callbacks (e.g. the force_exit confirmation buttons).
+        Audit logging must never break telegram handling, so any failure
+        degrades to a debug log.
+        """
+        try:
+            user = update.effective_user
+            user_id = getattr(user, "id", None)
+            user_name = getattr(user, "full_name", "") or ""
+            user_handle = f"@{user.username}" if getattr(user, "username", None) else ""
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            identity = f"chat_id={chat_id} user={user_handle or user_name}({user_id})"
+            if update.message and update.message.text:
+                entities = getattr(update.message, "entities", None) or []
+                kind = (
+                    "command"
+                    if any(getattr(entity, "type", "") == "bot_command" for entity in entities)
+                    else "message"
+                )
+                logger.info(
+                    f"Telegram inbound {kind}: {identity} text={update.message.text!r}"
+                )
+            elif update.callback_query:
+                logger.info(
+                    f"Telegram inbound callback: {identity} "
+                    f"data={update.callback_query.data!r}"
+                )
+        except Exception as exception:
+            logger.debug(f"Telegram inbound audit log failed: {exception}")
 
     async def _startup_telegram(self) -> None:
         retries = 3

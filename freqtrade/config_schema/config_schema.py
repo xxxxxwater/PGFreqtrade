@@ -811,6 +811,14 @@ CONF_SCHEMA = {
                     "description": "Enable systemd notify.",
                     "type": "boolean",
                 },
+                "persist_state": {
+                    "description": (
+                        "Persist RUNNING/PAUSED bot state to disk (live trading only) "
+                        "so a PAUSED bot stays PAUSED across restarts and reboots."
+                    ),
+                    "type": "boolean",
+                    "default": True,
+                },
             },
         },
         "dataformat_ohlcv": {

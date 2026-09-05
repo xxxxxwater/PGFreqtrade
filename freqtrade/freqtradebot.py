@@ -58,6 +58,7 @@ from freqtrade.persistence.pm_order_intent import PMOrderIntent
 from freqtrade.plugins.pairlistmanager import PairListManager
 from freqtrade.plugins.protectionmanager import ProtectionManager
 from freqtrade.resolvers import ExchangeResolver, StrategyResolver
+from freqtrade.state_persistence import read_persisted_state
 from freqtrade.rpc import RPCManager
 from freqtrade.rpc.external_message_consumer import ExternalMessageConsumer
 from freqtrade.rpc.rpc_types import (
@@ -155,6 +156,16 @@ class FreqtradeBot(LoggingMixin):
         # Set initial bot state from config
         initial_state = self.config.get("initial_state")
         self.state = State[initial_state.upper()] if initial_state else State.STOPPED
+
+        # Production fail-safe: a persisted PAUSED state survives restarts and
+        # reboots.  Only the fail-safe direction (PAUSED) is restored - a
+        # persisted RUNNING never overrides an explicit configuration.
+        if read_persisted_state(self.config) == State.PAUSED:
+            self.state = State.PAUSED
+            logger.warning(
+                "Restoring persisted bot state: PAUSED. "
+                "The bot will not trade until /start is sent."
+            )
 
         # Protect exit-logic from forcesell and vice versa
         self._exit_lock = Lock()

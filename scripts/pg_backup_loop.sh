@@ -109,26 +109,45 @@ restore_smoke() {
         return 1
     fi
 
+    START_NS=$(date +%s%N)
     SCRATCH="${PG_DB}_restore_smoke"
     dropdb -w -h "$PG_HOST" -U "$PG_USER" --if-exists "$SCRATCH" 2>/dev/null || true
     if ! createdb -w -h "$PG_HOST" -U "$PG_USER" "$SCRATCH" 2>/dev/null; then
         fail "createdb failed for restore smoke test"
         return 1
     fi
-    if ! psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -f "$NEWEST" >/dev/null 2>&1; then
+    # ON_ERROR_STOP: ANY SQL error (DDL, COPY, constraint) fails the restore
+    # immediately - a partially restored database can never pass as success.
+    if ! psql -w -v ON_ERROR_STOP=1 -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -f "$NEWEST" >/dev/null 2>&1; then
         fail "restore smoke test failed for $NEWEST"
         dropdb -w -h "$PG_HOST" -U "$PG_USER" --if-exists "$SCRATCH" 2>/dev/null || true
         return 1
     fi
-    TABLE_CHECK=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \
-        "SELECT to_regclass('public.pm_order_intents') IS NOT NULL")
+
+    # Every table the trading pipeline depends on must exist after restore.
+    for TABLE in trades orders pm_order_intents pm_outbox pm_signal_ledger pm_candle_watermarks; do
+        TABLE_CHECK=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \
+            "SELECT to_regclass('public.$TABLE') IS NOT NULL")
+        if [ "$TABLE_CHECK" != "t" ]; then
+            fail "restore smoke: table $TABLE missing after restore"
+            dropdb -w -h "$PG_HOST" -U "$PG_USER" --if-exists "$SCRATCH" 2>/dev/null || true
+            return 1
+        fi
+    done
+
+    # Key referential sanity: order rows must reference an existing trade.
+    ORPHANS=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \
+        "SELECT count(*) FROM orders WHERE ft_trade_id IS NOT NULL AND ft_trade_id NOT IN (SELECT id FROM trades)" 2>/dev/null)
     dropdb -w -h "$PG_HOST" -U "$PG_USER" "$SCRATCH" 2>/dev/null || true
-    if [ "$TABLE_CHECK" != "t" ]; then
-        fail "restore smoke: pm_order_intents missing after restore"
+    if [ "$ORPHANS" != "0" ] && [ -n "$ORPHANS" ]; then
+        fail "restore smoke: $ORPHANS orphaned order rows (ft_trade_id without trade)"
         return 1
     fi
+
+    ELAPSED_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
     echo "$NOW" > "$LAST_SMOKE_FILE"
-    echo "restore smoke test OK: $NEWEST"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) OK $NEWEST elapsed_ms=$ELAPSED_MS" >> "${BACKUP_DIR}/RESTORE_HEALTH"
+    echo "restore smoke test OK: $NEWEST elapsed_ms=$ELAPSED_MS"
     return 0
 }
 
@@ -137,4 +156,3 @@ while true; do
     restore_smoke
     sleep "$SLEEP"
 done
-

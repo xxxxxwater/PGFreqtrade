@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import signal
@@ -44,6 +45,22 @@ from pathlib import Path
 
 
 LOCK_BUSY_EXIT_CODE = 1
+
+
+def account_lock_path(env: dict[str, str], lock_dir: Path) -> Path | None:
+    """
+    Host-wide, ACCOUNT-level lock path derived from the exchange API key.
+
+    Any wrapper launched with the same API key resolves to the same lock file
+    regardless of the deployment directory, so a stale/duplicate deployment on
+    this host can never run a second bot against the same account.  Returns
+    None when no API key is present (e.g. dry-run test invocations).
+    """
+    key = env.get("FREQTRADE__EXCHANGE__KEY") or env.get("BINANCE_PM_API_KEY")
+    if not key:
+        return None
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return lock_dir / f"account-{digest}.lock"
 
 
 def acquire(lock_file: Path) -> int:
@@ -171,6 +188,12 @@ def main() -> None:
         "on the command line.",
     )
     parser.add_argument(
+        "--account-lock-dir",
+        default=os.environ.get("PM_ACCOUNT_LOCK_DIR", "/pm_account_locks"),
+        help="Host-wide directory for the account-level lock (derived from the "
+        "exchange API key). Default: /pm_account_locks.",
+    )
+    parser.add_argument(
         "--exec",
         nargs=argparse.REMAINDER,
         metavar="CMD...",
@@ -179,21 +202,38 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    lock_file = Path(args.lock_file)
-    fd = acquire(lock_file)
-    print(f"PM single-instance lock acquired: {lock_file}", flush=True)
-
     env_extra: dict[str, str] = {}
     for env_file in args.env_from_file:
         env_extra.update(read_env_file(env_file))
 
+    fds: list[int] = []
+
+    def release_all() -> None:
+        for held in reversed(fds):
+            try:
+                os.close(held)
+            except OSError:
+                pass
+
+    # Account-level lock first: it is the strongest guard (see docstring of
+    # account_lock_path).  The per-directory lock file is kept as a second,
+    # human-readable guard.
+    account_lock = account_lock_path(env_extra, Path(args.account_lock_dir))
+    if account_lock is not None:
+        fds.append(acquire(account_lock))
+        print(f"PM account-level lock acquired: {account_lock}", flush=True)
+
+    lock_file = Path(args.lock_file)
+    fds.append(acquire(lock_file))
+    print(f"PM single-instance lock acquired: {lock_file}", flush=True)
+
     if args.exec:
         cmd = list(args.exec)
         if not cmd:
-            os.close(fd)
+            release_all()
             raise SystemExit("--exec requires a command")
         rc = run_child(cmd, env_extra)
-        os.close(fd)  # release the lock after the child exits
+        release_all()  # release the locks after the child exits
         sys.exit(rc)
 
     # Direct acquire mode: hold the lock until terminated (used by tests /
@@ -205,7 +245,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        os.close(fd)
+        release_all()
 
 
 if __name__ == "__main__":

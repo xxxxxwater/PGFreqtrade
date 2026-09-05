@@ -54,8 +54,11 @@ def command_update(text: str, user_id: int = 5432, username: str = "trader") -> 
     return Update(0, message=message)
 
 
-async def run_handler(telegram, update):
-    return await telegram._log_inbound_update(update, MagicMock())
+async def run_handler(telegram, update, context=None):
+    if context is None:
+        context = MagicMock()
+        context.user_data = {}
+    return await telegram._log_inbound_update(update, context)
 
 
 def test_force_exit_command_is_audit_logged(mocker, default_conf, caplog):
@@ -118,3 +121,28 @@ def test_non_text_non_callback_update_is_silent(mocker, default_conf, caplog):
     with caplog.at_level(logging.INFO):
         asyncio.run(run_handler(telegram, update))
     assert "Telegram inbound" not in caplog.text
+
+
+def test_op_id_is_logged_and_stashed_on_context(mocker, default_conf, caplog):
+    import re as _re
+
+    telegram = make_telegram(mocker, default_conf)
+    context = MagicMock()
+    context.user_data = {}
+    update = command_update("/fx XRP/USDT:USDT")
+    with caplog.at_level(logging.INFO):
+        asyncio.run(run_handler(telegram, update, context))
+    match = _re.search(r"op=([0-9a-f]{8})", caplog.text)
+    assert match, f"op id missing in log: {caplog.text}"
+    assert context.user_data["audit_op_id"] == match.group(1)
+
+
+def test_long_message_is_truncated_and_sanitized(mocker, default_conf, caplog):
+    telegram = make_telegram(mocker, default_conf)
+    update = command_update("A" * 300 + "\nsecond line with secret=abc")
+    with caplog.at_level(logging.INFO):
+        asyncio.run(run_handler(telegram, update))
+    line = [l for l in caplog.text.splitlines() if "Telegram inbound" in l][0]
+    assert "..." in line
+    assert "second line" not in line
+    assert "secret=abc" not in line

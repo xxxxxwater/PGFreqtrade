@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from collections.abc import Callable, Coroutine
 from copy import deepcopy
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ from freqtrade.exceptions import OperationalException
 from freqtrade.misc import chunks, plural
 from freqtrade.persistence import Trade
 from freqtrade.rpc import RPC, RPCException, RPCHandler
+from freqtrade.rpc.rpc import set_audit_op_id
 from freqtrade.rpc.rpc_types import RPCEntryMsg, RPCExitMsg, RPCOrderMsg, RPCSendMsg
 from freqtrade.util import (
     dt_from_ts,
@@ -132,6 +134,17 @@ def authorized_only(command_handler: Callable[..., Coroutine[Any, Any, None]]):
             return None
         # Rollback session to avoid getting data stored in a transaction.
         Trade.rollback()
+        # Propagate the audit op id (stashed by the inbound audit logger) into
+        # the rpc execution context, so the execution outcome is logged with
+        # the SAME op id as the inbound command line.
+        try:
+            context = kwargs.get("context")
+            if context is None and len(args) > 1:
+                context = args[1]
+            op_id = getattr(context, "user_data", {}).get("audit_op_id")
+            set_audit_op_id(op_id)
+        except Exception:
+            set_audit_op_id(None)
         logger.debug("Executing handler: %s for chat_id: %s", command_handler.__name__, chat_id)
         try:
             return await command_handler(self, *args, **kwargs)
@@ -141,6 +154,7 @@ def authorized_only(command_handler: Callable[..., Coroutine[Any, Any, None]]):
             logger.exception("Exception occurred within Telegram module")
         finally:
             Trade.session.remove()
+            set_audit_op_id(None)
 
     return wrapper
 
@@ -376,10 +390,17 @@ class Telegram(RPCHandler):
 
         Covers text commands (e.g. /fx, /pm_close ...), plain messages and
         inline-button callbacks (e.g. the force_exit confirmation buttons).
-        Audit logging must never break telegram handling, so any failure
-        degrades to a debug log.
+        Every interaction gets a short operation id that is stashed on the
+        shared context, so trading handlers can pass it to the rpc layer and
+        the execution outcome is logged with the SAME op id.
+
+        Message text is length-limited and single-line (sanitized) so a
+        pasted blob can never flood the logfile.  Audit logging must never
+        break telegram handling, so any failure degrades to a debug log.
         """
         try:
+            op_id = uuid.uuid4().hex[:8]
+            context.user_data["audit_op_id"] = op_id
             user = update.effective_user
             user_id = getattr(user, "id", None)
             user_name = getattr(user, "full_name", "") or ""
@@ -387,18 +408,18 @@ class Telegram(RPCHandler):
             chat_id = update.effective_chat.id if update.effective_chat else None
             identity = f"chat_id={chat_id} user={user_handle or user_name}({user_id})"
             if update.message and update.message.text:
+                text = update.message.text.replace("\n", " ")
+                text = text[:200] + ("..." if len(update.message.text) > 200 else "")
                 entities = getattr(update.message, "entities", None) or []
                 kind = (
                     "command"
                     if any(getattr(entity, "type", "") == "bot_command" for entity in entities)
                     else "message"
                 )
-                logger.info(
-                    f"Telegram inbound {kind}: {identity} text={update.message.text!r}"
-                )
+                logger.info(f"Telegram inbound {kind}: op={op_id} {identity} text={text!r}")
             elif update.callback_query:
                 logger.info(
-                    f"Telegram inbound callback: {identity} "
+                    f"Telegram inbound callback: op={op_id} {identity} "
                     f"data={update.callback_query.data!r}"
                 )
         except Exception as exception:

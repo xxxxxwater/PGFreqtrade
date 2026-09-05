@@ -1,4 +1,4 @@
-"""
+﻿"""
 Freqtrade is the main module of this bot. It contains the FreqtradeBot class.
 """
 
@@ -58,7 +58,7 @@ from freqtrade.persistence.pm_order_intent import PMOrderIntent
 from freqtrade.plugins.pairlistmanager import PairListManager
 from freqtrade.plugins.protectionmanager import ProtectionManager
 from freqtrade.resolvers import ExchangeResolver, StrategyResolver
-from freqtrade.state_persistence import read_persisted_state
+from freqtrade.state_persistence import persist_state, read_persisted_state
 from freqtrade.rpc import RPCManager
 from freqtrade.rpc.external_message_consumer import ExternalMessageConsumer
 from freqtrade.rpc.rpc_types import (
@@ -155,17 +155,29 @@ class FreqtradeBot(LoggingMixin):
 
         # Set initial bot state from config
         initial_state = self.config.get("initial_state")
-        self.state = State[initial_state.upper()] if initial_state else State.STOPPED
+        if initial_state:
+            self.state = State[initial_state.upper()]
+        else:
+            self.set_state(State.STOPPED)
 
-        # Production fail-safe: a persisted PAUSED state survives restarts and
-        # reboots.  Only the fail-safe direction (PAUSED) is restored - a
-        # persisted RUNNING never overrides an explicit configuration.
-        if read_persisted_state(self.config) == State.PAUSED:
-            self.state = State.PAUSED
+        # Production fail-safe: restore the persisted state.  A valid record
+        # of PAUSED/STOPPED survives restarts and reboots; a CORRUPT record
+        # blocks auto-trading by starting PAUSED instead of silently
+        # re-running; a persisted RUNNING never overrides an explicit
+        # configuration.  The resolved state is persisted immediately, so a
+        # crash before the first worker iteration loses nothing.
+        persisted = read_persisted_state(self.config)
+        if persisted.corrupt:
+            self.set_state(State.PAUSED)
             logger.warning(
-                "Restoring persisted bot state: PAUSED. "
-                "The bot will not trade until /start is sent."
+                "Persisted bot state is corrupt or unreadable; starting PAUSED. "
+                "Entries are blocked until an operator reviews and sends /start."
             )
+        elif persisted.state in (State.PAUSED, State.STOPPED):
+            self.set_state(persisted.state)
+            logger.warning(f"Restoring persisted bot state: {persisted.state.name}.")
+        else:
+            self.set_state(self.state)
 
         # Protect exit-logic from forcesell and vice versa
         self._exit_lock = Lock()
@@ -1071,7 +1083,7 @@ class FreqtradeBot(LoggingMixin):
                 # Stop BEFORE attempting REST exits.  A close failure, a database
                 # error or a later recovery in this loop must never permit an
                 # automatic re-entry after an emergency threshold breach.
-                self.state = State.STOPPED
+                self.set_state(State.STOPPED)
                 self.rpc.send_msg(
                     {
                         "type": RPCMessageType.WARNING,
@@ -1126,8 +1138,10 @@ class FreqtradeBot(LoggingMixin):
                             ),
                         }
                     )
+                    # Persist the stop BEFORE attempting the closes: a crash
+                    # mid-close must never resurrect a RUNNING state on reboot.
+                    self.set_state(State.STOPPED)
                     self._pm_emergency_close_all()
-                    self.state = State.STOPPED
 
         except Exception as e:
             logger.warning(f"PM risk monitor check failed: {e}")
@@ -1135,9 +1149,9 @@ class FreqtradeBot(LoggingMixin):
             self._pm_block_orders("risk_check_failed")
             action = self._pm_risk_failure_action()
             if action == "stop":
-                self.state = State.STOPPED
+                self.set_state(State.STOPPED)
             elif action == "pause":
-                self.state = State.PAUSED
+                self.set_state(State.PAUSED)
             if not self._pm_risk_api_failure_sent:
                 self._pm_risk_api_failure_sent = True
                 self.rpc.send_msg(
@@ -1844,7 +1858,7 @@ class FreqtradeBot(LoggingMixin):
             # Fail-closed: an unreadable intent store must never be treated as empty.
             logger.warning(f"Could not read PM pending order intents: {e}")
             report["store_error"] = f"{e.__class__.__name__}: {e}"
-            self.state = State.PAUSED
+            self.set_state(State.PAUSED)
             self._pm_block_orders("intent_store_unavailable")
             self.rpc.send_msg(
                 {
@@ -2122,7 +2136,7 @@ class FreqtradeBot(LoggingMixin):
         """Apply the configured startup_consistency_mode to a consistency report."""
         if result["status"] == "error":
             # The consistency check itself failed - never start trading blind.
-            self.state = State.PAUSED
+            self.set_state(State.PAUSED)
             self._pm_block_orders("startup_consistency_error")
             self.rpc.send_msg(
                 {
@@ -2231,7 +2245,7 @@ class FreqtradeBot(LoggingMixin):
                     "proceeding without blocking."
                 )
             else:
-                self.state = State.PAUSED
+                self.set_state(State.PAUSED)
                 self._pm_block_orders("startup_consistency_mismatch")
                 self.rpc.send_msg(
                     {
@@ -2247,7 +2261,7 @@ class FreqtradeBot(LoggingMixin):
 
         if mode in {"pause", "cancel"} and unknown_positions:
             # Unmatched exchange positions cannot be auto-resolved safely - pause.
-            self.state = State.PAUSED
+            self.set_state(State.PAUSED)
             self._pm_block_orders("startup_consistency_mismatch")
             self.rpc.send_msg(
                 {
@@ -2260,7 +2274,7 @@ class FreqtradeBot(LoggingMixin):
                 }
             )
         elif mode == "pause" and (unknown_orders or unknown_conditional_orders):
-            self.state = State.PAUSED
+            self.set_state(State.PAUSED)
             self._pm_block_orders("startup_consistency_mismatch")
             self.rpc.send_msg(
                 {
@@ -2276,7 +2290,7 @@ class FreqtradeBot(LoggingMixin):
         if mode == "pause" and (local_flat_trades or local_missing_orders):
             # Reverse direction: the local database claims state the exchange does
             # not confirm. Never auto-mutate - pause and require manual review.
-            self.state = State.PAUSED
+            self.set_state(State.PAUSED)
             self._pm_block_orders("startup_consistency_mismatch")
             self.rpc.send_msg(
                 {
@@ -2301,6 +2315,19 @@ class FreqtradeBot(LoggingMixin):
                 logger.info("Binance PM listenKey deleted.")
         except Exception as e:
             logger.warning(f"Failed to delete Binance PM listenKey: {e}")
+
+    def set_state(self, state: State) -> None:
+        """
+        Change the bot state and persist it SYNCHRONOUSLY before anything else
+        (notifications, worker loops) can observe the transition.
+
+        Persisting at the assignment site means a crash in the window between
+        a pause/stop decision and the next worker iteration can never lose
+        that decision.  Dry-run and disabled persistence are no-ops.
+        """
+        self.state = state
+        if hasattr(self, "config"):
+            persist_state(self.config, state)
 
     def cleanup(self) -> None:
         """

@@ -5,6 +5,7 @@ This module contains class to define a RPC communications
 import logging
 from abc import abstractmethod
 from collections.abc import Generator, Sequence
+from contextvars import ContextVar
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -64,6 +65,16 @@ from freqtrade.wallets import PositionWallet, Wallet
 
 
 logger = logging.getLogger(__name__)
+
+# Operation id for the audit trail.  Telegram handlers set it before
+# dispatching a trading command; contextvars propagate into the executor
+# thread, so the rpc layer can correlate the execution outcome with the
+# originating Telegram interaction.
+AUDIT_OP_ID: ContextVar[str | None] = ContextVar("freqtrade_rpc_audit_op_id", default=None)
+
+
+def set_audit_op_id(op_id: str | None) -> None:
+    AUDIT_OP_ID.set(op_id)
 
 
 class RPCException(Exception):
@@ -132,6 +143,15 @@ class RPC:
         self._config: Config = freqtrade.config
         if self._config.get("fiat_display_currency"):
             self._fiat_converter = CryptoToFiatConverter(self._config)
+
+    def _audit(self, action: str, result: str, **detail: Any) -> None:
+        """Audit-log a trading command outcome with the originating op id."""
+        op = AUDIT_OP_ID.get()
+        parts = " ".join(f"{key}={value}" for key, value in detail.items())
+        logger.info(
+            f"RPC audit: op={op} action={action} result={result}"
+            + (f" {parts}" if parts else "")
+        )
 
     @staticmethod
     def _rpc_show_config(
@@ -952,22 +972,27 @@ class RPC:
     def _rpc_start(self) -> dict[str, str]:
         """Handler for start"""
         if self._freqtrade.state == State.RUNNING:
+            self._audit("start", "ignored", reason="already_running")
             return {"status": "already running"}
 
-        self._freqtrade.state = State.RUNNING
+        self._freqtrade.set_state(State.RUNNING)
+        self._audit("start", "ok")
         return {"status": "starting trader ..."}
 
     def _rpc_stop(self) -> dict[str, str]:
         """Handler for stop"""
         if self._freqtrade.state != State.STOPPED:
-            self._freqtrade.state = State.STOPPED
+            self._freqtrade.set_state(State.STOPPED)
+            self._audit("stop", "ok")
             return {"status": "stopping trader ..."}
 
+        self._audit("stop", "ignored", reason="already_stopped")
         return {"status": "already stopped"}
 
     def _rpc_reload_config(self) -> dict[str, str]:
         """Handler for reload_config."""
-        self._freqtrade.state = State.RELOAD_CONFIG
+        self._freqtrade.set_state(State.RELOAD_CONFIG)
+        self._audit("reload_config", "ok")
         return {"status": "Reloading config ..."}
 
     def _rpc_pause(self) -> dict[str, str]:
@@ -975,10 +1000,11 @@ class RPC:
         Handler to pause trading (stop entering new trades), but handle open trades gracefully.
         """
         if self._freqtrade.state == State.RUNNING:
-            self._freqtrade.state = State.PAUSED
+            self._freqtrade.set_state(State.PAUSED)
 
         if self._freqtrade.state == State.STOPPED:
-            self._freqtrade.state = State.PAUSED
+            self._freqtrade.set_state(State.PAUSED)
+            self._audit("pause", "ok", state="from_stopped")
             return {
                 "status": (
                     "starting bot with trader in paused state, no entries will occur. "
@@ -986,6 +1012,7 @@ class RPC:
                 )
             }
 
+        self._audit("pause", "ok")
         return {
             "status": "paused, no more entries will occur from now. Run /start to enable entries."
         }
@@ -1085,10 +1112,13 @@ class RPC:
         with self._freqtrade._exit_lock:
             if trade_id == "all":
                 # Execute exit for all open orders
+                exited: list[str] = []
                 for trade in Trade.get_open_trades():
-                    self.__exec_force_exit(trade, ordertype)
+                    if self.__exec_force_exit(trade, ordertype):
+                        exited.append(str(trade.id))
                 Trade.commit()
                 self._freqtrade.wallets.update()
+                self._audit("force_exit", "ok", trade_ids=",".join(exited) or "none")
                 return {"result": "Created exit orders for all open trades."}
 
             # Query for trade
@@ -1104,13 +1134,16 @@ class RPC:
             )
             if not trade:
                 logger.warning("force_exit: Invalid argument received")
+                self._audit("force_exit", "rejected", reason="invalid_argument", trade_id=trade_id)
                 raise RPCException("invalid argument")
 
             result = self.__exec_force_exit(trade, ordertype, amount, price)
             Trade.commit()
             self._freqtrade.wallets.update()
             if not result:
+                self._audit("force_exit", "failed", trade_id=trade_id, reason="exit_not_confirmed")
                 raise RPCException("Failed to exit trade.")
+            self._audit("force_exit", "ok", trade_id=trade_id)
             return {"result": f"Created exit order for trade {trade_id}."}
 
     def _select_trades_by_settlement(
@@ -1196,6 +1229,13 @@ class RPC:
                     ),
                 }
             )
+        self._audit(
+            "pm_close",
+            "failed" if failed_ids else "ok",
+            target=target,
+            closed=",".join(closed_ids) or "none",
+            failed=",".join(failed_ids) or "none",
+        )
         return {"result": result}
 
     def _rpc_pm_status(self) -> dict[str, Any]:
@@ -1368,6 +1408,21 @@ class RPC:
             self._freqtrade._pm_unblock_orders("reconciliation_incomplete")
             self._freqtrade._pm_unblock_orders("pending_intent_unresolved")
 
+        self._audit(
+            "pm_recover",
+            (
+                "ok"
+                if not result["errors"]
+                and not unresolved
+                and not intents_report["unresolved"]
+                and not intents_report.get("orphaned", 0)
+                else "failed"
+            ),
+            checked=result["checked"],
+            reconciled=result["reconciled"],
+            errors=len(result["errors"]),
+            unresolved_intents=intents_report["unresolved"],
+        )
         return {
             "open_trades": result["open_trades"],
             "orders_checked": result["checked"],
@@ -1464,8 +1519,10 @@ class RPC:
             ):
                 Trade.commit()
                 trade = Trade.get_trades([Trade.is_open.is_(True), Trade.pair == pair]).first()
+                self._audit("force_entry", "ok", pair=pair, trade_id=trade.id if trade else None)
                 return trade
             else:
+                self._audit("force_entry", "failed", pair=pair, reason="entry_not_confirmed")
                 raise RPCException(f"Failed to enter position for {pair}.")
 
     def _rpc_cancel_open_order(self, trade_id: int):
@@ -1481,21 +1538,30 @@ class RPC:
             ).first()
             if not trade:
                 logger.warning("cancel_open_order: Invalid trade_id received.")
+                self._audit("cancel_open_order", "rejected", reason="invalid_trade_id")
                 raise RPCException("Invalid trade_id.")
             if not trade.has_open_orders:
                 logger.warning("cancel_open_order: No open order for trade_id.")
+                self._audit("cancel_open_order", "rejected", reason="no_open_order", trade_id=trade_id)
                 raise RPCException("No open order for trade_id.")
 
+            canceled_ids: list[str] = []
             for open_order in trade.open_orders:
                 try:
                     order = self._freqtrade.exchange.fetch_order(open_order.order_id, trade.pair)
                 except ExchangeError as e:
                     logger.info(f"Cannot query order for {trade} due to {e}.", exc_info=True)
+                    self._audit("cancel_open_order", "failed", trade_id=trade_id, reason="order_not_found")
                     raise RPCException("Order not found.")
                 self._freqtrade.handle_cancel_order(
                     order, open_order, trade, CANCEL_REASON["USER_CANCEL"]
                 )
+                canceled_ids.append(str(open_order.order_id))
             Trade.commit()
+            self._audit(
+                "cancel_open_order", "ok", trade_id=trade_id,
+                order_ids=",".join(canceled_ids),
+            )
 
     def _rpc_delete(self, trade_id: int) -> dict[str, str | int]:
         """

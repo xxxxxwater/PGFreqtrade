@@ -1,20 +1,19 @@
-﻿"""
+"""
 Tests for production bot-state persistence across restarts.
 
-A bot that paused itself (risk fail-closed or operator /pause) must stay
-PAUSED after a container restart / server reboot instead of silently
-re-arming as RUNNING.
+A bot that paused or stopped itself (risk fail-closed or operator command)
+must stay in that state after a container restart / server reboot instead of
+silently re-arming as RUNNING.  A corrupt state record must block
+auto-trading entirely.
 """
 
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
 from freqtrade.enums import State
 from freqtrade.state_persistence import (
-    clear_persisted_state,
+    PersistedState,
     persistence_enabled,
     persist_state,
     read_persisted_state,
@@ -32,13 +31,44 @@ def live_conf(tmp_path: Path) -> dict:
 
 def test_persist_and_read_roundtrip(tmp_path):
     conf = live_conf(tmp_path)
-    assert read_persisted_state(conf) is None
-    persist_state(conf, State.PAUSED)
-    assert read_persisted_state(conf) == State.PAUSED
-    persist_state(conf, State.RUNNING)
-    assert read_persisted_state(conf) == State.RUNNING
+    assert read_persisted_state(conf) == PersistedState()
+    for state in (State.PAUSED, State.RUNNING, State.STOPPED):
+        persist_state(conf, state)
+        assert read_persisted_state(conf) == PersistedState(state=state)
     # File lives under user_data/.freqtrade/state (the bind-mounted volume).
     assert (tmp_path / ".freqtrade" / "state").is_file()
+
+
+def test_stopped_is_persisted_not_deleted(tmp_path):
+    """An intentional /stop must survive a restart as STOPPED."""
+    conf = live_conf(tmp_path)
+    persist_state(conf, State.PAUSED)
+    persist_state(conf, State.STOPPED)
+    assert read_persisted_state(conf) == PersistedState(state=State.STOPPED)
+
+
+def test_missing_file_is_no_record_not_corrupt(tmp_path):
+    conf = live_conf(tmp_path)
+    assert read_persisted_state(conf) == PersistedState(state=None, corrupt=False)
+
+
+def test_corrupt_file_is_flagged(tmp_path, caplog):
+    conf = live_conf(tmp_path)
+    state_file_path(conf).parent.mkdir(parents=True)
+    state_file_path(conf).write_text("{not json", encoding="utf-8")
+    result = read_persisted_state(conf)
+    assert result.corrupt is True
+    assert result.state is None
+    assert "corrupt" in caplog.text
+
+
+def test_unknown_state_name_is_corrupt(tmp_path, caplog):
+    conf = live_conf(tmp_path)
+    state_file_path(conf).parent.mkdir(parents=True)
+    state_file_path(conf).write_text(json.dumps({"state": "PAUSEDX"}), encoding="utf-8")
+    result = read_persisted_state(conf)
+    assert result.corrupt is True
+    assert "unknown value" in caplog.text
 
 
 def test_dry_run_never_persists_or_reads(tmp_path):
@@ -47,7 +77,7 @@ def test_dry_run_never_persists_or_reads(tmp_path):
     assert not persistence_enabled(conf)
     persist_state(conf, State.PAUSED)
     assert not (tmp_path / ".freqtrade" / "state").exists()
-    assert read_persisted_state(conf) is None
+    assert read_persisted_state(conf) == PersistedState()
 
 
 def test_internals_flag_disables(tmp_path):
@@ -55,71 +85,54 @@ def test_internals_flag_disables(tmp_path):
     conf["internals"]["persist_state"] = False
     assert not persistence_enabled(conf)
     persist_state(conf, State.PAUSED)
-    assert read_persisted_state(conf) is None
+    assert read_persisted_state(conf) == PersistedState()
 
 
-def test_non_trading_states_never_persisted(tmp_path):
+def test_reload_config_never_persisted(tmp_path):
     conf = live_conf(tmp_path)
-    # An intentional stop must not be resurrected by an old value.
-    persist_state(conf, State.STOPPED)
     persist_state(conf, State.RELOAD_CONFIG)
-    assert read_persisted_state(conf) is None
+    assert read_persisted_state(conf) == PersistedState()
 
 
-def test_clear_removes_file(tmp_path):
-    conf = live_conf(tmp_path)
-    persist_state(conf, State.PAUSED)
-    clear_persisted_state(conf)
-    assert read_persisted_state(conf) is None
+def test_set_state_persists_synchronously(mocker, default_conf_usdt, tmp_path):
+    """The state change is durable at the assignment site - no worker iteration
+    or notification happens in between, so a crash right after a pause/stop
+    decision cannot lose it."""
+    from tests.conftest import get_patched_freqtradebot
+
+    conf = default_conf_usdt.copy()
+    conf["dry_run"] = False
+    conf["user_data_dir"] = tmp_path
+    conf["exchange"]["portfolio_margin"] = False
+    mocker.patch("freqtrade.exchange.binance.Binance.validate_config", MagicMock())
+    bot = get_patched_freqtradebot(mocker, conf)
+
+    bot.set_state(State.PAUSED)
+    # Persisted IMMEDIATELY - before any notify/worker involvement.
+    assert read_persisted_state(conf) == PersistedState(state=State.PAUSED)
+    bot.set_state(State.STOPPED)
+    assert read_persisted_state(conf) == PersistedState(state=State.STOPPED)
 
 
-def test_corrupt_file_tolerated(tmp_path, caplog):
-    conf = live_conf(tmp_path)
-    state_file_path(conf).parent.mkdir(parents=True)
-    state_file_path(conf).write_text("{not json", encoding="utf-8")
-    assert read_persisted_state(conf) is None
-    assert "Could not read persisted bot state" in caplog.text
+def test_rpc_pause_and_start_persist(mocker):
+    """rpc state changes go through set_state (synchronous persistence)."""
+    from freqtrade.rpc.rpc import RPC
 
+    mocker.patch("freqtrade.rpc.rpc.CryptoToFiatConverter")
+    bot = MagicMock()
+    bot.config = {"fiat_display_currency": None, "dry_run": False}
+    bot.state = State.RUNNING
+    rpc = RPC(bot)
+    rpc._rpc_pause()
+    bot.set_state.assert_called_with(State.PAUSED)
 
-def test_unknown_state_name_ignored(tmp_path, caplog):
-    conf = live_conf(tmp_path)
-    state_file_path(conf).parent.mkdir(parents=True)
-    state_file_path(conf).write_text(json.dumps({"state": "PAUSEDX"}), encoding="utf-8")
-    assert read_persisted_state(conf) is None
-    assert "unknown persisted bot state" in caplog.text
-
-
-def test_worker_transition_persists_and_clears(tmp_path):
-    """The worker's state-transition hook writes RUNNING/PAUSED, clears on STOPPED."""
-    from freqtrade.freqtradebot import FreqtradeBot
-    from freqtrade.worker import Worker
-
-    conf = {
-        "dry_run": False,
-        "user_data_dir": str(tmp_path),
-        "internals": {},
-        "timeframe": "5m",
-    }
-    worker = Worker.__new__(Worker)
-    worker._config = conf
-    worker._heartbeat_msg = 0
-    worker._heartbeat_interval = 0
-    worker._throttle_secs = 5
-    worker._throttle = MagicMock()
-    worker._notify = MagicMock()
-    bot = MagicMock(spec=FreqtradeBot)
     bot.state = State.PAUSED
-    bot.notify_status = MagicMock()
-    bot.startup = MagicMock()
-    bot.check_for_open_trades = MagicMock()
-    worker.freqtrade = bot
+    rpc._rpc_start()
+    bot.set_state.assert_called_with(State.RUNNING)
 
-    worker._worker(old_state=State.RUNNING)
-    assert read_persisted_state(conf) == State.PAUSED
-
-    bot.state = State.STOPPED
-    worker._worker(old_state=State.PAUSED)
-    assert read_persisted_state(conf) is None
+    bot.state = State.RUNNING
+    rpc._rpc_stop()
+    bot.set_state.assert_called_with(State.STOPPED)
 
 
 def _live_pm_conf(default_conf_usdt, tmp_path: Path) -> dict:
@@ -142,46 +155,61 @@ def _live_pm_conf(default_conf_usdt, tmp_path: Path) -> dict:
     return conf
 
 
-def test_bot_restores_persisted_paused_on_init(mocker, default_conf_usdt, tmp_path):
+def _make_bot(mocker, conf):
     from tests.conftest import get_patched_freqtradebot
 
+    mocker.patch("freqtrade.exchange.binance.Binance.validate_config", MagicMock())
+    return get_patched_freqtradebot(mocker, conf)
+
+
+def test_first_boot_uses_config(mocker, default_conf_usdt, tmp_path):
+    """No record + configured running -> RUNNING (first boot, normal path)."""
     conf = _live_pm_conf(default_conf_usdt, tmp_path)
     conf["initial_state"] = "running"
-    # Simulate a crash/reboot that happened while the bot was PAUSED.
-    persist_state(conf, State.PAUSED)
-    mocker.patch("freqtrade.exchange.binance.Binance.validate_config", MagicMock())
-    bot = get_patched_freqtradebot(mocker, conf)
-    assert bot.state == State.PAUSED
-
-
-def test_bot_starts_from_config_when_no_state_file(mocker, default_conf_usdt, tmp_path):
-    from tests.conftest import get_patched_freqtradebot
-
-    conf = _live_pm_conf(default_conf_usdt, tmp_path)
-    conf["initial_state"] = "running"
-    mocker.patch("freqtrade.exchange.binance.Binance.validate_config", MagicMock())
-    bot = get_patched_freqtradebot(mocker, conf)
+    bot = _make_bot(mocker, conf)
     assert bot.state == State.RUNNING
 
 
-def test_persisted_running_never_overrides_explicit_config(mocker, default_conf_usdt, tmp_path):
-    from tests.conftest import get_patched_freqtradebot
+def test_persisted_paused_restored(mocker, default_conf_usdt, tmp_path):
+    conf = _live_pm_conf(default_conf_usdt, tmp_path)
+    conf["initial_state"] = "running"
+    persist_state(conf, State.PAUSED)
+    bot = _make_bot(mocker, conf)
+    assert bot.state == State.PAUSED
 
+
+def test_persisted_stopped_restored(mocker, default_conf_usdt, tmp_path):
+    """An intentional /stop is restored: the bot does NOT re-arm itself."""
+    conf = _live_pm_conf(default_conf_usdt, tmp_path)
+    conf["initial_state"] = "running"
+    persist_state(conf, State.STOPPED)
+    bot = _make_bot(mocker, conf)
+    assert bot.state == State.STOPPED
+
+
+def test_corrupt_state_blocks_auto_trading(mocker, default_conf_usdt, tmp_path, caplog):
+    """A corrupt record must NOT fall back to the configured running state."""
+    conf = _live_pm_conf(default_conf_usdt, tmp_path)
+    conf["initial_state"] = "running"
+    state_file_path(conf).parent.mkdir(parents=True, exist_ok=True)
+    state_file_path(conf).write_text("{broken", encoding="utf-8")
+    bot = _make_bot(mocker, conf)
+    assert bot.state == State.PAUSED
+    assert "corrupt" in caplog.text
+
+
+def test_persisted_running_never_overrides_explicit_config(mocker, default_conf_usdt, tmp_path):
     conf = _live_pm_conf(default_conf_usdt, tmp_path)
     conf["initial_state"] = "stopped"
     persist_state(conf, State.RUNNING)
-    mocker.patch("freqtrade.exchange.binance.Binance.validate_config", MagicMock())
-    bot = get_patched_freqtradebot(mocker, conf)
+    bot = _make_bot(mocker, conf)
     assert bot.state == State.STOPPED
 
 
 def test_dry_run_bot_ignores_persisted_state(mocker, default_conf_usdt, tmp_path):
-    from tests.conftest import get_patched_freqtradebot
-
     conf = _live_pm_conf(default_conf_usdt, tmp_path)
     conf["dry_run"] = True
     conf["initial_state"] = "running"
     persist_state(conf, State.PAUSED)
-    mocker.patch("freqtrade.exchange.binance.Binance.validate_config", MagicMock())
-    bot = get_patched_freqtradebot(mocker, conf)
+    bot = _make_bot(mocker, conf)
     assert bot.state == State.RUNNING

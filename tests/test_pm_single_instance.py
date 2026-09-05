@@ -195,3 +195,87 @@ def test_wrapper_forwards_exit_code(tmp_path):
     failing_child = [PY, "-c", "import sys,time; time.sleep(0.4); sys.exit(7)"]
     wrapper = _spawn_wrapper(lock_file, ["--exec", *failing_child])
     assert _wait_exit(wrapper) == 7
+
+
+# --- account-level lock (host-wide, keyed by exchange API key) ---
+
+
+def _spawn_wrapper_with_env(
+    lock_file: Path, account_dir: Path, env_file: Path, extra_args: list[str]
+) -> subprocess.Popen:
+    return subprocess.Popen(
+        [
+            PY,
+            SCRIPT,
+            "--lock-file",
+            str(lock_file),
+            "--account-lock-dir",
+            str(account_dir),
+            "--env-from-file",
+            str(env_file),
+            *extra_args,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def test_account_lock_path_derives_from_api_key(tmp_path):
+    """Same API key -> same host-wide lock path, regardless of directory."""
+    from scripts.pm_single_instance import account_lock_path
+
+    env1 = {"FREQTRADE__EXCHANGE__KEY": "key-one"}
+    p1 = account_lock_path(env1, tmp_path)
+    assert p1 is not None
+    assert p1.name.startswith("account-")
+    assert account_lock_path({"FREQTRADE__EXCHANGE__KEY": "key-one"}, tmp_path) == p1
+    assert account_lock_path({"FREQTRADE__EXCHANGE__KEY": "key-two"}, tmp_path) != p1
+    assert account_lock_path({}, tmp_path) is None
+    assert account_lock_path({"BINANCE_PM_API_KEY": "key-one"}, tmp_path) == p1
+
+
+def test_same_key_second_wrapper_rejected_even_with_different_lock_file(tmp_path):
+    """A second deployment directory with the SAME API key must be refused:
+    the account-level lock is independent of the per-directory lock file."""
+    env_file = tmp_path / "pm_env.txt"
+    env_file.write_text("FREQTRADE__EXCHANGE__KEY=shared-account-key\n")
+    lock1 = tmp_path / "dir1" / ".pm_instance.lock"
+    lock2 = tmp_path / "dir2" / ".pm_instance.lock"
+    lock1.parent.mkdir()
+    lock2.parent.mkdir()
+    account_dir = tmp_path / "account_locks"
+
+    first = _spawn_wrapper_with_env(lock1, account_dir, env_file, ["--exec", *SLEEP_CHILD])
+    try:
+        _wait_ready(lock1, first)
+        second = _spawn_wrapper_with_env(lock2, account_dir, env_file, [])
+        assert _wait_exit(second) == LOCK_BUSY_EXIT_CODE
+    finally:
+        first.kill()
+        first.wait()
+
+
+def test_different_key_wrapper_is_allowed(tmp_path):
+    """Two different accounts may run concurrently on the same host."""
+    env1 = tmp_path / "env1.txt"
+    env1.write_text("FREQTRADE__EXCHANGE__KEY=account-a\n")
+    env2 = tmp_path / "env2.txt"
+    env2.write_text("FREQTRADE__EXCHANGE__KEY=account-b\n")
+    lock1 = tmp_path / "dir1" / ".pm_instance.lock"
+    lock2 = tmp_path / "dir2" / ".pm_instance.lock"
+    lock1.parent.mkdir()
+    lock2.parent.mkdir()
+    account_dir = tmp_path / "account_locks"
+
+    first = _spawn_wrapper_with_env(lock1, account_dir, env1, ["--exec", *SLEEP_CHILD])
+    try:
+        _wait_ready(lock1, first)
+        second = _spawn_wrapper_with_env(lock2, account_dir, env2, ["--exec", *SLEEP_CHILD])
+        _wait_ready(lock2, second)
+        assert second.poll() is None  # holds its own account lock happily
+    finally:
+        second.terminate()
+        _wait_exit(second)
+        first.kill()
+        first.wait()

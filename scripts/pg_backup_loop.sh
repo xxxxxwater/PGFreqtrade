@@ -16,7 +16,10 @@
 set -u
 
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
-KEEP="${KEEP:-10}"
+# Keep 48 hourly backups (~2 days).  The database is a few MB per dump, so
+# this is cheap; combined with the host-level Alibaba hbrclient volume backup
+# it gives a practical recovery window.  Set KEEP explicitly via compose.
+KEEP="${KEEP:-48}"
 SLEEP="${BACKUP_INTERVAL_SECS:-3600}"
 RESTORE_SMOKE_EVERY_SECS="${RESTORE_SMOKE_EVERY_SECS:-86400}"
 LAST_SMOKE_FILE="${BACKUP_DIR}/.last_restore_smoke"
@@ -134,3 +137,4 @@ while true; do
     restore_smoke
     sleep "$SLEEP"
 done
+

@@ -129,25 +129,25 @@ def persist_state(config: dict, state: State) -> bool:
 
 
 def invalidate_state_file(config: dict) -> bool:
-    """Best-effort fail-safe after a failed persist.
+    """Fail-safe after a failed persist: replace the state record with a
+    CORRUPT tombstone so a restart can never resurrect the previous (stale)
+    state: ``read_persisted_state`` reports corrupt and the bot boots PAUSED
+    (auto-trading blocked).
 
-    Overwrite the state record with a CORRUPT marker so a restart can never
-    resurrect the previous (stale) state: ``read_persisted_state`` reports
-    corrupt and the bot boots PAUSED (auto-trading blocked).  Returns False
-    when invalidation itself failed - in that case nothing more can be done
-    locally and only the CRITICAL log + operator alert remain.
+    The tombstone write is fsynced and a REAL sync error makes this return
+    False - "the restart will be PAUSED" must never be claimed when only the
+    write syscall completed.  On False the caller keeps the alert + retry
+    semantics; nothing more can be done locally.
     """
     if not persistence_enabled(config):
         return True
     path = state_file_path(config)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("corrupt - previous persist failed\n", encoding="utf-8")
-        try:
-            with open(path, "rb") as handle:
-                os.fsync(handle.fileno())
-        except OSError:
-            pass  # tombstone fsync is best-effort; content already replaced
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("corrupt - previous persist failed\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         return True
     except Exception as exception:
         logger.critical(f"Could not invalidate stale bot state at {path}: {exception}")

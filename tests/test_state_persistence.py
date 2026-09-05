@@ -124,7 +124,20 @@ def test_invalidate_makes_read_corrupt(tmp_path):
 def test_invalidate_failure_is_reported(tmp_path, mocker, caplog):
     from freqtrade.state_persistence import invalidate_state_file
 
-    mocker.patch("freqtrade.state_persistence.Path.write_text", side_effect=OSError("disk full"))
+    mocker.patch("freqtrade.state_persistence.open", side_effect=OSError("disk full"))
+    conf = live_conf(tmp_path)
+    assert invalidate_state_file(conf) is False
+    assert "Could not invalidate stale bot state" in caplog.text
+
+
+def test_invalidate_fsync_io_error_returns_false(tmp_path, mocker, caplog):
+    """The tombstone's fsync is NOT best-effort: a real sync error must make
+    invalidation report failure instead of claiming the restart will be safe."""
+    import errno as _errno
+
+    from freqtrade.state_persistence import invalidate_state_file
+
+    mocker.patch("os.fsync", side_effect=OSError(_errno.EIO, "input/output error"))
     conf = live_conf(tmp_path)
     assert invalidate_state_file(conf) is False
     assert "Could not invalidate stale bot state" in caplog.text

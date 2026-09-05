@@ -2658,24 +2658,52 @@ class Exchange:
 
             if (
                 candles
-                and (
-                    (len(candles) > 1 and candles[-1][0] >= prev_candle_ts)
-                    # Edgecase on reconnect, where 1 candle is available but it's the current one
-                    or (len(candles) == 1 and candles[-1][0] < candle_ts)
-                )
+                and self._ws_candles_cover_refresh(pair, timeframe, candle_type, candles, candle_ts)
                 and last_refresh_time >= half_candle
             ):
                 # Usable result, candle contains the previous candle.
                 # Also, we check if the last refresh time is no more than half the candle ago.
                 logger.debug(f"reuse watch result for {pair}, {timeframe}, {last_refresh_time}")
 
-                return self._exchange_ws.get_ohlcv(pair, timeframe, candle_type, candle_ts)
+                return self._async_ws_ohlcv_or_rest(pair, timeframe, candle_type, candle_ts)
             logger.info(
                 f"Couldn't reuse watch for {pair}, {timeframe}, falling back to REST api. "
                 f"{candle_ts < last_refresh_time}, {candle_ts}, {last_refresh_time}, "
                 f"{format_ms_time(candle_ts)}, {format_ms_time(last_refresh_time)} "
             )
         return None
+
+    def _ws_candles_cover_refresh(
+        self, pair: str, timeframe: str, candle_type: CandleType, candles: list, candle_ts: int
+    ) -> bool:
+        """Require the latest closed candle and an unbroken bridge from the REST cache."""
+        interval = timeframe_to_msecs(timeframe)
+        closed = [c[0] for c in candles if c[0] < candle_ts]
+        if not closed or closed[-1] != candle_ts - interval:
+            return False
+        cached_ts = self._pairs_last_refresh_time.get((pair, timeframe, candle_type), 0)
+        required = [ts for ts in closed if ts >= cached_ts]
+        return bool(required) and required[0] <= cached_ts + interval and all(
+            b - a == interval for a, b in zip(required, required[1:])
+        )
+
+    async def _async_ws_ohlcv_or_rest(
+        self, pair: str, timeframe: str, candle_type: CandleType, candle_ts: int
+    ) -> OHLCVResponse:
+        # A reconnect/expiry may clear the buffer AFTER job selection. Revalidate
+        # at consumption and fetch REST in the same refresh rather than skipping
+        # the pair or falsely advancing its last-refresh timestamp.
+        try:
+            result = await self._exchange_ws.get_ohlcv(pair, timeframe, candle_type, candle_ts)
+            last_refresh = self._exchange_ws.klines_last_refresh.get((pair, timeframe, candle_type), 0)
+            if (
+                self._ws_candles_cover_refresh(pair, timeframe, candle_type, result[3], candle_ts)
+                and last_refresh >= candle_ts - timeframe_to_msecs(timeframe) // 2
+            ):
+                return result
+        except (TemporaryError, KeyError, RuntimeError):
+            logger.warning("WS snapshot invalidated for %s, %s; fetching REST.", pair, timeframe)
+        return await self._async_get_candle_history(pair, timeframe, candle_type)
 
     def _can_use_websocket(
         self, exchange_ws: ExchangeWS | None, pair: str, timeframe: str, candle_type: CandleType
@@ -2697,11 +2725,6 @@ class Exchange:
         cache: bool,
     ) -> Coroutine[Any, Any, OHLCVResponse]:
         not_all_data = cache and self.required_candle_call_count > 1
-        if cache:
-            if self._can_use_websocket(self._exchange_ws, pair, timeframe, candle_type):
-                # Subscribe to websocket
-                self._exchange_ws.schedule_ohlcv(pair, timeframe, candle_type)
-
         if cache and (pair, timeframe, candle_type) in self._klines:
             candle_limit = self.ohlcv_candle_limit(timeframe, candle_type)
             min_ts = dt_ts(date_minus_candles(timeframe, candle_limit - 5))
@@ -2748,6 +2771,14 @@ class Exchange:
         """
         input_coroutines: list[Coroutine[Any, Any, OHLCVResponse]] = []
         cached_pairs = []
+        if cache and self._exchange_ws:
+            # Touch all active pairs, including cache hits, before any expiry.
+            # Registering them one at a time evicts the rest of a slow batch and
+            # lets late UNSUBSCRIBE ACKs cancel their replacement watchers.
+            self._exchange_ws.schedule_ohlcvs([
+                p for p in set(pair_list)
+                if p[2] in (CandleType.SPOT, CandleType.FUTURES) and p[1] in self.timeframes
+            ])
         for pair, timeframe, candle_type in set(pair_list):
             if candle_type == CandleType.FUNDING_RATE and timeframe != (
                 ff_tf := self.get_option("funding_fee_timeframe")

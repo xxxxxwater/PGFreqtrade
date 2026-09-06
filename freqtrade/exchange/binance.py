@@ -41,6 +41,7 @@ from freqtrade.exchange.exchange_utils import ROUND_DOWN, ROUND_UP
 from freqtrade.exchange.exchange_utils_timeframe import timeframe_to_msecs
 from freqtrade.misc import deep_merge_dicts, json_load
 from freqtrade.exchange.pm_governor import PapiGovernor, endpoint_weight
+from freqtrade.exchange.pm_identity import canonical_pm_pair
 from freqtrade.exchange.pm_locks import pm_pipeline_lock
 from freqtrade.util import FtTTLCache
 from freqtrade.util.datetime_helpers import dt_from_ts, dt_now, dt_ts
@@ -121,6 +122,10 @@ class Binance(Exchange):
         "emergency_close_retries",
         "data_failure_exit",
         "snapshot_cache_ttl_s",
+        "user_stream_auto_recovery_cooldown_seconds",
+        "account_position_quantity_tolerance",
+        "user_stream_journal_retention_days",
+        "account_position_inflight_max_seconds",
     }
     _pm_risk_positive_number_keys = {
         "min_uni_mmr",
@@ -548,6 +553,22 @@ class Binance(Exchange):
     def _pm_namespace_for_pair(self, pair: str) -> str:
         return "um"
 
+    def pm_canonical_pair(self, instrument: str, *, namespace: str = "um") -> str:
+        """One settled-contract identity for PM REST, WS and durable ownership."""
+        return canonical_pm_pair(self.markets, instrument, namespace=namespace)
+
+    def _pm_response_pair(
+        self, symbol_id: str | None, pair: str | None = None, *, namespace: str = "um"
+    ) -> str:
+        """Validate response identity against request identity, not just its order ID."""
+        canonical = self.pm_canonical_pair(pair or symbol_id or "", namespace=namespace)
+        if symbol_id and self.pm_canonical_pair(symbol_id, namespace=namespace) != canonical:
+            raise OperationalException(
+                f"Binance PM {namespace.upper()} response instrument does not match {canonical}; "
+                "refusing to associate the order/position with another instrument."
+            )
+        return canonical
+
     def _pm_risk_config(self) -> dict[str, Any]:
         return self._config.get("exchange", {}).get("portfolio_margin_risk", {})
 
@@ -555,7 +576,7 @@ class Binance(Exchange):
         return bool(self._pm_risk_config().get("user_stream_enabled", True))
 
     def _pm_symbol_for_pair(self, pair: str) -> str:
-        return self.markets[pair]["id"]
+        return self.markets[self.pm_canonical_pair(pair)]["id"]
 
     def get_pm_tradable_pairs(self) -> set[str]:
         """Return UM markets explicitly enabled for this PM account.
@@ -596,11 +617,15 @@ class Binance(Exchange):
             ):
                 enabled_symbols.add(symbol)
 
-        pairs = {
-            pair
-            for pair, market in self.markets.items()
-            if isinstance(market, dict) and market.get("id") in enabled_symbols
-        }
+        pairs = set()
+        for symbol_id in enabled_symbols:
+            try:
+                pairs.add(self.pm_canonical_pair(symbol_id))
+            except OperationalException:
+                # A public/spot alias is not evidence this contract is loaded.
+                # Excluding it from the whitelist is safe; account positions and
+                # orders use the strict resolver and cannot be silently dropped.
+                logger.debug("PM whitelist excludes unmapped UM instrument %s", symbol_id)
         if not pairs:
             raise OperationalException(
                 "Binance PM um/symbolConfig returned no crossed UM symbols mapped to loaded "
@@ -636,7 +661,7 @@ class Binance(Exchange):
 
     def _parse_pm_order(self, order: dict[str, Any], pair: str | None = None) -> CcxtOrder:
         symbol_id = order.get("symbol")
-        symbol = pair or self._api.safe_symbol(symbol_id, None, None, "contract")
+        symbol = self._pm_response_pair(symbol_id, pair)
         amount = self._float_or_none(order.get("origQty"))
         filled = self._float_or_zero(order.get("executedQty"))
         price = self._float_or_none(order.get("price"))
@@ -670,7 +695,7 @@ class Binance(Exchange):
     def _parse_pm_trade(self, trade: dict[str, Any], pair: str | None = None) -> dict[str, Any]:
         """Convert a PAPI /um/userTrades entry into the ccxt trade shape freqtrade expects."""
         symbol_id = trade.get("symbol")
-        symbol = pair or self._api.safe_symbol(symbol_id, None, None, "contract")
+        symbol = self._pm_response_pair(symbol_id, pair)
         price = self._float_or_none(trade.get("price"))
         amount = self._float_or_zero(trade.get("qty"))
         cost = self._float_or_none(trade.get("quoteQty"))
@@ -724,7 +749,7 @@ class Binance(Exchange):
     ) -> CcxtOrder:
         """Convert a PAPI UM algo (stoploss) response into a ccxt order shape."""
         symbol_id = order.get("symbol")
-        symbol = pair or self._api.safe_symbol(symbol_id, None, None, "contract")
+        symbol = self._pm_response_pair(symbol_id, pair)
         amount = self._float_or_none(order.get("quantity") or order.get("origQty"))
         price = self._float_or_none(order.get("price"))
         stop_price = self._float_or_none(order.get("triggerPrice") or order.get("stopPrice"))
@@ -821,10 +846,12 @@ class Binance(Exchange):
         merged["info"] = info
         return merged
 
-    def _parse_pm_position(self, position: dict[str, Any]) -> CcxtPosition | None:
-        pair = self._api.safe_symbol(position.get("symbol"), None, None, "contract")
-        if not pair or pair not in self.markets:
-            return None
+    def _parse_pm_position(
+        self, position: dict[str, Any], *, namespace: str = "um"
+    ) -> CcxtPosition | None:
+        # Never silently drop an unknown account position: that would make
+        # recovery/risk report zero exposure when the instrument cannot be owned.
+        pair = self._pm_response_pair(position.get("symbol"), namespace=namespace)
 
         position_amount = self._float_or_zero(position.get("positionAmt"))
         if position_amount == 0:
@@ -951,7 +978,7 @@ class Binance(Exchange):
         PMOrderIntent = self._pm_intent_model()
         PMOutbox = self._pm_outbox_model()
         operation = "conditional" if str(intent.get("kind")) == "conditional" else "order"
-        pair_str = str(intent.get("pair"))
+        pair_str = self._pm_response_pair((payload or {}).get("symbol"), intent.get("pair"))
         try:
             with pm_pipeline_lock(PMOrderIntent.session):
                 # Supersede stale same-kind PREPARED intents for the same pair:
@@ -962,13 +989,14 @@ class Binance(Exchange):
                 stale = (
                     PMOrderIntent.session.query(PMOrderIntent)
                     .filter(
-                        PMOrderIntent.pair == pair_str,
                         PMOrderIntent.kind == str(intent.get("kind")),
                         PMOrderIntent.state == "PREPARED",
                     )
                     .all()
                 )
                 for old in stale:
+                    if self.pm_canonical_pair(old.pair) != pair_str:
+                        continue
                     old_outbox = PMOutbox.get_by_client_id(old.client_id)
                     if old_outbox is not None:
                         old_outbox.state = "REJECTED"
@@ -1230,7 +1258,13 @@ class Binance(Exchange):
         """
         PMOrderIntent = self._pm_intent_model()
         try:
-            return PMOrderIntent.has_unresolved_for_pair(pair)
+            canonical = self.pm_canonical_pair(pair)
+            # Legacy aliases may remain on a pre-upgrade pending row. Read them
+            # through the same resolver instead of ignoring its reservation.
+            return any(
+                self.pm_canonical_pair(row.pair) == canonical
+                for row in PMOrderIntent.get_unresolved()
+            )
         except Exception:
             return True
 
@@ -1251,7 +1285,12 @@ class Binance(Exchange):
         """
         PMOrderIntent = self._pm_intent_model()
         try:
-            return [row.to_dict() for row in PMOrderIntent.get_unresolved()]
+            result = []
+            for row in PMOrderIntent.get_unresolved():
+                entry = row.to_dict()
+                entry["pair"] = self.pm_canonical_pair(entry["pair"])
+                result.append(entry)
+            return result
         except Exception as e:
             raise OperationalException(
                 f"Could not read PM order intents from the database: {e} (fail-closed)"
@@ -1265,7 +1304,12 @@ class Binance(Exchange):
         """
         PMOrderIntent = self._pm_intent_model()
         try:
-            return [row.to_dict() for row in PMOrderIntent.get_linked()]
+            result = []
+            for row in PMOrderIntent.get_linked():
+                entry = row.to_dict()
+                entry["pair"] = self.pm_canonical_pair(entry["pair"])
+                result.append(entry)
+            return result
         except Exception as e:
             raise OperationalException(
                 f"Could not read LINKED PM order intents from the database: {e} "
@@ -1338,11 +1382,14 @@ class Binance(Exchange):
             "error": None,
         }
         if not client_id or not pair:
-            report["resolved"] = True
-            report["exists"] = False
+            # Malformed local evidence cannot establish that Binance has no
+            # order. Keep it unresolved for repair instead of tombstoning it.
+            report["uncertain"] = True
             report["error"] = "intent is malformed (missing client_id/pair)"
             return report
         try:
+            pair = self.pm_canonical_pair(pair)
+            report["pair"] = pair
             if intent.get("kind") == "conditional":
                 order = self.fetch_stoploss_order(client_id, pair)
             elif state == "ACKED" and exchange_order_id:
@@ -1413,7 +1460,7 @@ class Binance(Exchange):
                             row.last_error = "intent row missing"
                             continue
                         payload = json.loads(row.payload or "{}")
-                        pair = intent.pair
+                        pair = self._pm_response_pair(payload.get("symbol"), intent.pair)
                         if row.operation == "conditional":
                             raw = self._pm_dispatch_conditional(
                                 row.client_id, pair, payload, from_relay=True
@@ -1523,6 +1570,7 @@ class Binance(Exchange):
           intent UNKNOWN (blocks new exposure).
         """
         PMOutbox = self._pm_outbox_model()
+        pair = self._pm_response_pair(request.get("symbol"), pair)
         try:
             with pm_pipeline_lock(PMOutbox.session):
                 outbox = PMOutbox.get_by_client_id(client_id)
@@ -1596,7 +1644,17 @@ class Binance(Exchange):
                     outbox.last_error = str(e)[:250]
                     PMOutbox.session.commit()
                     raise OperationalException(e) from e
-                parsed = self._parse_pm_order(raw, pair)
+                try:
+                    parsed = self._parse_pm_order(raw, pair)
+                except OperationalException as identity_error:
+                    # POST may have succeeded. Preserve its exchange evidence
+                    # even if the response cannot safely be linked to this pair;
+                    # never leave a replaceable PREPARED row after this ACK.
+                    try:
+                        self._pm_ack(client_id, raw, str(raw.get("orderId") or ""))
+                    finally:
+                        self._pm_intent_mark_uncertain(client_id, str(identity_error))
+                    raise
                 self._log_exchange_response(f"papi_dispatch_{client_id[:8]}", raw)
                 try:
                     self._pm_ack(client_id, raw, str(parsed.get("id")))
@@ -1631,6 +1689,7 @@ class Binance(Exchange):
         (reduce-only protection must never be deferred).
         """
         PMOutbox = self._pm_outbox_model()
+        pair = self._pm_response_pair(request.get("symbol"), pair)
         try:
             with pm_pipeline_lock(PMOutbox.session):
                 outbox = PMOutbox.get_by_client_id(client_id)
@@ -1696,7 +1755,16 @@ class Binance(Exchange):
                     outbox.last_error = str(e)[:250]
                     PMOutbox.session.commit()
                     raise OperationalException(e) from e
-                parsed = self._parse_pm_conditional_order(raw, pair)
+                try:
+                    parsed = self._parse_pm_conditional_order(raw, pair)
+                except OperationalException as identity_error:
+                    try:
+                        self._pm_ack(
+                            client_id, raw, str(raw.get("algoId") or raw.get("strategyId") or "")
+                        )
+                    finally:
+                        self._pm_intent_mark_uncertain(client_id, str(identity_error))
+                    raise
                 self._log_exchange_response(f"papi_dispatch_cond_{client_id[:8]}", raw)
                 try:
                     self._pm_ack(client_id, raw, str(parsed.get("id")))
@@ -1984,6 +2052,9 @@ class Binance(Exchange):
         if not self._is_portfolio_margin() or self._config["dry_run"]:
             return
 
+        if pair is not None:
+            pair = self.pm_canonical_pair(pair)
+
         risk_config = self._pm_risk_config()
         try:
             risk = self.get_pm_risk_summary()
@@ -2072,7 +2143,7 @@ class Binance(Exchange):
                         continue
                     reserved_open_orders.append(
                         {
-                            "symbol": str(open_order.get("symbol") or ""),
+                            "symbol": self.pm_canonical_pair(open_order.get("symbol") or ""),
                             "notional": remaining * price,
                         }
                     )
@@ -2089,7 +2160,7 @@ class Binance(Exchange):
                     )
                     if intent_notional > 0:
                         reserved_intents.append(
-                            {"pair": str(intent.pair), "notional": intent_notional}
+                            {"pair": self.pm_canonical_pair(intent.pair), "notional": intent_notional}
                         )
             except Exception as e:
                 raise OperationalException(
@@ -2625,18 +2696,18 @@ class Binance(Exchange):
         # True single-flight short-TTL snapshot for the account-wide position
         # view (per-pair queries bypass the cache).
 
+        if pair is not None:
+            pair = self.pm_canonical_pair(pair)
+
         def _fetch_positions() -> list[CcxtPosition]:
-            pairs = [pair] if pair else list(self.markets.keys())
-            namespaces = {
-                self._pm_namespace_for_pair(ft_pair)
-                for ft_pair in pairs
-                if ft_pair in self.markets and self.markets[ft_pair].get("swap")
-            }
+            # This adapter currently trades UM only; do not infer an API family
+            # from whichever spot/inverse markets happen to be loaded first.
+            namespaces = {"um"}
             positions: list[CcxtPosition] = []
             for namespace in sorted(namespaces):
                 raw_positions = self._papi_request(f"{namespace}/positionRisk", "GET", params)
                 for raw_position in raw_positions:
-                    parsed = self._parse_pm_position(raw_position)
+                    parsed = self._parse_pm_position(raw_position, namespace=namespace)
                     if parsed and (pair is None or parsed["symbol"] == pair):
                         positions.append(parsed)
             self._log_exchange_response("papi_positions", positions, add_info=params)

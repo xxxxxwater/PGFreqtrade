@@ -161,7 +161,9 @@ def test_pm_foreign_order_event_is_read_only_and_deduplicated(mocker, caplog):
     bot.rpc = mocker.Mock()
     bot._pm_order_recovery = mocker.Mock()
     bot.exchange = mocker.Mock()
-    bot.exchange.markets = {"BTC/USDT:USDT": {"id": "BTCUSDT"}}
+    bot.exchange.markets = {
+        "BTC/USDT:USDT": {"id": "BTCUSDT", "settle": "USDT", "inverse": False}
+    }
     mocker.patch.object(Trade, "get_open_trades", return_value=[])
     bot._pm_init_user_stream_state()
 
@@ -193,7 +195,9 @@ def test_pm_unmatched_own_order_event_blocks_and_alerts(mocker):
     bot.rpc = mocker.Mock()
     bot._pm_order_recovery = mocker.Mock()
     bot.exchange = mocker.Mock()
-    bot.exchange.markets = {"BTC/USDT:USDT": {"id": "BTCUSDT"}}
+    bot.exchange.markets = {
+        "BTC/USDT:USDT": {"id": "BTCUSDT", "settle": "USDT", "inverse": False}
+    }
     mocker.patch.object(Trade, "get_open_trades", return_value=[])
     bot._pm_init_user_stream_state()
 

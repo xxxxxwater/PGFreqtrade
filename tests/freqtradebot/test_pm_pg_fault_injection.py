@@ -27,7 +27,7 @@ import pytest
 from freqtrade.exchange.binance import Binance
 from freqtrade.exchange.pm_locks import pm_pipeline_lock
 from freqtrade.persistence import PMOrderIntent, PMOutbox, init_db
-from tests.conftest import get_patched_exchange
+from tests.conftest import get_markets, get_patched_exchange
 
 pytest.importorskip("psycopg2")
 
@@ -74,7 +74,11 @@ def pm_pg(mocker, default_conf_usdt):
     conf["exchange"]["pair_whitelist"] = ["ETH/USDT:USDT"]
     conf["exchange"]["portfolio_margin"] = True
     conf["exchange"]["portfolio_margin_risk"] = {"min_uni_mmr": 1.5}
-    exchange = get_patched_exchange(mocker, conf, api_mock=MagicMock(), exchange="binance")
+    markets = get_markets()
+    markets["ETH/USDT:USDT"]["id"] = "ETHUSDT"
+    exchange = get_patched_exchange(
+        mocker, conf, api_mock=MagicMock(), exchange="binance", mock_markets=markets
+    )
     exchange._order_contracts_to_amount = MagicMock(side_effect=lambda o: o)
     yield exchange
 

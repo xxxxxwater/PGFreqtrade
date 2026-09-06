@@ -3,12 +3,13 @@ Freqtrade is the main module of this bot. It contains the FreqtradeBot class.
 """
 
 import logging
+import time as _time
 import traceback
 from hashlib import sha256
 from copy import deepcopy
 from datetime import UTC, datetime, time, timedelta
 from math import isclose
-from threading import Lock
+from threading import RLock
 from time import sleep
 from typing import Any
 
@@ -55,6 +56,8 @@ from freqtrade.mixins import LoggingMixin
 from freqtrade.persistence import Order, PairLocks, Trade, init_db
 from freqtrade.persistence.key_value_store import set_startup_time
 from freqtrade.persistence.pm_order_intent import PMOrderIntent
+from freqtrade.pm_order_ownership import PMOrderOwnershipMixin, PMOwnershipClass, pm_order_locked
+from freqtrade.persistence.pm_stream_journal import PMStreamJournal
 from freqtrade.plugins.pairlistmanager import PairListManager
 from freqtrade.plugins.protectionmanager import ProtectionManager
 from freqtrade.resolvers import ExchangeResolver, StrategyResolver
@@ -79,7 +82,7 @@ from freqtrade.wallets import Wallets
 logger = logging.getLogger(__name__)
 
 
-class FreqtradeBot(LoggingMixin):
+class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
     """
     Freqtrade is the main class of the bot.
     This is from here the bot start its logic.
@@ -183,7 +186,7 @@ class FreqtradeBot(LoggingMixin):
             self.set_state(self.state)
 
         # Protect exit-logic from forcesell and vice versa
-        self._exit_lock = Lock()
+        self._exit_lock = RLock()
         timeframe_secs = timeframe_to_seconds(self.strategy.timeframe)
         self._exit_reason_cache = PeriodicCache(100, ttl=timeframe_secs)
         LoggingMixin.__init__(self, logger, timeframe_secs)
@@ -345,7 +348,7 @@ class FreqtradeBot(LoggingMixin):
         if not hasattr(self, "_pm_user_stream_restart_limit_warning_sent"):
             self._pm_user_stream_restart_limit_warning_sent = False
         if not hasattr(self, "_pm_unmatched_stream_order_ids"):
-            self._pm_unmatched_stream_order_ids: set[str] = set()
+            self._pm_unmatched_stream_order_ids: set[tuple[str, str]] = set()
         if not hasattr(self, "_pm_foreign_stream_order_events"):
             # Foreign exchange orders remain outside the strategy database.  Keep a
             # bounded id/status cache solely to avoid flooding logs when Binance
@@ -354,9 +357,32 @@ class FreqtradeBot(LoggingMixin):
         if not hasattr(self, "_pm_actual_order_map"):
             # Real order id (after conditional trigger) -> local stoploss order id.
             # Populated whenever fetch_stoploss_order resolves an actual order.
-            self._pm_actual_order_map: dict[str, str] = {}
+            self._pm_actual_order_map: dict[tuple[str, str], str] = {}
         if not hasattr(self, "_pm_orders_blocked_reasons"):
             self._pm_orders_blocked_reasons: list[str] = []
+        if not hasattr(self, "_pm_owned_resolve_cache"):
+            # Per-batch cache of proven (pair, order_id, client_id) -> (trade, order).
+            # Reset at the start of every user-stream batch; only successful
+            # ownership resolutions are cached (misses keep retrying).
+            self._pm_owned_resolve_cache: dict[tuple[str, str, str], tuple[Any, Any]] = {}
+        if not hasattr(self, "_pm_clean_terminal_ids"):
+            # Bounded set of (pair, order_id) whose ownership was verified clean,
+            # so a terminal-event redelivery storm skips journal lookups.
+            self._pm_clean_terminal_ids: set[tuple[str, str]] = set()
+        if not hasattr(self, "_pm_last_auto_recovery_at"):
+            self._pm_last_auto_recovery_at: float | None = None
+        if not hasattr(self, "_pm_unresolved_instrument_ids"):
+            # raw symbol -> {"namespace": ..., "event": {...}} for symbols that
+            # failed canonicalization. Retried on recovery with FULL event
+            # re-processing before the instrument_identity_unknown gate may
+            # auto-release.
+            self._pm_unresolved_instrument_ids: dict[str, dict[str, Any]] = {}
+        if not hasattr(self, "_pm_position_mismatch_alerted"):
+            self._pm_position_mismatch_alerted = False
+        if not hasattr(self, "_pm_stop_protection_missing_alerted"):
+            self._pm_stop_protection_missing_alerted = False
+        if not hasattr(self, "_pm_last_journal_purge_at"):
+            self._pm_last_journal_purge_at: float | None = None
         if not hasattr(self, "_pm_unresolved_alert_sent"):
             self._pm_unresolved_alert_sent = False
         if not hasattr(self, "_pm_last_success_reconcile_time"):
@@ -404,6 +430,9 @@ class FreqtradeBot(LoggingMixin):
         if self._pm_db_gate_active():
             self._pm_init_user_stream_state()
             try:
+                if PMStreamJournal.get_unresolved():
+                    if "unmatched_stream_order" not in reasons:
+                        reasons.append("unmatched_stream_order")
                 if PMOrderIntent.has_unresolved():
                     if "unresolved_intent" not in reasons:
                         reasons.append("unresolved_intent")
@@ -450,6 +479,86 @@ class FreqtradeBot(LoggingMixin):
         except Exception:
             return -1
 
+    def _pm_auto_recovery_due(self) -> bool:
+        """Rate-limit auto-triggered FULL recovery sweeps.
+
+        A burst of distinct unknown orders would otherwise multiply into N
+        full account sweeps (REST weight amplification). Targeted incident
+        recovery is never throttled; only the full sweep is.
+        """
+        self._pm_init_user_stream_state()
+        cooldown = float(
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("user_stream_auto_recovery_cooldown_seconds", 60)
+        )
+        last = getattr(self, "_pm_last_auto_recovery_at", None)
+        now = _time.monotonic()
+        if last is not None and now - last < cooldown:
+            return False
+        self._pm_last_auto_recovery_at = now
+        return True
+
+    def _pm_retry_unresolved_instruments(self) -> int:
+        """Retry unresolved-instrument events with FULL evidence re-processing.
+
+        Canonicalizing a raw symbol proves nothing about the ORDER: the stored
+        original event (namespace, orderId, clientOrderId, status, fill
+        evidence) is re-dispatched through the authoritative matcher. A symbol
+        only counts as resolved when the re-dispatched event is owned or
+        explained (no new unresolved journal incident), and the gate is only
+        released when every stored symbol resolved AND the account position
+        quantity invariant is clean. Returns the number of still-unresolved
+        symbols.
+        """
+        self._pm_init_user_stream_state()
+        pending = dict(getattr(self, "_pm_unresolved_instrument_ids", {}))
+        for raw in sorted(pending):
+            meta = pending[raw] or {}
+            try:
+                pair = self._pm_canonical_pair(raw, namespace=str(meta.get("namespace") or "um"))
+            except OperationalException:
+                continue  # still unresolvable: gate stays
+            # Re-run the ORIGINAL event through the authoritative ownership /
+            # fill high-water / incident path. An unexplained order creates a
+            # durable journal incident (which itself blocks new exposure).
+            try:
+                self._pm_handle_order_trade_update(dict(meta.get("event") or {}), {})
+            except Exception:
+                logger.exception("PM re-dispatch of unresolved instrument event failed")
+                continue
+            order_data = (meta.get("event") or {}).get("o") or {}
+            event_key = str(order_data.get("i") or order_data.get("c") or "")
+            unresolved_incident = False
+            if self._pm_db_gate_active() and event_key:
+                try:
+                    incident = PMStreamJournal.get(pair, event_key)
+                    unresolved_incident = incident is not None and incident.unresolved
+                except Exception:
+                    unresolved_incident = True
+            if unresolved_incident:
+                # Ownership / fill evidence still unexplained: keep the identity
+                # gate (the unmatched_stream_order gate holds risk increase too).
+                continue
+            self._pm_unresolved_instrument_ids.pop(raw, None)
+        still = dict(getattr(self, "_pm_unresolved_instrument_ids", {}))
+        if not still:
+            # Full pipeline before release: the account-level quantity
+            # invariant must also be clean.
+            try:
+                mismatches = self._pm_account_position_reconcile()
+            except Exception:
+                mismatches = ["unavailable"]
+            if not mismatches:
+                self._pm_unblock_orders("instrument_identity_unknown")
+                if pending:
+                    logger.info(
+                        "PM instrument identity gate auto-released after %d event(s) "
+                        "were re-dispatched and reconciled.",
+                        len(pending),
+                    )
+        return len(still)
+
     def _pm_risk_failure_action(self) -> str:
         """Configured action when the PM risk API fails: warn (default) | pause | stop."""
         action = (
@@ -462,23 +571,14 @@ class FreqtradeBot(LoggingMixin):
     def _pm_pair_from_exchange_symbol(self, symbol_id: str | None) -> str | None:
         if not symbol_id:
             return None
+        try:
+            return self._pm_canonical_pair(symbol_id)
+        except OperationalException:
+            return None
 
-        for pair, market in self.exchange.markets.items():
-            if market.get("id") == symbol_id:
-                return pair
-
-        api = getattr(self.exchange, "_api", None)
-        if api and hasattr(api, "safe_symbol"):
-            try:
-                pair = api.safe_symbol(symbol_id, None, None, "contract")
-                if pair in self.exchange.markets:
-                    return pair
-            except Exception:
-                logger.debug(f"Could not map PM stream symbol {symbol_id} to a freqtrade pair.")
-        return None
-
+    @pm_order_locked
     def _pm_handle_order_trade_update(
-        self, event: dict[str, Any], order_index: dict[str, tuple[Any, Any]]
+        self, event: dict[str, Any], order_index: dict
     ) -> bool:
         order_data = event.get("o", {})
         order_id = str(order_data.get("i") or order_data.get("orderId") or "")
@@ -487,20 +587,77 @@ class FreqtradeBot(LoggingMixin):
         if not event_order_id:
             return False
 
-        pair = self._pm_pair_from_exchange_symbol(order_data.get("s"))
-        if not pair:
-            logger.debug(f"Skipping PM order event for unknown symbol {order_data.get('s')}.")
+        self._pm_init_user_stream_state()
+        try:
+            pair = self._pm_canonical_pair(
+                order_data.get("s"), str(event.get("fs") or "UM").lower()
+            )
+        except OperationalException as exc:
+            self._pm_init_user_stream_state()
+            raw = str(order_data.get("s") or "")
+            if raw:
+                # Persist the complete event evidence (namespace, orderId,
+                # clientOrderId, status, fill data): releasing the gate later
+                # requires re-processing THIS event, not just parsing the symbol.
+                self._pm_unresolved_instrument_ids.setdefault(
+                    raw,
+                    {
+                        "namespace": str(event.get("fs") or "UM").lower(),
+                        "event": dict(event),
+                    },
+                )
+            self._pm_block_orders("instrument_identity_unknown")
+            logger.warning("PM stream instrument unresolved: %s", exc)
             return False
 
         # A PM conditional order may announce its generated real ``orderId`` in
         # ``i`` while keeping our ``newClientStrategyId`` in ``c``.  Stoploss
         # orders are stored locally under the strategy id, so consult both ids
         # before treating the event as an unmatched order.
-        entry = order_index.get(order_id) or order_index.get(client_order_id)
+        try:
+            entry = self._pm_owned_order(pair, order_id, client_order_id, order_index)
+        except Exception as exc:
+            self._pm_note_stream_incident(pair, event_order_id, order_data, str(exc))
+            return False
         if entry is None:
+            if (pair, event_order_id) in self._pm_unmatched_stream_order_ids:
+                # Keep cumulative evidence, but do not repeat conditional REST
+                # probes/full recovery for every message in an unknown-order burst.
+                self._pm_note_stream_incident(
+                    pair, event_order_id, order_data, "RECOVERABLE_UNKNOWN: awaiting recovery"
+                )
+                return False
             return self._pm_handle_unmatched_order_trade_update(event_order_id, order_data, pair)
 
         trade, order = entry
+        # A REST-confirmed fill remains owned even after removal from open_orders.
+        # Absorb late NEW/PARTIAL/FILLED replays without another fee/notify pass.
+        if self._pm_event_is_replay(order, order_data):
+            key = (pair, event_order_id)
+            had_incident = key in self._pm_unmatched_stream_order_ids
+            clean = getattr(self, "_pm_clean_terminal_ids", None)
+            if (
+                not had_incident
+                and self._pm_db_gate_active()
+                and (clean is None or key not in clean)
+            ):
+                had_incident = PMStreamJournal.get(pair, event_order_id) is not None
+            self._pm_finish_stream_incident(pair, event_order_id, order)
+            classification = (
+                PMOwnershipClass.KNOWN_LATE
+                if order_data.get("X") in {"NEW", "PARTIALLY_FILLED"}
+                else PMOwnershipClass.KNOWN_DUPLICATE
+            )
+            logger.debug("PM stream %s: %s orderId=%s", classification, pair, event_order_id)
+            if had_incident:
+                # Closed loop: resolving this incident re-evaluates the remaining
+                # durable incidents immediately instead of waiting for the next
+                # scheduled recovery (generation-safe: never a blanket clear).
+                try:
+                    self._pm_recover_stream_incidents()
+                except Exception:
+                    logger.exception("PM post-replay incident re-evaluation failed")
+            return False
         # Stoploss orders are PM conditional orders: their lifecycle must be resolved
         # through the conditional endpoints (and the triggered real order), never
         # through a plain /um/order fetch with the strategy id.
@@ -520,7 +677,8 @@ class FreqtradeBot(LoggingMixin):
                     order.ft_is_open = False
                     order.status = "canceled"
                     return True
-                self._pm_record_actual_order(exchange_order, strategy_id)
+                self._pm_validate_rest_ownership(trade, order, exchange_order)
+                self._pm_record_actual_order(exchange_order, strategy_id, trade.pair)
                 self.update_trade_state(
                     trade,
                     strategy_id,
@@ -529,25 +687,31 @@ class FreqtradeBot(LoggingMixin):
                 )
         else:
             with self._exit_lock:
-                exchange_order = self.exchange.fetch_order(order_id, trade.pair)
+                exchange_order = self.exchange.fetch_order(order.order_id, trade.pair)
+                self._pm_validate_rest_ownership(trade, order, exchange_order)
                 self.update_trade_state(
                     trade,
-                    order_id,
+                    order.order_id,
                     exchange_order,
                     stoploss_order=False,
                 )
+        self._pm_finish_stream_incident(pair, event_order_id, order)
         logger.info(
             f"PM user stream reconciled order {event_order_id} on {trade.pair}: "
             f"{exchange_order.get('status')}."
         )
         return True
 
-    def _pm_record_actual_order(self, exchange_order: CcxtOrder | dict, strategy_id: str) -> None:
+    def _pm_record_actual_order(
+        self, exchange_order: CcxtOrder | dict, strategy_id: str, pair: str | None = None
+    ) -> None:
         """Remember the real order id behind a triggered conditional strategy."""
         self._pm_init_user_stream_state()
         actual_id = exchange_order.get("id_stop")
         if actual_id:
-            self._pm_actual_order_map[str(actual_id)] = strategy_id
+            pair = self._pm_canonical_pair(pair or exchange_order.get("symbol"))
+            self._pm_actual_order_map[(pair, str(actual_id))] = strategy_id
+            self._pm_remember_child_ownership(pair, str(actual_id), strategy_id)
 
     def _pm_handle_unmatched_order_trade_update(
         self, order_id: str, order_data: dict[str, Any], pair: str
@@ -564,16 +728,18 @@ class FreqtradeBot(LoggingMixin):
            only; it is never imported into or managed by the strategy.
         """
         self._pm_init_user_stream_state()
-        strategy_id = self._pm_actual_order_map.get(order_id)
+        strategy_id = self._pm_actual_order_map.get((pair, order_id))
         if strategy_id is not None:
             # Real order event for a locally known conditional stoploss.
             for trade in Trade.get_open_trades():
-                if any(sl.order_id == strategy_id for sl in trade.open_sl_orders):
+                if self._pm_canonical_pair(trade.pair) != pair:
+                    continue
+                if any(sl.order_id == strategy_id for sl in trade.orders):
                     with self._exit_lock:
                         exchange_order = self.exchange.fetch_stoploss_order(
                             strategy_id, trade.pair
                         )
-                        self._pm_record_actual_order(exchange_order, strategy_id)
+                        self._pm_record_actual_order(exchange_order, strategy_id, pair)
                         self.update_trade_state(
                             trade, strategy_id, exchange_order, stoploss_order=True
                         )
@@ -597,7 +763,7 @@ class FreqtradeBot(LoggingMixin):
         # we can never silently ignore an order that may belong to this bot.
         child_lookup_failed = False
         for trade in Trade.get_open_trades():
-            if trade.pair != pair:
+            if self._pm_canonical_pair(trade.pair) != pair:
                 continue
             for sl in trade.open_sl_orders:
                 try:
@@ -609,7 +775,7 @@ class FreqtradeBot(LoggingMixin):
                         f"({pair}) while classifying order event {order_id}: {e}"
                     )
                     continue
-                self._pm_record_actual_order(exchange_order, sl.order_id)
+                self._pm_record_actual_order(exchange_order, sl.order_id, pair)
                 if str(exchange_order.get("id_stop") or "") == order_id:
                     # The event IS the real child order of a local conditional stoploss.
                     with self._exit_lock:
@@ -624,54 +790,30 @@ class FreqtradeBot(LoggingMixin):
                     return True
         if child_lookup_failed:
             # Fail-closed: we could not rule out that this order belongs to this bot.
-            if order_id not in self._pm_unmatched_stream_order_ids:
-                self._pm_unmatched_stream_order_ids.add(order_id)
             self._pm_block_orders("reconciliation_incomplete")
-            self.rpc.send_msg(
-                {
-                    "type": RPCMessageType.WARNING,
-                    "status": (
-                        f"PM User Stream FAIL-CLOSED: order event {order_id} on {pair} "
-                        "could not be classified because a conditional-history lookup "
-                        "failed. New orders BLOCKED until reconciliation succeeds."
-                    ),
-                }
+            self._pm_note_stream_incident(
+                pair, order_id, order_data, "conditional-history lookup failed"
             )
             return False
 
         if client_order_id.startswith(("ft", "st")):
             # Ours, but not in the local index -> we lost track of it.
-            if len(self._pm_unmatched_stream_order_ids) > 1000:
-                self._pm_unmatched_stream_order_ids.clear()
-            if order_id not in self._pm_unmatched_stream_order_ids:
-                self._pm_unmatched_stream_order_ids.add(order_id)
-            self._pm_block_orders("unmatched_stream_order")
-            self.rpc.send_msg(
-                {
-                    "type": RPCMessageType.WARNING,
-                    "status": (
-                        f"PM User Stream FAIL-CLOSED: order event {order_id} "
-                        f"(clientId {client_order_id}) on {pair} did not match a local "
-                        "open order. New orders are BLOCKED until /pm_recover succeeds."
-                    ),
-                }
+            self._pm_note_stream_incident(
+                pair, order_id, order_data,
+                f"{self._pm_unowned_classification(client_order_id)}: "
+                "no proven local Order/Trade ownership"
             )
-            if (
-                self.config.get("exchange", {})
-                .get("portfolio_margin_risk", {})
-                .get("user_stream_recover_unmatched_orders", True)
-            ):
-                self._pm_order_recovery()
             return False
 
         event_state = str(order_data.get("X") or order_data.get("x") or "unknown")
-        event_key = f"{order_id}:{event_state}"
+        event_key = f"{pair}:{order_id}:{event_state}"
         if len(self._pm_foreign_stream_order_events) > 1000:
             self._pm_foreign_stream_order_events.clear()
         if event_key not in self._pm_foreign_stream_order_events:
             self._pm_foreign_stream_order_events.add(event_key)
             logger.info(
                 f"PM user stream: observed foreign order event {order_id} on {pair} "
+                f"classification={PMOwnershipClass.EXTERNAL_ORDER} "
                 f"(state={event_state}); read-only account refresh only, not managed by this bot."
             )
         return False
@@ -949,6 +1091,7 @@ class FreqtradeBot(LoggingMixin):
         logger.debug(f"Unhandled Binance PM user stream event type: {event_type}")
         return False, False, False
 
+    @pm_order_locked
     def _pm_consume_user_stream_events(self) -> None:
         if (
             self.trading_mode != TradingMode.FUTURES
@@ -966,15 +1109,15 @@ class FreqtradeBot(LoggingMixin):
         if not events:
             return
 
-        order_index: dict[str, tuple[Any, Any]] = {}
+        order_index: dict[tuple[str, str], tuple[Any, Any]] = {}
         for trade in Trade.get_open_trades():
-            for order in trade.open_orders:
-                order_index[str(order.order_id)] = (trade, order)
-            # ``open_orders`` intentionally excludes stoploss orders.  PM
-            # conditionals are identified by their local client strategy id,
-            # which Binance can send in ORDER_TRADE_UPDATE.o.c before trigger.
-            for order in trade.open_sl_orders:
-                order_index[str(order.order_id)] = (trade, order)
+            for order in trade.orders:
+                pair = self._pm_canonical_pair(trade.pair)
+                order_index[(pair, str(order.order_id))] = (trade, order)
+        # Ownership identity is stable within one batch; reuse proven
+        # resolutions so a redelivery storm does not re-query the DB per event.
+        self._pm_init_user_stream_state()
+        self._pm_owned_resolve_cache.clear()
 
         order_updates = 0
         account_updates = 0
@@ -994,7 +1137,15 @@ class FreqtradeBot(LoggingMixin):
                 needs_risk_check = needs_risk_check or risk_check
             except Exception as e:
                 errors += 1
+                Trade.session.rollback()
                 logger.warning(f"Failed to process Binance PM user stream event {event_type}: {e}")
+                if event_type == "ORDER_TRADE_UPDATE":
+                    data = event.get("o", {})
+                    pair = self._pm_pair_from_exchange_symbol(data.get("s"))
+                    if pair:
+                        self._pm_note_stream_incident(
+                            pair, str(data.get("i") or data.get("c") or ""), data, str(e)
+                        )
 
         if needs_wallet_update:
             self.wallets.update(require_update=True)
@@ -1336,6 +1487,7 @@ class FreqtradeBot(LoggingMixin):
             ordertype=self.strategy.order_types.get("emergency_exit", "market"),
         )
 
+    @pm_order_locked
     def _pm_reconcile_open_orders(self) -> dict[str, Any]:
         """
         Reconcile all open orders for open PM trades against the exchange (PAPI).
@@ -1352,6 +1504,7 @@ class FreqtradeBot(LoggingMixin):
             "open_trades": 0,
             "checked": 0,
             "reconciled": 0,
+            "transitions": [],
             "mismatches": [],
             "errors": [],
         }
@@ -1375,7 +1528,7 @@ class FreqtradeBot(LoggingMixin):
                             exchange_order = self.exchange.fetch_stoploss_order(
                                 order.order_id, trade.pair
                             )
-                            self._pm_record_actual_order(exchange_order, order.order_id)
+                            self._pm_record_actual_order(exchange_order, order.order_id, trade.pair)
                         else:
                             exchange_order = self.exchange.fetch_order(order.order_id, trade.pair)
                         if exchange_order.get("status") != order.status:
@@ -1383,12 +1536,17 @@ class FreqtradeBot(LoggingMixin):
                                 f"{order.order_id}({trade.pair}): DB={order.status} "
                                 f"Exchange={exchange_order.get('status')}"
                             )
-                            result["mismatches"].append(mismatch_detail)
-                            logger.warning(
-                                f"PM order state mismatch for {order.order_id} "
-                                f"({trade.pair}): DB={order.status}, "
-                                f"Exchange={exchange_order.get('status')}"
-                            )
+                            # REST winning a race with WS is ordinary lifecycle
+                            # progress, not lost position ownership.
+                            if order.status == "open" and exchange_order.get("status") in {
+                                "closed", "canceled", "expired", "rejected"
+                            }:
+                                result["transitions"].append(mismatch_detail)
+                                logger.info("PM order lifecycle synchronized: %s", mismatch_detail)
+                            else:
+                                result["mismatches"].append(mismatch_detail)
+                                logger.warning("PM order state mismatch: %s", mismatch_detail)
+                        self._pm_validate_rest_ownership(trade, order, exchange_order)
                         # Full lifecycle update - same path as a normal fill.
                         self.update_trade_state(
                             trade,
@@ -1399,6 +1557,7 @@ class FreqtradeBot(LoggingMixin):
                         )
                         result["reconciled"] += 1
                     except Exception as e:
+                        Trade.session.rollback()
                         result["errors"].append(f"{order.order_id}: {e}")
                         logger.debug(f"PM order recovery check failed for {order.order_id}: {e}")
             Trade.commit()
@@ -1408,7 +1567,69 @@ class FreqtradeBot(LoggingMixin):
             logger.warning(f"PM order recovery check failed: {e}")
             result["errors"].append(f"recovery: {e}")
         result["unresolved_intents"] = self._pm_unresolved_intent_count()
-        if not result["errors"]:
+
+        # Account-level quantity invariant: settled local exposure must match the
+        # exchange position per instrument. A mismatch is a dedicated SAFE_HOLD
+        # reason (risk increase blocked, protection untouched) and auto-releases
+        # when quantities reconcile again - never a silent "recovery passed".
+        try:
+            result["position_mismatches"] = self._pm_account_position_reconcile()
+        except Exception as e:
+            result["position_mismatches"] = [f"unavailable: {e}"]
+        if result["position_mismatches"]:
+            self._pm_block_orders("position_quantity_mismatch")
+            if not self._pm_position_mismatch_alerted:
+                self._pm_position_mismatch_alerted = True
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM SAFE_HOLD: account position quantity mismatch on "
+                            f"{len(result['position_mismatches'])} instrument(s). New "
+                            f"exposure BLOCKED until quantities reconcile. "
+                            f"{'; '.join(result['position_mismatches'][:3])}"
+                        ),
+                    }
+                )
+        else:
+            self._pm_position_mismatch_alerted = False
+            self._pm_unblock_orders("position_quantity_mismatch")
+
+        # Stop-protection invariant: a settled non-zero position must have
+        # verifiable conditional protection on the exchange. Unverifiable
+        # listing fails closed; missing protection blocks risk increase until
+        # the regular loop recreates it (auto-heal).
+        try:
+            result["unprotected_positions"] = self._pm_verify_stop_protection()
+            protection_verifiable = True
+        except Exception as e:
+            result["unprotected_positions"] = []
+            protection_verifiable = False
+            result["errors"].append(f"stop protection verification: {e}")
+        if protection_verifiable and not result["unprotected_positions"]:
+            self._pm_stop_protection_missing_alerted = False
+            self._pm_unblock_orders("stop_protection_missing")
+        else:
+            self._pm_block_orders("stop_protection_missing")
+            if result["unprotected_positions"] and not self._pm_stop_protection_missing_alerted:
+                self._pm_stop_protection_missing_alerted = True
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM SAFE_HOLD: {len(result['unprotected_positions'])} open "
+                            f"position(s) without verified stop protection "
+                            f"({result['unprotected_positions'][0]['pair']}). New exposure "
+                            "BLOCKED until protection is restored."
+                        ),
+                    }
+                )
+
+        if (
+            not result["errors"]
+            and not result["position_mismatches"]
+            and not result["unprotected_positions"]
+        ):
             self._pm_init_user_stream_state()
             self._pm_last_success_reconcile_time = datetime.now(UTC)
             result["success"] = True
@@ -1465,8 +1686,20 @@ class FreqtradeBot(LoggingMixin):
                 report["kept"] += 1
         return report
 
+    @pm_order_locked
     def _pm_order_recovery(self, clear_unmatched_block: bool = False) -> None:
         result = self._pm_reconcile_open_orders()
+        stream_report = self._pm_recover_stream_incidents()
+        # A previously unresolvable instrument may now canonicalize (markets are
+        # reloaded every loop) - retry so the identity gate can auto-release.
+        self._pm_retry_unresolved_instruments()
+        # Bounded retention of resolved stream-journal rows (once per hour).
+        try:
+            self._pm_purge_resolved_journal_if_due()
+            Trade.commit()
+        except Exception as exc:
+            logger.warning("PM stream journal retention purge failed: %s", exc)
+            Trade.session.rollback()
         if result["mismatches"]:
             self.rpc.send_msg(
                 {
@@ -1478,6 +1711,7 @@ class FreqtradeBot(LoggingMixin):
                 }
             )
         if result["errors"]:
+            self._pm_block_orders("reconciliation_incomplete")
             self.rpc.send_msg(
                 {
                     "type": RPCMessageType.WARNING,
@@ -1488,21 +1722,422 @@ class FreqtradeBot(LoggingMixin):
                     ),
                 }
             )
-        if clear_unmatched_block and not result["errors"]:
-            # Explicit manual recovery that completed cleanly -> clear the
-            # unmatched-stream-order block.
-            self._pm_unblock_orders("unmatched_stream_order")
+        # The shared incident reconciler alone can clear ownership gates, after
+        # checking the exact canonical instrument + order, even on scheduled
+        # recovery. A command or an empty open-order scan is not authorization.
+        if stream_report["errors"]:
+            logger.warning("PM stream ownership reconciliation incomplete: %s", stream_report)
+
+    def _pm_purge_resolved_journal_if_due(self) -> int:
+        """Bounded cleanup of resolved stream-journal rows (retention window)."""
+        self._pm_init_user_stream_state()
+        now = _time.monotonic()
+        last = getattr(self, "_pm_last_journal_purge_at", None)
+        if last is not None and now - last < 3600:
+            return 0
+        from freqtrade.persistence.pm_stream_journal import PMStreamJournal
+
+        retention_days = int(
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("user_stream_journal_retention_days", 30)
+        )
+        purged = PMStreamJournal.purge_resolved(datetime.now(UTC) - timedelta(days=retention_days))
+        self._pm_last_journal_purge_at = now
+        if purged:
+            logger.info("PM stream journal retention purge removed %d resolved rows.", purged)
+        return purged
 
     def _pm_has_open_trade_for(self, pair: str, side: str | None) -> bool:
         """Whether a local open trade exists for an exchange position (pair+side)."""
         for trade in Trade.get_open_trades():
-            if trade.pair != pair or not trade.is_open:
+            if (
+                self._pm_canonical_pair(trade.pair) != self._pm_canonical_pair(pair)
+                or not trade.is_open
+            ):
                 continue
             if side is None:
                 return True
             if trade.is_short == (side == "short"):
                 return True
         return False
+
+    def _pm_account_position_reconcile(self) -> list[str]:
+        """Full-account quantity invariant with a bounded in-flight model.
+
+        For every instrument the exchange position must fall inside the
+        explainable interval:
+
+            confirmed local exposure
+            + possible remaining risk-INCREASING fills (open entry/DCA orders)
+            - possible remaining risk-REDUCING fills (open exit orders)
+
+        built per open order from side/origQty/executedQty/remaining and the
+        trade direction. In-flight allowances expire: an open order older than
+        the configured deadline stops exempting its instrument (a permanent
+        working order must never mask a real quantity mismatch).
+
+        Returns human-readable mismatch descriptions (empty list = consistent).
+        Raises when the exchange view is unreadable (caller fails closed).
+        """
+        mismatches: list[str] = []
+        if not (
+            self.trading_mode == TradingMode.FUTURES
+            and not self.config.get("dry_run", True)
+            and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+        ):
+            return mismatches
+        self._pm_init_user_stream_state()
+        positions = self.exchange.fetch_positions()
+        exchange_by_pair: dict[str, float] = {}
+        for position in positions:
+            contracts = float(position.get("contracts", 0) or 0)
+            raw = position.get("symbol")
+            if not raw or contracts == 0:
+                continue
+            # PM fetch_positions returns canonical settled symbols; resolve
+            # defensively (never drop an unownable position silently).
+            pair = self._pm_canonical_pair(raw)
+            signed = contracts if position.get("side") != "short" else -contracts
+            exchange_by_pair[pair] = exchange_by_pair.get(pair, 0.0) + signed
+
+        tolerance = float(
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("account_position_quantity_tolerance", 0.01)
+        )
+        inflight_max_s = float(
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("account_position_inflight_max_seconds", 3600)
+        )
+        now = datetime.now(UTC)
+        local_by_pair: dict[str, float] = {}
+        inflight: dict[str, dict[str, Any]] = {}
+        for trade in Trade.get_open_trades():
+            if not trade.is_open:
+                continue
+            pair = self._pm_canonical_pair(trade.pair)
+            trade_sign = -1.0 if trade.is_short else 1.0
+            signed = float(trade.amount) * trade_sign
+            local_by_pair[pair] = local_by_pair.get(pair, 0.0) + signed
+            entry = inflight.setdefault(
+                pair, {"low": 0.0, "high": 0.0, "stale": False}
+            )
+            for order in trade.open_orders:
+                try:
+                    filled = float(order.filled or 0)
+                    total = float(order.amount or 0)
+                except (TypeError, ValueError):
+                    continue
+                remaining = max(total - filled, 0.0)
+                if remaining <= 0:
+                    continue
+                delta_sign = 1.0 if str(order.side) == trade.entry_side else -1.0
+                delta = trade_sign * delta_sign * remaining
+                entry["low"] = min(entry["low"], delta)
+                entry["high"] = max(entry["high"], delta)
+                order_date = order.order_date
+                if order_date is not None:
+                    if order_date.tzinfo is None:
+                        order_date = order_date.replace(tzinfo=UTC)
+                    if (now - order_date).total_seconds() > inflight_max_s:
+                        entry["stale"] = True
+
+        for pair in sorted(set(exchange_by_pair) | set(local_by_pair)):
+            exchange_amount = self.exchange._contracts_to_amount(
+                pair, exchange_by_pair.get(pair, 0.0)
+            )
+            local_amount = local_by_pair.get(pair, 0.0)
+            tol = max(abs(local_amount) * tolerance, 1e-9)
+            entry = inflight.get(pair)
+            if entry and not entry["stale"]:
+                if (
+                    local_amount + entry["low"] - tol
+                    <= exchange_amount
+                    <= local_amount + entry["high"] + tol
+                ):
+                    continue
+            if abs(exchange_amount - local_amount) <= tol:
+                continue
+            mismatches.append(
+                f"{pair}: exchange={exchange_amount!r} local={local_amount!r}"
+                f" inflight={entry or {}}"
+            )
+        return mismatches
+
+
+    def _pm_validate_protection_order(
+        self,
+        trade: Trade,
+        expected_id: str,
+        check: CcxtOrder | dict | None,
+        *,
+        require_reduce_only: bool = False,
+    ) -> tuple[str, Any]:
+        """Strictly validate one conditional protection order against the exchange.
+
+        Returns ("active"|"terminal"|"invalid", order):
+
+        * "active":   working/trigger-pending conditional that really protects
+                      the position (instrument, id, side, positionSide,
+                      reduce-only semantics and quantity all verified).
+        * "terminal": CLOSED/FILLED/triggered - the order already fired. The
+                      caller MUST process the fill (update_trade_state), refresh
+                      the position and recompute the protection requirement
+                      before doing anything else.
+        * "invalid":  rejected / canceled / expired / unknown / missing status /
+                      wrong instrument / wrong side / wrong positionSide /
+                      not reduce-only (when required) / insufficient quantity.
+                      The previous protection must NEVER be retired on this.
+        """
+        if not check:
+            return "invalid", check
+        pair = self._pm_canonical_pair(trade.pair)
+        # 1. canonical instrument exact match (never by bare order id)
+        try:
+            check_pair = self._pm_canonical_pair(check.get("symbol") or trade.pair)
+        except OperationalException:
+            return "invalid", check
+        if check_pair != pair:
+            return "invalid", check
+        # 2. expected exchange order id / child alias identity
+        if str(check.get("id") or "") != str(expected_id):
+            return "invalid", check
+        status = str(check.get("status") or "").lower()
+        triggered = str(check.get("status_stop") or "").lower() == "triggered"
+        # 3-8. status: closed/filled/triggered => terminal-unprocessed; only
+        # open/new are active; rejected/canceled/expired/missing => invalid.
+        if status in {"closed", "filled"} or triggered:
+            return "terminal", check
+        if status not in {"open", "new"}:
+            return "invalid", check
+        # 9. correct exit side
+        if str(check.get("side") or "").lower() != trade.exit_side:
+            return "invalid", check
+        # 10. positionSide semantics (one-way "BOTH" or matching hedge side)
+        info = check.get("info") if isinstance(check, dict) else {}
+        info = info or {}
+        position_side = str(info.get("positionSide") or "").upper()
+        if position_side:
+            expected_sides = {"BOTH", "LONG" if not trade.is_short else "SHORT"}
+            if position_side not in expected_sides:
+                return "invalid", check
+        # 11. reduceOnly / closePosition semantics. Our own candidates are always
+        # created with reduceOnly=true by construction; the response only
+        # invalidates them when it explicitly contradicts that. Foreign
+        # conditionals (invariant verification) must PROVE reduce-only.
+        reduce_only = info.get("reduceOnly")
+        if reduce_only is not None and str(reduce_only).lower() not in {"true", "1"}:
+            return "invalid", check
+        if require_reduce_only and reduce_only is None:
+            return "invalid", check
+        # 12. protected quantity must cover the position
+        quantity = check.get("amount")
+        if quantity is None:
+            return "invalid", check
+        try:
+            if float(quantity) + max(float(trade.amount) * 1e-6, 1e-9) < float(trade.amount):
+                return "invalid", check
+        except (TypeError, ValueError):
+            return "invalid", check
+        return "active", check
+
+    def _pm_protection_hold(self, trade: Trade, why: str) -> None:
+        """Hold risk increase while protection is unverified; keep exits open."""
+        self._pm_init_user_stream_state()
+        self._pm_block_orders("stop_protection_missing")
+        if not self._pm_stop_protection_missing_alerted:
+            self._pm_stop_protection_missing_alerted = True
+            try:
+                self.rpc.send_msg(
+                    {
+                        "type": RPCMessageType.WARNING,
+                        "status": (
+                            f"PM SAFE_HOLD: stop protection for {trade.pair} could not "
+                            f"be verified/replaced ({why}); the previous protection "
+                            "is retained and new exposure is BLOCKED."
+                        ),
+                    }
+                )
+            except Exception:
+                pass
+
+    def _pm_retire_stop_ids(self, trade: Trade, old_ids: list[str]) -> None:
+        """Cancel ONLY the given conditional ids (never a replacement)."""
+        for old_id in sorted(set(old_ids)):
+            try:
+                co = self.exchange.cancel_stoploss_order_with_result(
+                    old_id, trade.pair, trade.amount
+                )
+            except InvalidOrderException:
+                # Already gone (triggered/canceled): mark the local row canceled.
+                for sl in trade.open_sl_orders:
+                    if str(sl.order_id) == str(old_id):
+                        sl.ft_is_open = False
+                        sl.status = "canceled"
+                continue
+            self.update_trade_state(trade, old_id, co, stoploss_order=True)
+
+    def _pm_replace_stop_protection(
+        self,
+        trade: Trade,
+        old_ids: list[str],
+        *,
+        new_stop_price: float | None = None,
+    ) -> str:
+        """Unified protection replacement primitive (all PM paths):
+
+            CREATE NEW -> PERSIST CANDIDATE -> FETCH EXCHANGE TRUTH
+            -> VALIDATE NEW -> only then RETIRE OLD
+
+        Returns "active" (replacement verified, old retired), "kept_old"
+        (replacement not created/verified - old protection stays on the
+        exchange, risk increase held), "terminal" (replacement already fired -
+        the fill was processed first; old conditionals were NOT canceled) or
+        "not_required" (trade closed/flat).
+        """
+        old_ids = sorted({str(o) for o in old_ids})
+        if not trade.is_open or not trade.has_open_position:
+            return "not_required"
+        stop_price = (
+            new_stop_price if new_stop_price is not None else trade.stoploss_or_liquidation
+        )
+        old_ids_before = {str(sl.order_id) for sl in trade.open_sl_orders}
+        if not self.create_stoploss_order(trade=trade, stop_price=stop_price):
+            if trade.is_open and trade.has_open_position:
+                self._pm_protection_hold(trade, "replacement creation failed")
+            return "kept_old"
+        if not trade.is_open:
+            return "not_required"
+        new_ids = {str(sl.order_id) for sl in trade.open_sl_orders} - old_ids_before
+        if len(new_ids) != 1:
+            self._pm_protection_hold(
+                trade, f"expected one replacement conditional, found {len(new_ids)}"
+            )
+            return "kept_old"
+        new_id = next(iter(new_ids))
+        try:
+            check = self.exchange.fetch_stoploss_order(new_id, trade.pair)
+        except Exception as e:
+            logger.warning(
+                "PM protection replace: could not verify new conditional %s (%s); "
+                "keeping the old protection.",
+                new_id,
+                e,
+            )
+            self._pm_protection_hold(trade, "replacement verification fetch failed")
+            return "kept_old"
+        verdict, _ = self._pm_validate_protection_order(trade, new_id, check)
+        if verdict == "invalid":
+            self._pm_protection_hold(trade, "replacement failed validation")
+            return "kept_old"
+        if verdict == "terminal":
+            # The replacement already fired: process the fill FIRST, refresh the
+            # trade, and recompute the protection requirement. The old
+            # conditionals are never blindly canceled.
+            logger.warning(
+                "PM protection replace: replacement %s for %s is already terminal; "
+                "processing the fill and keeping the old protection.",
+                new_id,
+                trade.pair,
+            )
+            self.update_trade_state(trade, new_id, check, stoploss_order=True)
+            return "terminal"
+        self._pm_retire_stop_ids(trade, [o for o in old_ids if o != new_id])
+        return "active"
+
+    def _pm_switch_trailing_stoploss(
+        self, trade: Trade, old_order: CcxtOrder, stoploss_norm: float
+    ) -> None:
+        """PM-safe trailing-stop replacement (unified primitive)."""
+        verdict = self._pm_replace_stop_protection(
+            trade, [str(old_order["id"])], new_stop_price=stoploss_norm
+        )
+        if verdict == "active":
+            logger.info(
+                "PM trailing stop switch: %s protection replaced %s.",
+                trade.pair,
+                old_order["id"],
+            )
+
+    def _pm_resize_stop_protection(self, trade: Trade) -> str:
+        """DCA/entry-fill resize: the OLD conditional stays active until a
+        verified replacement exists on the exchange (unified primitive)."""
+        old_ids = [str(sl.order_id) for sl in trade.open_sl_orders]
+        if not old_ids:
+            # Nothing to keep alive: the first protection is created by the
+            # regular loop (handle_stoploss_on_exchange) through the same safe
+            # create -> verify primitive.
+            return "not_required"
+        verdict = self._pm_replace_stop_protection(
+            trade, old_ids, new_stop_price=trade.stoploss_or_liquidation
+        )
+        if verdict == "kept_old":
+            logger.warning(
+                "PM stop protection resize kept the previous protection for %s.",
+                trade.pair,
+            )
+        elif verdict == "active":
+            logger.info("PM stop protection resized for %s.", trade.pair)
+        return verdict
+
+    def _pm_verify_stop_protection(self) -> list[dict[str, Any]]:
+        """Trades with confirmed exposure whose stop protection cannot be
+        STRICTLY verified on the exchange (conditional orders).
+
+        Verification is independent of open entry/DCA/exit orders: confirmed
+        local exposure requires protection no matter what else is working.
+        Each local conditional is checked by canonical instrument + id, then
+        validated for status/side/positionSide/reduce-only/quantity.
+        """
+        offenders: list[dict[str, Any]] = []
+        if not (
+            self.trading_mode == TradingMode.FUTURES
+            and not self.config.get("dry_run", True)
+            and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+        ):
+            return offenders
+        if not self.strategy.order_types.get("stoploss_on_exchange"):
+            return offenders
+        self._pm_init_user_stream_state()
+        open_conditionals = self.exchange.fetch_open_conditional_orders()
+        by_key: dict[tuple[str, str], Any] = {}
+        for order in open_conditionals:
+            raw_pair = order.get("symbol")
+            try:
+                pair = self._pm_canonical_pair(raw_pair) if raw_pair else ""
+            except OperationalException:
+                pair = str(raw_pair or "")
+            by_key[(pair, str(order.get("id") or order.get("clientAlgoId") or ""))] = order
+        for trade in Trade.get_open_trades():
+            if not trade.is_open or not trade.has_open_position:
+                continue
+            pair = self._pm_canonical_pair(trade.pair)
+            local_ids = {str(sl.order_id) for sl in trade.open_sl_orders}
+            verified: set[str] = set()
+            problems: list[str] = []
+            for sl in trade.open_sl_orders:
+                o = by_key.get((pair, str(sl.order_id)))
+                verdict, _ = self._pm_validate_protection_order(
+                    trade, str(sl.order_id), o, require_reduce_only=True
+                )
+                if verdict == "active":
+                    verified.add(str(sl.order_id))
+                else:
+                    problems.append(f"{sl.order_id}:{verdict}")
+            if not local_ids:
+                problems.append("no local stop protection")
+            if local_ids - verified or not local_ids:
+                offenders.append(
+                    {
+                        "trade_id": trade.id,
+                        "pair": trade.pair,
+                        "local_ids": sorted(local_ids),
+                        "problems": problems,
+                    }
+                )
+        return offenders
 
     def _pm_link_intent_for_order(
         self, exchange_order: dict, trade: Trade, local_order_id: str
@@ -1528,18 +2163,19 @@ class FreqtradeBot(LoggingMixin):
             pass
         self.exchange.pm_link_intent_in_session(client_id, str(local_order_id), trade.id)
 
-    def _pm_find_local_order(self, exchange_id: str, client_id: str) -> dict[str, Any] | None:
+    def _pm_find_local_order(
+        self, exchange_id: str, client_id: str, pair: str
+    ) -> dict[str, Any] | None:
         """
         Find the local Order row for a resolved exchange order.
 
         Regular PM orders store the exchange orderId locally; conditional
         (stoploss) orders store the client algo id. Either identifier may match.
         """
-        candidates = {str(exchange_id), str(client_id)} - {"", "None"}
-        if not candidates:
-            return None
-        for order in Order.session.query(Order).filter(Order.order_id.in_(candidates)).all():
-            return {"order_id": str(order.order_id), "trade_id": order.ft_trade_id}
+        entry = self._pm_owned_order(self._pm_canonical_pair(pair), exchange_id, client_id, {})
+        if entry:
+            trade, order = entry
+            return {"order_id": str(order.order_id), "trade_id": trade.id}
         return None
 
     # ---- Signal decision ledger + unified data-failure policy ----
@@ -1798,7 +2434,7 @@ class FreqtradeBot(LoggingMixin):
             for sl in trade.open_sl_orders:
                 try:
                     exchange_order = self.exchange.fetch_stoploss_order(sl.order_id, trade.pair)
-                    self._pm_record_actual_order(exchange_order, sl.order_id)
+                    self._pm_record_actual_order(exchange_order, sl.order_id, trade.pair)
                 except Exception as e:
                     failures += 1
                     logger.warning(
@@ -1820,6 +2456,7 @@ class FreqtradeBot(LoggingMixin):
         else:
             self._pm_unblock_orders("reconciliation_incomplete")
 
+    @pm_order_locked
     def _pm_recover_pending_intents(self) -> dict[str, Any]:
         """
         Crash/restart recovery for the PM order pipeline.
@@ -1910,7 +2547,7 @@ class FreqtradeBot(LoggingMixin):
                 or intent.get("exchange_order_id")
                 or ""
             )
-            local = self._pm_find_local_order(exchange_id, client_id)
+            local = self._pm_find_local_order(exchange_id, client_id, intent["pair"])
             if local is not None:
                 try:
                     self.exchange.pm_mark_intent_linked(
@@ -2000,25 +2637,25 @@ class FreqtradeBot(LoggingMixin):
 
             open_trades = Trade.get_open_trades()
             known_order_ids = {
-                order.order_id
+                (self._pm_canonical_pair(trade.pair), str(order.order_id))
                 for trade in open_trades
                 for order in trade.open_orders
             }
             known_strategy_ids = {
-                order.order_id
+                (self._pm_canonical_pair(trade.pair), str(order.order_id))
                 for trade in open_trades
                 for order in trade.open_sl_orders
             }
             open_orders = self.exchange.fetch_open_orders()
             for order in open_orders:
                 order_id = str(order.get("id") or "")
-                symbol = order.get("symbol")
+                symbol = self._pm_canonical_pair(order.get("symbol"))
                 if not order_id:
                     continue
                 result["exchange_open_orders"].append(
                     {"order_id": order_id, "symbol": symbol}
                 )
-                if order_id not in known_order_ids and order_id not in known_strategy_ids:
+                if (symbol, order_id) not in known_order_ids:
                     result["unknown_orders"].append(
                         {"order_id": order_id, "symbol": symbol}
                     )
@@ -2028,13 +2665,13 @@ class FreqtradeBot(LoggingMixin):
             conditional_orders = self.exchange.fetch_open_conditional_orders()
             for order in conditional_orders:
                 strategy_id = str(order.get("id") or "")
-                symbol = order.get("symbol")
+                symbol = self._pm_canonical_pair(order.get("symbol"))
                 if not strategy_id:
                     continue
                 result["exchange_conditional_orders"].append(
                     {"order_id": strategy_id, "symbol": symbol}
                 )
-                if strategy_id not in known_strategy_ids:
+                if (symbol, strategy_id) not in known_strategy_ids:
                     result["unknown_conditional_orders"].append(
                         {"order_id": strategy_id, "symbol": symbol}
                     )
@@ -2042,18 +2679,23 @@ class FreqtradeBot(LoggingMixin):
             # --- Reverse direction: local records the exchange does NOT confirm ---
             # (one-way mode, so position matching is side-agnostic)
             exchange_position_pairs = {
-                pos["pair"]
+                self._pm_canonical_pair(pos["pair"])
                 for pos in result["exchange_positions"]
                 if float(pos.get("contracts") or 0) != 0
             }
-            exchange_order_ids = {o["order_id"] for o in result["exchange_open_orders"]}
-            exchange_conditional_ids = {o["order_id"] for o in result["exchange_conditional_orders"]}
+            exchange_order_ids = {
+                (o["symbol"], o["order_id"]) for o in result["exchange_open_orders"]
+            }
+            exchange_conditional_ids = {
+                (o["symbol"], o["order_id"]) for o in result["exchange_conditional_orders"]
+            }
             for trade in open_trades:
                 if not trade.is_open:
                     continue
-                local_open_ids = {str(o.order_id) for o in trade.open_orders}
-                local_sl_ids = {str(o.order_id) for o in trade.open_sl_orders}
-                if trade.pair not in exchange_position_pairs:
+                pair = self._pm_canonical_pair(trade.pair)
+                local_open_ids = {(pair, str(o.order_id)) for o in trade.open_orders}
+                local_sl_ids = {(pair, str(o.order_id)) for o in trade.open_sl_orders}
+                if pair not in exchange_position_pairs:
                     working_entry = bool(local_open_ids & exchange_order_ids)
                     working_stop = bool(local_sl_ids & exchange_conditional_ids)
                     if not working_entry and not working_stop:
@@ -2070,7 +2712,8 @@ class FreqtradeBot(LoggingMixin):
                 )
                 if missing_ids:
                     result["local_open_orders_missing_on_exchange"].append(
-                        {"trade_id": trade.id, "pair": trade.pair, "order_ids": missing_ids}
+                        {"trade_id": trade.id, "pair": pair,
+                         "order_ids": [order_id for _, order_id in missing_ids]}
                     )
 
             # --- Recent terminal orders: the local DB claims a terminal state -
@@ -2085,23 +2728,29 @@ class FreqtradeBot(LoggingMixin):
             )
             for local_order in recent_orders:
                 order_id = str(local_order.order_id)
-                if order_id in exchange_order_ids:
+                pair = self._pm_canonical_pair(local_order.ft_pair)
+                if (pair, order_id) in exchange_order_ids:
                     continue  # still open on the exchange - covered above
                 try:
-                    ex_order = self.exchange.fetch_order(order_id, local_order.pair)
+                    ex_order = (
+                        self.exchange.fetch_stoploss_order(order_id, pair)
+                        if local_order.ft_order_side == "stoploss"
+                        else self.exchange.fetch_order(order_id, pair)
+                    )
                 except InvalidOrderException:
                     result["recent_closed_order_mismatches"].append(
                         {
                             "order_id": order_id,
-                            "pair": local_order.pair,
+                            "pair": pair,
                             "local_status": local_order.status,
                             "exchange_status": "absent",
                         }
                     )
                     continue
                 except Exception as e:
-                    logger.debug(f"PM recent-order verification failed for {order_id}: {e}")
-                    continue
+                    raise OperationalException(
+                        f"PM recent-order verification unavailable for {pair}/{order_id}: {e}"
+                    ) from e
                 ex_status = str((ex_order or {}).get("status") or "")
                 local_terminal = {
                     "closed": "closed",
@@ -2113,7 +2762,7 @@ class FreqtradeBot(LoggingMixin):
                     result["recent_closed_order_mismatches"].append(
                         {
                             "order_id": order_id,
-                            "pair": local_order.pair,
+                            "pair": pair,
                             "local_status": local_order.status,
                             "exchange_status": ex_status,
                         }
@@ -2440,6 +3089,10 @@ class FreqtradeBot(LoggingMixin):
             #    before the bot may open new orders.
             consistency = self._pm_startup_consistency_check()
             self._pm_apply_startup_consistency(consistency)
+            # 4) Cold reconcile: rebuild order/ownership state, resolve durable
+            #    stream incidents, verify position-quantity and stop-protection
+            #    invariants. STARTING never silently becomes RUNNING.
+            self._pm_order_recovery()
 
         if (
             self.trading_mode == TradingMode.FUTURES
@@ -3804,6 +4457,12 @@ class FreqtradeBot(LoggingMixin):
         if len(stoploss_orders) == 0:
             stop_price = trade.stoploss_or_liquidation
 
+            if getattr(self.exchange, "_is_portfolio_margin", lambda: False)():
+                # Unified safe creation: create -> persist candidate -> fetch
+                # exchange truth -> validate (no old conditional to retire).
+                self._pm_replace_stop_protection(trade, [], new_stop_price=stop_price)
+                return False
+
             if self.create_stoploss_order(trade=trade, stop_price=stop_price):
                 # The above will return False if the placement failed and the trade was force-sold.
                 # in which case the trade will be closed - which we must check below.
@@ -3829,6 +4488,13 @@ class FreqtradeBot(LoggingMixin):
             and len(stoploss_orders) > 0
             and len(stoploss_orders) == len(canceled_sl_orders)
         ):
+            if getattr(self.exchange, "_is_portfolio_margin", lambda: False)():
+                # Unified safe recreation (the canceled conditionals need no
+                # retirement - they are already gone on the exchange).
+                self._pm_replace_stop_protection(
+                    trade, [], new_stop_price=trade.stoploss_or_liquidation
+                )
+                return False
             if self.create_stoploss_order(trade=trade, stop_price=trade.stoploss_or_liquidation):
                 return False
             else:
@@ -3873,6 +4539,12 @@ class FreqtradeBot(LoggingMixin):
             update_beat = self.strategy.order_types.get("stoploss_on_exchange_interval", 60)
             upd_req = datetime.now(UTC) - timedelta(seconds=update_beat)
             if trade.stoploss_last_update_utc and upd_req >= trade.stoploss_last_update_utc:
+                if getattr(self.exchange, "_is_portfolio_margin", lambda: False)():
+                    # PM safety switch: create + verify the replacement BEFORE
+                    # retiring the old conditional, so a crash between the two
+                    # steps can never leave a non-zero position unprotected.
+                    self._pm_switch_trailing_stoploss(trade, order, stoploss_norm)
+                    return
                 # cancelling the current stoploss on exchange first
                 logger.info(
                     f"Cancelling current stoploss on exchange for pair {trade.pair} "
@@ -3891,6 +4563,7 @@ class FreqtradeBot(LoggingMixin):
                     logger.warning(
                         f"Could not create trailing stoploss order for pair {trade.pair}."
                     )
+
 
     def manage_open_orders(self) -> None:
         """
@@ -4702,7 +5375,13 @@ class FreqtradeBot(LoggingMixin):
                         # Only necessary for additional entries
                         trade.fee_open_currency = None
                     # Don't cancel stoploss in recovery modes immediately
-                    trade = self.cancel_stoploss_on_exchange(trade)
+                    if getattr(self.exchange, "_is_portfolio_margin", lambda: False)():
+                        # PM safety: resize the protection instead of
+                        # cancel-then-recreate. The OLD conditional stays
+                        # active until a verified replacement exists.
+                        self._pm_resize_stop_protection(trade)
+                    else:
+                        trade = self.cancel_stoploss_on_exchange(trade)
                 trade.adjust_stop_loss(trade.open_rate, self.strategy.stoploss, initial=True)
             if (
                 order.ft_order_side == trade.entry_side

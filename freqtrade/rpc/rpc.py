@@ -1380,6 +1380,12 @@ class RPC:
         }
 
     def _rpc_pm_recover(self) -> dict[str, Any]:
+        # Same reentrant lifecycle lock as scheduled recovery and stream updates:
+        # no event may race between verification and the command's gate decision.
+        with self._freqtrade._exit_lock:
+            return self._rpc_pm_recover_locked()
+
+    def _rpc_pm_recover_locked(self) -> dict[str, Any]:
         if self._freqtrade.trading_mode != TradingMode.FUTURES:
             raise RPCException("pm_recover is only available in futures mode.")
         if not hasattr(self._freqtrade.exchange, "_is_portfolio_margin"):
@@ -1394,6 +1400,7 @@ class RPC:
         #    update_trade_state() lifecycle (fees, realized PnL, exit time, wallet,
         #    notifications, protections) - not just a bare trade.update_order().
         result = self._freqtrade._pm_reconcile_open_orders()
+        stream_report = self._freqtrade._pm_recover_stream_incidents()
         unresolved = self._freqtrade._pm_has_unresolved_intents()
         # 3) Only a fully clean recovery clears the fail-closed blocks (orphaned
         #    orders - existing on the exchange without a local record - keep the
@@ -1403,6 +1410,9 @@ class RPC:
             and not unresolved
             and not intents_report["unresolved"]
             and not intents_report.get("orphaned", 0)
+            and not intents_report.get("store_error")
+            and not stream_report["unresolved"]
+            and not stream_report["errors"]
         ):
             self._freqtrade._pm_unblock_orders("unmatched_stream_order")
             self._freqtrade._pm_unblock_orders("reconciliation_incomplete")
@@ -1416,6 +1426,9 @@ class RPC:
                 and not unresolved
                 and not intents_report["unresolved"]
                 and not intents_report.get("orphaned", 0)
+                and not intents_report.get("store_error")
+                and not stream_report["unresolved"]
+                and not stream_report["errors"]
                 else "failed"
             ),
             checked=result["checked"],
@@ -1428,6 +1441,8 @@ class RPC:
             "orders_checked": result["checked"],
             "reconciled_count": result["reconciled"],
             "mismatches": result["mismatches"],
+            "lifecycle_transitions": result.get("transitions", []),
+            "stream_ownership": stream_report,
             "errors": result["errors"],
             "intents_checked": intents_report["checked"],
             "intents_cleared": intents_report["cleared"],

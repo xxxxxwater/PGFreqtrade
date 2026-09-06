@@ -131,4 +131,9 @@ secrets/pm_env.txt
 
 # Local pytest basetemp dirs / suite output artifacts
 .basetemp*/
-.full_suite_output.txt
+.full_suite_output*.txt
+.pytest-*/
+.pytest-*evidence*/
+
+# Local scratch PostgreSQL (round-2 fault injection; never committed)
+.pg-portable/

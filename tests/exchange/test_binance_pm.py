@@ -19,7 +19,7 @@ from freqtrade.exceptions import (
     TemporaryError,
 )
 from freqtrade.exchange.binance import Binance
-from tests.conftest import get_patched_exchange
+from tests.conftest import get_markets, get_patched_exchange
 
 
 @pytest.fixture(autouse=True)
@@ -47,6 +47,11 @@ def get_patched_pm_exchange(mocker, default_conf_usdt, api_mock=None, mock_marke
         "user_stream_enabled": False,
     }
     api_mock = api_mock if api_mock is not None else MagicMock()
+    if mock_markets is True:
+        mock_markets = get_markets()
+        # The generic fixture uses another exchange's ETH_USDT raw ID. PM's
+        # request and response fixtures must agree on Binance's actual identity.
+        mock_markets["ETH/USDT:USDT"]["id"] = "ETHUSDT"
     return get_patched_exchange(
         mocker, conf, api_mock=api_mock, exchange="binance", mock_markets=mock_markets
     )
@@ -230,7 +235,7 @@ def test_create_order_pm_routes_to_papi_and_uses_client_order_id(default_conf_us
     assert len(params["newClientOrderId"]) <= 32
     assert params["side"] == "BUY"
     assert params["type"] == "LIMIT"
-    assert params["symbol"] == "ETH_USDT"
+    assert params["symbol"] == "ETHUSDT"
 
 
 def test_pm_leverage_prep_skips_standard_margin_mode_and_uses_papi(default_conf_usdt, mocker):
@@ -243,7 +248,7 @@ def test_pm_leverage_prep_skips_standard_margin_mode_and_uses_papi(default_conf_
 
     exchange._api.set_margin_mode.assert_not_called()
     exchange._papi_request.assert_called_once_with(
-        "um/leverage", "POST", {"symbol": "ETH_USDT", "leverage": 1}
+        "um/leverage", "POST", {"symbol": "ETHUSDT", "leverage": 1}
     )
 
 
@@ -383,7 +388,7 @@ def test_fetch_order_pm_routes_to_papi(default_conf_usdt, mocker):
     assert path == "um/order"
     assert method == "GET"
     assert params["orderId"] == "123"
-    assert params["symbol"] == "ETH_USDT"
+    assert params["symbol"] == "ETHUSDT"
 
 
 def test_fetch_open_orders_pm_routes_to_papi(default_conf_usdt, mocker):
@@ -396,7 +401,7 @@ def test_fetch_open_orders_pm_routes_to_papi(default_conf_usdt, mocker):
     path, method, params = exchange._papi_request.call_args[0]
     assert path == "um/openOrders"
     assert method == "GET"
-    assert params["symbol"] == "ETH_USDT"
+    assert params["symbol"] == "ETHUSDT"
     assert len(orders) == 1
 
 
@@ -443,7 +448,7 @@ def test_get_trades_for_order_pm_routes_to_papi_user_trades(default_conf_usdt, m
     path, method, params = exchange._papi_request.call_args[0]
     assert path == "um/userTrades"
     assert method == "GET"
-    assert params["symbol"] == "ETH_USDT"
+    assert params["symbol"] == "ETHUSDT"
 
 
 def test_pm_place_order_idempotent_resolves_existing(default_conf_usdt, mocker):

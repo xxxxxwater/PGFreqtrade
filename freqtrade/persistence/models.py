@@ -23,6 +23,7 @@ from freqtrade.persistence.pm_order_intent import PMOrderIntent
 from freqtrade.persistence.pm_outbox import PMOutbox
 from freqtrade.persistence.pm_candle_watermark import PMCandleWatermark
 from freqtrade.persistence.pm_signal_ledger import PMSignalLedger
+from freqtrade.persistence.pm_stream_journal import PMStreamJournal
 from freqtrade.persistence.trade_model import Order, Trade
 
 
@@ -96,6 +97,7 @@ def init_db(db_url: str) -> None:
     PMOutbox.session = Trade.session
     PMCandleWatermark.session = Trade.session
     PMSignalLedger.session = Trade.session
+    PMStreamJournal.session = Trade.session
     _CustomData.session = scoped_session(
         sessionmaker(bind=engine, autoflush=True), scopefunc=get_request_or_thread_id
     )

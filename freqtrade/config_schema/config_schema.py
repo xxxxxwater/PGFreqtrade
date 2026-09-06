@@ -1295,6 +1295,50 @@ CONF_SCHEMA = {
                             "exclusiveMinimum": True,
                             "default": 3.0,
                         },
+                        "user_stream_auto_recovery_cooldown_seconds": {
+                            "description": (
+                                "Minimum seconds between auto-triggered FULL order-recovery "
+                                "sweeps after unmatched stream events. Targeted incident "
+                                "recovery is never throttled; only the full account sweep is. "
+                                "Default: 60."
+                            ),
+                            "type": "number",
+                            "minimum": 0,
+                            "default": 60,
+                        },
+                        "account_position_quantity_tolerance": {
+                            "description": (
+                                "Relative tolerance for the full-account position quantity "
+                                "invariant (settled local exposure vs exchange position). "
+                                "A larger mismatch blocks new exposure until quantities "
+                                "reconcile. Default: 0.01 (1%)."
+                            ),
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                            "default": 0.01,
+                        },
+                        "user_stream_journal_retention_days": {
+                            "description": (
+                                "Days resolved PM stream-journal incidents are retained as "
+                                "terminal-order ownership evidence before the bounded purge. "
+                                "Default: 30."
+                            ),
+                            "type": "integer",
+                            "minimum": 7,
+                            "default": 30,
+                        },
+                        "account_position_inflight_max_seconds": {
+                            "description": (
+                                "Maximum age of an open order before its instrument loses the "
+                                "in-flight quantity allowance in the account position "
+                                "invariant. A permanently working order must never mask a "
+                                "real quantity mismatch. Default: 3600."
+                            ),
+                            "type": "integer",
+                            "minimum": 60,
+                            "default": 3600,
+                        },
                     },
                 },
                 "ccxt_config": {"description": "CCXT configuration settings.", "type": "object"},

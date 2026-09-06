@@ -10,8 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from freqtrade.constants import EntryExecuteMode
-from freqtrade.enums import ExitType, RPCMessageType, State
+from freqtrade.enums import RPCMessageType, State
 from freqtrade.exceptions import TemporaryError
 from freqtrade.persistence import Order, Trade
 from freqtrade.util.datetime_helpers import dt_now
@@ -47,7 +46,25 @@ def make_pm_bot(mocker, pm_conf):
     bot = get_patched_freqtradebot(mocker, pm_conf)
     # Exchange is a Binance instance; expose the PM flag and control fetch_order.
     bot.exchange._is_portfolio_margin = MagicMock(return_value=True)
+    bot.exchange.markets["ETH/USDT:USDT"]["id"] = "ETHUSDT"
     bot.exchange.fetch_order = MagicMock(return_value={})
+    # Account-level quantity invariant: default the exchange position view to
+    # the local open trades (tests override it to inject mismatches). Contract
+    # conversion is identity in the test market universe (contractSize=1).
+    bot.exchange._contracts_to_amount = MagicMock(side_effect=lambda pair, contracts: contracts)
+
+    def _fake_positions():
+        return [
+            {
+                "symbol": trade.pair,
+                "side": "short" if trade.is_short else "long",
+                "contracts": abs(trade.amount),
+            }
+            for trade in Trade.get_open_trades()
+        ]
+
+    bot.exchange.fetch_positions = MagicMock(side_effect=_fake_positions)
+    bot.exchange.fetch_open_conditional_orders = MagicMock(return_value=[])
     # Avoid external notifications / side effects.
     bot._notify_enter = MagicMock()
     bot._notify_exit = MagicMock()
@@ -152,7 +169,7 @@ def ccxt_order(order_id, status, side, amount=11.0, filled=11.0, price=0.01):
 def test_pm_reconcile_calls_full_update_path(mocker, pm_conf):
     """Recovery must run update_trade_state (full lifecycle), not bare update_order."""
     bot = make_pm_bot(mocker, pm_conf)
-    trade = make_open_trade(pm_conf, order_id="e1", side="buy")
+    make_open_trade(pm_conf, order_id="e1", side="buy")
     bot.exchange.fetch_order.return_value = ccxt_order("e1", "open", "buy")
 
     bot.update_trade_state = MagicMock(return_value=False)
@@ -166,18 +183,18 @@ def test_pm_reconcile_calls_full_update_path(mocker, pm_conf):
     assert call.kwargs["stoploss_order"] is False
 
 
-def test_pm_reconcile_reports_mismatch(mocker, pm_conf):
-    """DB status != exchange status must be reported as a mismatch."""
+def test_pm_reconcile_reports_normal_fill_transition(mocker, pm_conf):
+    """REST winning the fill race is ordinary progress, not lost ownership."""
     bot = make_pm_bot(mocker, pm_conf)
-    trade = make_open_trade(pm_conf, order_id="m1", side="buy")
+    make_open_trade(pm_conf, order_id="m1", side="buy")
     # Exchange says FILLED, DB says open -> mismatch.
     bot.exchange.fetch_order.return_value = ccxt_order("m1", "closed", "buy")
     bot.update_trade_state = MagicMock(return_value=False)
 
     result = bot._pm_reconcile_open_orders()
 
-    assert result["mismatches"], "expected a mismatch to be recorded"
-    assert "m1" in result["mismatches"][0]
+    assert result["mismatches"] == []
+    assert "m1" in result["transitions"][0]
 
 
 def test_pm_reconcile_entry_fill_updates_trade(mocker, pm_conf):
@@ -250,7 +267,7 @@ def test_pm_reconcile_canceled_order_stays_flat(mocker, pm_conf):
 def test_pm_reconcile_idempotent(mocker, pm_conf):
     """Repeated recovery must not re-process already-closed orders."""
     bot = make_pm_bot(mocker, pm_conf)
-    trade = make_open_trade(pm_conf, order_id="id1", side="buy", amount=11.0)
+    make_open_trade(pm_conf, order_id="id1", side="buy", amount=11.0)
     bot.exchange.fetch_order.return_value = ccxt_order(
         "id1", "closed", "buy", amount=11.0, filled=11.0
     )
@@ -302,7 +319,7 @@ def test_pm_startup_consistency_check_consistent(mocker, pm_conf):
     exists on the exchange, the (bidirectional) check reports consistent.
     """
     bot = make_pm_bot(mocker, pm_conf)
-    trade = make_open_trade(pm_conf, order_id="ok1", side="buy", amount=11.0)
+    make_open_trade(pm_conf, order_id="ok1", side="buy", amount=11.0)
     bot.exchange.fetch_positions = MagicMock(
         return_value=[
             {"symbol": "ETH/USDT:USDT", "side": "long", "contracts": 11.0, "collateral": 1.0}
@@ -497,7 +514,7 @@ def test_pm_reconcile_triggered_stoploss_fill_closes_trade(mocker, pm_conf):
     Trade.session.refresh(trade)
     assert trade.is_open is False
     assert trade.close_profit is not None
-    assert bot._pm_actual_order_map.get("999") == "stabc"
+    assert bot._pm_actual_order_map.get((trade.pair, "999")) == "stabc"
 
 
 def test_pm_handle_order_trade_update_stoploss_branch(mocker, pm_conf):
@@ -513,7 +530,7 @@ def test_pm_handle_order_trade_update_stoploss_branch(mocker, pm_conf):
     )
     bot.exchange.fetch_order = MagicMock()
 
-    event = {"e": "ORDER_TRADE_UPDATE", "o": {"i": "stabc", "s": "ETH_USDT"}}
+    event = {"e": "ORDER_TRADE_UPDATE", "o": {"i": "stabc", "s": "ETHUSDT"}}
     handled = bot._pm_handle_order_trade_update(event, {"stabc": (trade, order)})
 
     assert handled is True
@@ -531,7 +548,7 @@ def test_pm_stoploss_stream_event_matches_client_strategy_id(mocker, pm_conf):
     )
     bot.exchange.fetch_order = MagicMock()
 
-    event = {"e": "ORDER_TRADE_UPDATE", "o": {"s": "ETH_USDT", "c": "stabc"}}
+    event = {"e": "ORDER_TRADE_UPDATE", "o": {"s": "ETHUSDT", "c": "stabc"}}
     handled = bot._pm_handle_order_trade_update(event, {"stabc": (trade, order)})
 
     assert handled is True
@@ -547,13 +564,13 @@ def test_pm_handle_unmatched_actual_order_event_reconciles_stoploss(mocker, pm_c
     """
     bot = make_pm_bot(mocker, pm_conf)
     trade = make_stoploss_trade(pm_conf, order_id="stabc", side="sell")
-    bot._pm_actual_order_map["999"] = "stabc"
+    bot._pm_actual_order_map[(trade.pair, "999")] = "stabc"
     bot.exchange.fetch_stoploss_order = MagicMock(
         return_value=ccxt_order("stabc", "open", "sell", filled=0.0)
     )
     bot.exchange.fetch_order = MagicMock()
 
-    event = {"e": "ORDER_TRADE_UPDATE", "o": {"i": "999", "s": "ETH_USDT"}}
+    event = {"e": "ORDER_TRADE_UPDATE", "o": {"i": "999", "s": "ETHUSDT"}}
     handled = bot._pm_handle_order_trade_update(event, {})
 
     assert handled is True
@@ -889,7 +906,7 @@ def test_pm_rebuild_actual_order_map_from_persistent_orders(mocker, pm_conf):
 
     bot._pm_rebuild_actual_order_map()
 
-    assert bot._pm_actual_order_map.get("999") == "stabc"
+    assert bot._pm_actual_order_map.get((trade.pair, "999")) == "stabc"
     assert "reconciliation_incomplete" not in bot._pm_blocked_order_reasons()
 
 
@@ -918,12 +935,12 @@ def test_pm_unmatched_child_event_classified_via_conditional_lookup(mocker, pm_c
     bot.exchange.fetch_stoploss_order = MagicMock(return_value=merged)
     bot.exchange.fetch_order = MagicMock()
 
-    event = {"e": "ORDER_TRADE_UPDATE", "o": {"i": "999", "s": "ETH_USDT", "c": ""}}
+    event = {"e": "ORDER_TRADE_UPDATE", "o": {"i": "999", "s": "ETHUSDT", "c": ""}}
     handled = bot._pm_handle_order_trade_update(event, {})
 
     assert handled is True
     bot.exchange.fetch_order.assert_not_called()
-    assert bot._pm_actual_order_map.get("999") == "stabc"
+    assert bot._pm_actual_order_map.get((trade.pair, "999")) == "stabc"
 
 
 def test_pm_unmatched_child_event_lookup_failure_fails_closed(mocker, pm_conf):
@@ -934,7 +951,7 @@ def test_pm_unmatched_child_event_lookup_failure_fails_closed(mocker, pm_conf):
     bot.exchange.fetch_stoploss_order = MagicMock(side_effect=TemporaryError("down"))
     bot.rpc.send_msg = MagicMock()
 
-    event = {"e": "ORDER_TRADE_UPDATE", "o": {"i": "999", "s": "ETH_USDT", "c": ""}}
+    event = {"e": "ORDER_TRADE_UPDATE", "o": {"i": "999", "s": "ETHUSDT", "c": ""}}
     handled = bot._pm_handle_order_trade_update(event, {})
 
     assert handled is False

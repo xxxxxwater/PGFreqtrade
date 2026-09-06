@@ -10,7 +10,7 @@ import pytest
 from freqtrade.exceptions import OperationalException, TemporaryError
 from freqtrade.exchange.binance import Binance
 from freqtrade.persistence import PMOrderIntent, PMOutbox, init_db
-from tests.conftest import get_patched_exchange
+from tests.conftest import get_markets, get_patched_exchange
 
 PM_ORDER = {
     "orderId": 123,
@@ -49,7 +49,11 @@ def make_exchange(mocker, default_conf_usdt):
         "min_uni_mmr": 1.5,
         "user_stream_enabled": False,
     }
-    return get_patched_exchange(mocker, conf, api_mock=MagicMock(), exchange="binance")
+    markets = get_markets()
+    markets["ETH/USDT:USDT"]["id"] = "ETHUSDT"
+    return get_patched_exchange(
+        mocker, conf, api_mock=MagicMock(), exchange="binance", mock_markets=markets
+    )
 
 
 def test_enqueue_ack_link_tombstone_lifecycle(mocker, default_conf_usdt):

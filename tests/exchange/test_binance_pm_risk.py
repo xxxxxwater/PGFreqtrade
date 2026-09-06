@@ -19,6 +19,9 @@ def set_minimal_exchange_cleanup_attrs(exchange):
     exchange._api_async = None
     exchange._ws_async = None
     exchange.loop = None
+    exchange._markets = {
+        PAIR: {"id": "BTCUSDT", "settle": "USDT", "inverse": False}
+    }
 
 
 class _EmptyIntentModel:

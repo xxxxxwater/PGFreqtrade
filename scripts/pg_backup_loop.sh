@@ -7,7 +7,7 @@
 #     valid backup).
 #   - Every final backup gets a SHA-256 checksum; restore verifies it.
 #   - A periodic restore smoke test restores the newest backup into a scratch
-#     database and verifies the pm_order_intents table exists and is readable.
+#     database and verifies all seven trading/PM pipeline tables exist.
 #   - Backup health (last OK / last failure) is exposed in BACKUP_HEALTH.
 #
 # Env vars: PG_HOST, PG_USER, PG_DB, BACKUP_DIR, KEEP, BACKUP_INTERVAL_SECS,
@@ -125,7 +125,10 @@ restore_smoke() {
     fi
 
     # Every table the trading pipeline depends on must exist after restore.
-    for TABLE in trades orders pm_order_intents pm_outbox pm_signal_ledger pm_candle_watermarks; do
+    # This release adds pm_stream_journal. Pre-upgrade backups must first be
+    # restored and migrated in isolation before they can pass this release's
+    # seven-table readiness check; do not silently waive the journal check.
+    for TABLE in trades orders pm_order_intents pm_outbox pm_signal_ledger pm_candle_watermarks pm_stream_journal; do
         TABLE_CHECK=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \
             "SELECT to_regclass('public.$TABLE') IS NOT NULL")
         if [ "$TABLE_CHECK" != "t" ]; then

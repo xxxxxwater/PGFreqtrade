@@ -192,6 +192,11 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         LoggingMixin.__init__(self, logger, timeframe_secs)
 
         self._schedule = Scheduler()
+        # PM control-plane maintenance must continue even while the trading
+        # state is STOPPED.  Keep it separate from the strategy/account-risk
+        # scheduler so STOPPED can service listenKey/stream/recovery without
+        # running trading or emergency account actions.
+        self._pm_maintenance_schedule = Scheduler()
 
         if self.trading_mode == TradingMode.FUTURES:
 
@@ -254,16 +259,24 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         keepalive_interval = int(
             pm_risk_cfg.get("user_stream_listen_key_keepalive_minutes", 20)
         )
-        self._schedule.every(keepalive_interval).minutes.do(self._pm_keepalive_listen_key)
+        self._pm_maintenance_schedule.every(keepalive_interval).minutes.do(
+            self._pm_keepalive_listen_key
+        )
 
         risk_interval = pm_risk_cfg.get("monitor_interval_minutes", 5)
+        # Account-level risk actions (including emergency close-all) belong to
+        # the active/paused trading control loop, never STOPPED maintenance.
         self._schedule.every(risk_interval).minutes.do(self._pm_risk_monitor)
 
         recovery_interval = pm_risk_cfg.get("order_recovery_interval_minutes", 5)
-        self._schedule.every(recovery_interval).minutes.do(self._pm_order_recovery)
+        self._pm_maintenance_schedule.every(recovery_interval).minutes.do(
+            self._pm_order_recovery
+        )
 
         health_interval = pm_risk_cfg.get("user_stream_health_interval_minutes", 1)
-        self._schedule.every(health_interval).minutes.do(self._pm_user_stream_health_monitor)
+        self._pm_maintenance_schedule.every(health_interval).minutes.do(
+            self._pm_user_stream_health_monitor
+        )
 
         logger.info(
             f"Binance PM scheduled tasks registered: listenKey keepalive "
@@ -478,6 +491,35 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             return len(PMOrderIntent.get_unresolved())
         except Exception:
             return -1
+
+    def _pm_pending_reduce_only_exit_intent(self, trade: Trade) -> PMOrderIntent | None:
+        """Return a durable unresolved normal reduce-only exit for this Trade.
+
+        A timeout-uncertain PM exit must be resolved by its original client id,
+        never followed by a fresh client id every strategy loop.  Conditional
+        stop protection is intentionally excluded: it may coexist with a normal
+        reduce-only exit until the trade lifecycle cancels it.
+
+        If the intent store itself is unavailable, do not turn this de-dup helper
+        into a new risk-reduction blocker.  The exchange PM pipeline will still
+        fail closed before submitting because it cannot durably enqueue an intent.
+        """
+        if not self._pm_db_gate_active():
+            return None
+        try:
+            for intent in PMOrderIntent.get_unresolved_for_pair(trade.pair):
+                if (
+                    intent.kind == "order"
+                    and bool(intent.reduce_only)
+                    and str(intent.side or "").lower() == str(trade.exit_side).lower()
+                ):
+                    return intent
+        except Exception as exc:
+            self.log_once(
+                f"PM exit de-dup could not read pending intents for {trade.pair}: {exc}",
+                logger.warning,
+            )
+        return None
 
     def _pm_auto_recovery_due(self) -> bool:
         """Rate-limit auto-triggered FULL recovery sweeps.
@@ -902,6 +944,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             if dropped > self._pm_user_stream_last_events_dropped:
                 # Dropped events mean the local view may be stale: go DEGRADED immediately,
                 # block new orders and force a full reconciliation.
+                previous_dropped = self._pm_user_stream_last_events_dropped
                 self._pm_user_stream_state = "DEGRADED"
                 self._pm_block_orders("user_stream_events_dropped")
                 self._pm_user_stream_last_events_dropped = dropped
@@ -911,7 +954,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                         "type": RPCMessageType.WARNING,
                         "status": (
                             f"PM User Stream CRITICAL: dropped events increased from "
-                            f"{self._pm_user_stream_last_events_dropped} to {dropped}. "
+                            f"{previous_dropped} to {dropped}. "
                             "Stream state=DEGRADED; new orders BLOCKED; running order recovery."
                         ),
                     }
@@ -982,20 +1025,26 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                         self._pm_unblock_orders("user_stream_unavailable")
                         self._pm_unblock_orders("user_stream_events_dropped")
                         self._pm_unblock_orders("reconciliation_incomplete")
+                        self._pm_last_reconciliation_warning = None
                     else:
                         self._pm_block_orders("reconciliation_incomplete")
-                        self.rpc.send_msg(
-                            {
-                                "type": RPCMessageType.WARNING,
-                                "status": (
-                                    "PM FAIL-CLOSED: user stream is connected but "
-                                    "reconciliation did not complete cleanly "
-                                    f"({len(result['errors'])} error(s), unresolved "
-                                    f"intents={self._pm_unresolved_intent_count()}). "
-                                    "New orders stay BLOCKED (reconciliation_incomplete)."
-                                ),
-                            }
-                        )
+                        unresolved_count = self._pm_unresolved_intent_count()
+                        signature = (tuple(result["errors"]), unresolved_count)
+                        if signature != getattr(self, "_pm_last_reconciliation_warning", None):
+                            self._pm_last_reconciliation_warning = signature
+                            self.rpc.send_msg(
+                                {
+                                    "type": RPCMessageType.WARNING,
+                                    "status": (
+                                        "PM FAIL-CLOSED: user stream is connected but "
+                                        "reconciliation did not complete cleanly "
+                                        f"({len(result['errors'])} error(s), unresolved "
+                                        f"intents={unresolved_count}). New orders stay "
+                                        "BLOCKED (reconciliation_incomplete). Further identical "
+                                        "warnings are suppressed until the incident changes."
+                                    ),
+                                }
+                            )
                 else:
                     self._pm_block_orders("user_stream_unavailable")
                     self.rpc.send_msg(
@@ -1092,7 +1141,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         return False, False, False
 
     @pm_order_locked
-    def _pm_consume_user_stream_events(self) -> None:
+    def _pm_consume_user_stream_events(self, *, allow_account_risk_actions: bool = True) -> None:
         if (
             self.trading_mode != TradingMode.FUTURES
             or self.config["dry_run"]
@@ -1149,7 +1198,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
 
         if needs_wallet_update:
             self.wallets.update(require_update=True)
-        if needs_risk_check:
+        if needs_risk_check and allow_account_risk_actions:
             self._pm_risk_monitor()
         Trade.commit()
 
@@ -2178,6 +2227,105 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             return {"order_id": str(order.order_id), "trade_id": trade.id}
         return None
 
+    def _pm_adopt_orphan_reduce_only_order(
+        self, intent: dict[str, Any], exchange_order: CcxtOrder | dict[str, Any]
+    ) -> tuple[Trade, Order] | None:
+        """Adopt a provably-owned ACK->commit orphaned reduce-only exit.
+
+        This is deliberately narrow.  An ACKED intent alone is not enough to
+        claim an arbitrary exchange order.  Recovery is allowed only when the
+        durable intent, exchange response and exactly one local open Trade all
+        agree on instrument, client id, exchange id, exit side and full size.
+        Any ambiguity returns ``None`` and leaves the normal PM fail-closed gate
+        in place.
+        """
+        if intent.get("kind") != "order" or not bool(intent.get("reduce_only")):
+            return None
+        client_id = str(intent.get("client_id") or "")
+        exchange_id = str(exchange_order.get("id") or intent.get("exchange_order_id") or "")
+        if not client_id or not exchange_id:
+            return None
+        if intent.get("exchange_order_id") and str(intent.get("exchange_order_id")) != exchange_id:
+            return None
+        pair = self._pm_canonical_pair(str(intent.get("pair") or ""))
+        try:
+            order_pair = self._pm_canonical_pair(str(exchange_order.get("symbol") or pair))
+        except OperationalException:
+            return None
+        if order_pair != pair:
+            return None
+        exchange_client_id = str(exchange_order.get("clientOrderId") or "")
+        if exchange_client_id and exchange_client_id != client_id:
+            return None
+        info = exchange_order.get("info") if isinstance(exchange_order, dict) else None
+        info = info if isinstance(info, dict) else {}
+        reduce_only_evidence = info.get("reduceOnly", exchange_order.get("reduceOnly"))
+        if reduce_only_evidence is not None and str(reduce_only_evidence).lower() not in {"true", "1"}:
+            return None
+        side = str(exchange_order.get("side") or intent.get("side") or "").lower()
+        if side not in {"buy", "sell"}:
+            return None
+        try:
+            exchange_amount = float(exchange_order.get("amount") or 0)
+        except (TypeError, ValueError):
+            return None
+        if exchange_amount <= 0:
+            return None
+
+        # The durable intent stores contracts while the local Trade stores base
+        # amount.  Validate the intent against the parsed exchange amount after
+        # contract conversion when possible.
+        intent_amount = intent.get("amount")
+        if intent_amount is not None:
+            try:
+                expected = float(intent_amount)
+                if hasattr(self.exchange, "_contracts_to_amount"):
+                    expected = float(self.exchange._contracts_to_amount(pair, expected))
+                tol = max(abs(exchange_amount) * 1e-6, 1e-9)
+                if not isclose(expected, exchange_amount, rel_tol=1e-6, abs_tol=tol):
+                    return None
+            except (TypeError, ValueError):
+                return None
+
+        candidates: list[Trade] = []
+        for trade in Trade.get_open_trades():
+            if not trade.is_open or self._pm_canonical_pair(trade.pair) != pair:
+                continue
+            if side != trade.exit_side:
+                continue
+            tol = max(abs(float(trade.amount)) * 1e-6, 1e-9)
+            if not isclose(float(trade.amount), exchange_amount, rel_tol=1e-6, abs_tol=tol):
+                continue
+            # A different local exit order means ownership is no longer unique.
+            if any(
+                o.ft_order_side == trade.exit_side and str(o.order_id) != exchange_id
+                for o in trade.orders
+                if o.ft_order_side != "stoploss"
+            ):
+                continue
+            candidates.append(trade)
+        if len(candidates) != 1:
+            return None
+
+        trade = candidates[0]
+        if Order.order_by_id(exchange_id) is not None:
+            return None
+        order_obj = Order.parse_from_ccxt_object(
+            exchange_order, trade.pair, trade.exit_side, exchange_amount
+        )
+        order_obj.ft_order_tag = trade.exit_reason or "pm_recovered_exit"
+        trade.exit_reason = trade.exit_reason or "pm_recovered_exit"
+        trade.orders.append(order_obj)
+        logger.warning(
+            "PM recovery adopted provably-owned reduce-only orphan %s (clientId=%s) "
+            "into Trade #%s %s; local lifecycle reconciliation will now finish it.",
+            exchange_id,
+            client_id,
+            trade.id,
+            trade.pair,
+        )
+        return trade, order_obj
+
     # ---- Signal decision ledger + unified data-failure policy ----
 
     def _pm_ledger_enabled(self) -> bool:
@@ -2548,8 +2696,23 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 or ""
             )
             local = self._pm_find_local_order(exchange_id, client_id, intent["pair"])
+            adopted: tuple[Trade, Order] | None = None
+            if local is None and result.get("order") is not None:
+                try:
+                    adopted = self._pm_adopt_orphan_reduce_only_order(intent, result["order"])
+                except Exception as e:
+                    Trade.session.rollback()
+                    logger.warning(
+                        "PM orphan adoption check failed for %s: %s", client_id, e
+                    )
+                if adopted is not None:
+                    trade, adopted_order = adopted
+                    local = {"order_id": str(adopted_order.order_id), "trade_id": trade.id}
             if local is not None:
                 try:
+                    # For an adopted orphan this commit is atomic with the newly
+                    # appended local Order row, restoring the missing ACK->commit
+                    # transaction boundary rather than creating a second window.
                     self.exchange.pm_mark_intent_linked(
                         client_id, local["order_id"], local["trade_id"]
                     )
@@ -2558,8 +2721,19 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                         f"PM pending intent {client_id} LINKED to local order "
                         f"{local['order_id']} (trade {local['trade_id']})."
                     )
+                    if adopted is not None:
+                        trade, adopted_order = adopted
+                        status = str((result.get("order") or {}).get("status") or "").lower()
+                        if status in constants.NON_OPEN_EXCHANGE_STATES or status == "filled":
+                            self.update_trade_state(
+                                trade,
+                                adopted_order.order_id,
+                                action_order=result["order"],
+                                send_msg=False,
+                            )
                 except Exception as e:
-                    logger.warning(f"Could not link PM intent {client_id}: {e}")
+                    Trade.session.rollback()
+                    logger.warning(f"Could not link/reconcile PM intent {client_id}: {e}")
                     report["unresolved"] += 1
                 continue
             report["orphaned"] += 1
@@ -3071,28 +3245,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         self.update_all_liquidation_prices()
         self.update_funding_fees()
 
-        if (
-            self.trading_mode == TradingMode.FUTURES
-            and not self.config["dry_run"]
-            and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
-        ):
-            # 1) Resolve persisted order intents from before a crash/restart so a
-            #    timeout-uncertain order can never be resubmitted twice.
-            self._pm_recover_pending_intents()
-            # 2) Rebuild the real-order-id -> strategy-id map from the persistent
-            #    local stoploss orders BEFORE the listenKey/user stream may deliver
-            #    child-order events (post-restart child events must never be
-            #    classified as foreign).
-            self._pm_rebuild_actual_order_map()
-            # 3) Fail-closed startup consistency check: exchange (PAPI) positions / open
-            #    orders / conditional stoploss orders must match the local database
-            #    before the bot may open new orders.
-            consistency = self._pm_startup_consistency_check()
-            self._pm_apply_startup_consistency(consistency)
-            # 4) Cold reconcile: rebuild order/ownership state, resolve durable
-            #    stream incidents, verify position-quantity and stop-protection
-            #    invariants. STARTING never silently becomes RUNNING.
-            self._pm_order_recovery()
+        self._pm_cold_start_reconcile()
 
         if (
             self.trading_mode == TradingMode.FUTURES
@@ -3101,6 +3254,32 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             and not self._pm_listen_key
         ):
             self._pm_create_listen_key()
+
+    def _pm_cold_start_reconcile(self) -> None:
+        """Run PM crash recovery independently of the trading RUNNING state.
+
+        Persisted STOPPED is a legitimate operator state and must never prevent
+        exchange/local bookkeeping from converging after a crash.  This routine
+        performs only PM reconciliation/protection maintenance; it does not arm
+        entries or transition the bot to RUNNING.
+        """
+        if not (
+            self.trading_mode == TradingMode.FUTURES
+            and not self.config["dry_run"]
+            and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+        ):
+            return
+        # 1) Resolve durable intents first (including the narrow, provable
+        #    reduce-only ACK->commit orphan adoption path).
+        self._pm_recover_pending_intents()
+        # 2) Rebuild stoploss child-id ownership before any replayed stream event.
+        self._pm_rebuild_actual_order_map()
+        # 3) Verify full-account consistency before any future /start can expose
+        #    capital.  Failures remain latched fail-closed.
+        consistency = self._pm_startup_consistency_check()
+        self._pm_apply_startup_consistency(consistency)
+        # 4) Full idempotent order/position/protection reconcile.
+        self._pm_order_recovery()
 
     def process(self) -> None:
         """
@@ -3155,14 +3334,42 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         if self.state == State.RUNNING and self.get_free_open_trades():
             self.enter_positions()
         self._schedule.run_pending()
+        self._pm_maintenance_schedule.run_pending()
         Trade.commit()
         self.rpc.process_msg_queue(self.dataprovider._msg_queue)
         self.last_process = datetime.now(UTC)
 
     def process_stopped(self) -> None:
         """
-        Close all orders that were left open
+        Keep STOPPED non-trading while still allowing one cold PM reconciliation.
         """
+        if not getattr(self, "_pm_stopped_cold_reconcile_done", False):
+            # Set before the call so an exchange outage cannot create a tight
+            # retry/spam loop every worker throttle.  Scheduled/manual recovery
+            # remains available afterwards, and a later /start runs startup()
+            # with another full reconcile before entries can be considered.
+            self._pm_stopped_cold_reconcile_done = True
+            try:
+                self._pm_cold_start_reconcile()
+            except Exception as e:
+                self._pm_block_orders("reconciliation_incomplete")
+                logger.exception(
+                    "PM cold reconciliation while STOPPED failed; bot remains STOPPED "
+                    "and new exposure stays blocked: %s",
+                    e,
+                )
+        if (
+            self.trading_mode == TradingMode.FUTURES
+            and not self.config.get("dry_run", True)
+            and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+        ):
+            # Drain/process stream ownership while STOPPED so the bounded queue
+            # cannot fill with stale events.  Keep account-level risk actions
+            # disabled here: STOPPED must not force-close manual/external assets.
+            self._pm_consume_user_stream_events(allow_account_risk_actions=False)
+            self._pm_maintenance_schedule.run_pending()
+            Trade.commit()
+            self.last_process = datetime.now(UTC)
         if self.config["cancel_open_orders_on_exit"]:
             self.cancel_all_open_orders()
 
@@ -5057,6 +5264,37 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         :param exit_check: CheckTuple with signal and reason
         :return: True if it succeeds False
         """
+        # PM exit idempotency across timeout/ACK->commit windows.  If a
+        # reduce-only normal exit for this instrument is already unresolved,
+        # resolve THAT durable client id first instead of creating another one.
+        # This prevents the 15-second retry storm observed in production after
+        # an exchange-filled exit was missing its local Order commit.
+        pending_exit = self._pm_pending_reduce_only_exit_intent(trade)
+        if pending_exit is not None:
+            if self._pm_auto_recovery_due():
+                try:
+                    self._pm_recover_pending_intents()
+                except Exception as exc:
+                    logger.warning(
+                        "PM targeted pending-exit recovery failed for Trade #%s %s: %s",
+                        trade.id,
+                        trade.pair,
+                        exc,
+                    )
+                pending_exit = self._pm_pending_reduce_only_exit_intent(trade)
+            if not trade.is_open:
+                # Recovery may have adopted a terminal orphan and closed the Trade.
+                return False
+            if pending_exit is not None:
+                self.log_once(
+                    "Suppressing duplicate PM reduce-only exit for "
+                    f"Trade #{trade.id} {trade.pair}: unresolved intent "
+                    f"{pending_exit.client_id} state={pending_exit.state}; "
+                    "waiting for same-client-id reconciliation.",
+                    logger.warning,
+                )
+                return False
+
         trade.set_funding_fees(
             self.exchange.get_funding_fees(
                 pair=trade.pair,

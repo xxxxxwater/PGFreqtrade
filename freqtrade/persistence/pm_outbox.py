@@ -47,6 +47,8 @@ class PMOutbox(ModelBase):
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="PENDING")
     exchange_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     raw_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Permanent audit copy of the pre-send Trade ownership marker.
+    origin_trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     linked_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     linked_trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dispatch_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -89,6 +91,7 @@ class PMOutbox(ModelBase):
             "operation": self.operation,
             "state": self.state,
             "exchange_order_id": self.exchange_order_id,
+            "origin_trade_id": self.origin_trade_id,
             "linked_order_id": self.linked_order_id,
             "linked_trade_id": self.linked_trade_id,
             "dispatch_attempts": self.dispatch_attempts,

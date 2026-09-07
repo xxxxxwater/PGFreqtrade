@@ -109,6 +109,7 @@ class Binance(Exchange):
         "user_stream_recover_unmatched_orders",
         "monitor_interval_minutes",
         "order_recovery_interval_minutes",
+        "reconciliation_warning_reminder_minutes",
         "heartbeat_risk_cache_seconds",
         "max_leverage",
         "max_total_notional",
@@ -123,6 +124,7 @@ class Binance(Exchange):
         "data_failure_exit",
         "snapshot_cache_ttl_s",
         "user_stream_auto_recovery_cooldown_seconds",
+        "reconciliation_warning_reminder_minutes",
         "account_position_quantity_tolerance",
         "user_stream_journal_retention_days",
         "account_position_inflight_max_seconds",
@@ -979,6 +981,16 @@ class Binance(Exchange):
         PMOutbox = self._pm_outbox_model()
         operation = "conditional" if str(intent.get("kind")) == "conditional" else "order"
         pair_str = self._pm_response_pair((payload or {}).get("symbol"), intent.get("pair"))
+        origin_trade_id = intent.get("origin_trade_id")
+        if origin_trade_id is not None:
+            if isinstance(origin_trade_id, bool):
+                raise OperationalException("PM origin_trade_id must be a positive integer")
+            try:
+                origin_trade_id = int(origin_trade_id)
+            except (TypeError, ValueError) as e:
+                raise OperationalException("PM origin_trade_id must be a positive integer") from e
+            if origin_trade_id < 1:
+                raise OperationalException("PM origin_trade_id must be a positive integer")
         try:
             with pm_pipeline_lock(PMOrderIntent.session):
                 # Supersede stale same-kind PREPARED intents for the same pair:
@@ -1013,6 +1025,7 @@ class Binance(Exchange):
                     price=intent.get("price"),
                     stop_price=intent.get("stop_price"),
                     reduce_only=bool(intent.get("reduce_only", False)),
+                    origin_trade_id=origin_trade_id,
                     state="PREPARED",
                 )
                 PMOrderIntent.session.add(row)
@@ -1021,6 +1034,7 @@ class Binance(Exchange):
                         client_id=client_id,
                         operation=operation,
                         payload=json.dumps(payload or {}, default=str),
+                        origin_trade_id=origin_trade_id,
                         state="PENDING",
                     )
                 )
@@ -1435,7 +1449,9 @@ class Binance(Exchange):
                 return None
             raise
 
-    def pm_drain_outbox(self, limit: int = 50) -> dict[str, Any]:
+    def pm_drain_outbox(
+        self, limit: int = 50, *, allow_exposure_increasing: bool = True
+    ) -> dict[str, Any]:
         """
         Relay PENDING outbox rows to the exchange exactly once (advisory lock).
 
@@ -1445,12 +1461,18 @@ class Binance(Exchange):
         """
         PMOutbox = self._pm_outbox_model()
         PMOrderIntent = self._pm_intent_model()
-        report: dict[str, Any] = {"drained": 0, "acked": 0, "rejected": 0, "deferred": 0, "errors": []}
+        report: dict[str, Any] = {
+            "drained": 0,
+            "acked": 0,
+            "rejected": 0,
+            "deferred": 0,
+            "suppressed_exposure_increasing": 0,
+            "errors": [],
+        }
         try:
             with pm_pipeline_lock(PMOutbox.session):
                 pending = PMOutbox.get_pending(limit)
                 for row in pending:
-                    report["drained"] += 1
                     try:
                         intent = PMOrderIntent.get_by_client_id(row.client_id)
                         if intent is None:
@@ -1459,6 +1481,14 @@ class Binance(Exchange):
                             row.state = "DEAD"
                             row.last_error = "intent row missing"
                             continue
+                        if not allow_exposure_increasing and intent.increases_exposure:
+                            # Operator STOPPED is an execution boundary, not merely a
+                            # strategy boundary.  Keep the PREPARED/PENDING rows durable
+                            # and untouched for a later explicit /start recovery; never
+                            # POST entry/DCA exposure from STOPPED maintenance.
+                            report["suppressed_exposure_increasing"] += 1
+                            continue
+                        report["drained"] += 1
                         payload = json.loads(row.payload or "{}")
                         pair = self._pm_response_pair(payload.get("symbol"), intent.pair)
                         if row.operation == "conditional":
@@ -1795,6 +1825,7 @@ class Binance(Exchange):
         params: dict[str, Any],
         *,
         log_tag: str,
+        origin_trade_id: int | None = None,
     ) -> CcxtOrder:
         """
         Submit an order to the PM PAPI endpoint with idempotency guarantees.
@@ -1830,6 +1861,7 @@ class Binance(Exchange):
                 "amount": amount_contracts,
                 "price": rate_for_order,
                 "reduce_only": reduce_only,
+                "origin_trade_id": origin_trade_id,
                 "ts": time.time(),
             },
             payload=request,
@@ -2739,6 +2771,7 @@ class Binance(Exchange):
         reduceOnly: bool = False,
         initial_order: bool = True,
         entry_mode: EntryExecuteMode = "initial",
+        origin_trade_id: int | None = None,
     ) -> CcxtOrder:
         if not self._is_portfolio_margin() or self._config["dry_run"]:
             return super().create_order(
@@ -2779,6 +2812,7 @@ class Binance(Exchange):
                     rate_for_order,
                     params,
                     log_tag="papi_create_order",
+                    origin_trade_id=origin_trade_id,
                 )
                 outcome = "ack"
             else:
@@ -2821,6 +2855,7 @@ class Binance(Exchange):
                         rate_for_order,
                         params,
                         log_tag="papi_create_order",
+                        origin_trade_id=origin_trade_id,
                     )
                     outcome = "ack"
             return order

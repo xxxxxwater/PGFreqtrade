@@ -1306,6 +1306,16 @@ CONF_SCHEMA = {
                             "minimum": 0,
                             "default": 60,
                         },
+                        "reconciliation_warning_reminder_minutes": {
+                            "description": (
+                                "Minutes between low-frequency reminder notifications for an "
+                                "unchanged PM reconciliation incident after the first alert. "
+                                "Default: 30."
+                            ),
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 30,
+                        },
                         "account_position_quantity_tolerance": {
                             "description": (
                                 "Relative tolerance for the full-account position quantity "

@@ -96,3 +96,50 @@ def test_exposure_increasing_intent_does_not_block_risk_reducing_exit(mocker, pm
     _intent(trade, reduce_only=False, side=trade.entry_side, client_id="ft-entry-pending")
 
     assert bot._pm_pending_reduce_only_exit_intent(trade) is None
+
+
+def test_execute_exit_passes_origin_trade_id_to_exchange_before_submit(mocker, pm_conf):
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = make_open_trade(pm_conf, order_id="entry-origin", side="buy", amount=11.0)
+    entry = trade.orders[-1]
+    entry.status = "closed"
+    entry.ft_is_open = False
+    entry.filled = trade.amount
+    entry.remaining = 0.0
+    entry.average = trade.open_rate
+    entry.order_filled_date = trade.open_date
+    Trade.commit()
+    bot.strategy.confirm_trade_exit = MagicMock(return_value=True)
+    bot.exchange.create_order = MagicMock(
+        return_value={
+            "id": "exit-origin",
+            "clientOrderId": "ft-origin",
+            "symbol": trade.pair,
+            "type": "limit",
+            "side": trade.exit_side,
+            "amount": trade.amount,
+            "filled": 0.0,
+            "remaining": trade.amount,
+            "price": trade.open_rate,
+            "average": None,
+            "cost": 0.0,
+            "status": "open",
+            "fee": None,
+            "trades": [],
+            "timestamp": None,
+            "datetime": None,
+            "lastTradeTimestamp": None,
+            "timeInForce": "GTC",
+            "info": {"reduceOnly": True},
+        }
+    )
+    bot.exchange.pm_link_intent_in_session = MagicMock()
+
+    result = bot.execute_trade_exit(
+        trade,
+        limit=trade.open_rate,
+        exit_check=ExitCheckTuple(exit_type=ExitType.ROI),
+    )
+
+    assert result is True
+    assert bot.exchange.create_order.call_args.kwargs["origin_trade_id"] == trade.id

@@ -138,6 +138,21 @@ restore_smoke() {
         fi
     done
 
+    # Schema-level protection evidence must survive restore too.  Table presence
+    # alone is insufficient: crash recovery now depends on the pre-send
+    # origin_trade_id marker in BOTH the short-lived intent and permanent outbox.
+    for SPEC in "pm_order_intents:origin_trade_id" "pm_outbox:origin_trade_id"; do
+        TABLE=${SPEC%%:*}
+        COLUMN=${SPEC##*:}
+        COLUMN_CHECK=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='$TABLE' AND column_name='$COLUMN')")
+        if [ "$COLUMN_CHECK" != "t" ]; then
+            fail "restore smoke: required column $TABLE.$COLUMN missing after restore"
+            dropdb -w -h "$PG_HOST" -U "$PG_USER" --if-exists "$SCRATCH" 2>/dev/null || true
+            return 1
+        fi
+    done
+
     # Key referential sanity: order rows must reference an existing trade.
     # The query exit code is checked AND only an explicit numeric "0" is
     # accepted - an empty/failed query must fail the smoke test, never pass.

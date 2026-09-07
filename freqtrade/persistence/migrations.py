@@ -13,10 +13,15 @@ logger = logging.getLogger(__name__)
 # ``TIMESTAMP`` is deliberately used instead of SQLite's permissive ``DATETIME``
 # spelling.  PostgreSQL does not have a DATETIME type, while SQLite accepts
 # TIMESTAMP as a type affinity, so this is valid for both supported databases.
+_PM_OUTBOX_NEW_COLUMNS = [
+    ("origin_trade_id", "INTEGER"),
+]
+
 _PM_INTENT_NEW_COLUMNS = [
     ("exchange_order_id", "VARCHAR(64)"),
     ("raw_response", "TEXT"),
     ("acked_at", "TIMESTAMP"),
+    ("origin_trade_id", "INTEGER"),
     ("linked_order_id", "VARCHAR(64)"),
     ("linked_trade_id", "INTEGER"),
     ("linked_at", "TIMESTAMP"),
@@ -40,11 +45,21 @@ def migrate_pm_tables(engine: Engine) -> None:
         return
     columns = {col["name"] for col in inspector.get_columns("pm_order_intents")}
     missing = [(name, sqltype) for name, sqltype in _PM_INTENT_NEW_COLUMNS if name not in columns]
+    outbox_missing: list[tuple[str, str]] = []
+    if "pm_outbox" in tables:
+        outbox_columns = {col["name"] for col in inspector.get_columns("pm_outbox")}
+        outbox_missing = [
+            (name, sqltype) for name, sqltype in _PM_OUTBOX_NEW_COLUMNS if name not in outbox_columns
+        ]
     migrated_pending = 0
     with engine.begin() as connection:
         for name, sqltype in missing:
             connection.execute(
                 text(f'ALTER TABLE pm_order_intents ADD COLUMN "{name}" {sqltype}')
+            )
+        for name, sqltype in outbox_missing:
+            connection.execute(
+                text(f'ALTER TABLE pm_outbox ADD COLUMN "{name}" {sqltype}')
             )
         # All known PM schemas have a state column.  Keep this guard so an
         # unrelated/corrupt table produces no unsafe SQL; the normal model
@@ -60,10 +75,12 @@ def migrate_pm_tables(engine: Engine) -> None:
             )
             # SQLAlchemy reports -1 for drivers where rowcount is unavailable.
             migrated_pending = max(0, result.rowcount or 0)
-    if missing or migrated_pending:
+    if missing or outbox_missing or migrated_pending:
         logger.info(
-            "PM order-intent table migrated: added columns %s; migrated %s legacy PENDING rows.",
+            "PM persistence migrated: intent columns %s; outbox columns %s; "
+            "migrated %s legacy PENDING rows.",
             [name for name, _ in missing],
+            [name for name, _ in outbox_missing],
             migrated_pending,
         )
 

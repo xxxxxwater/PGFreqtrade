@@ -9,7 +9,7 @@ from hashlib import sha256
 from copy import deepcopy
 from datetime import UTC, datetime, time, timedelta
 from math import isclose
-from threading import RLock
+from threading import RLock, local
 from time import sleep
 from typing import Any
 
@@ -398,6 +398,8 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self._pm_last_journal_purge_at: float | None = None
         if not hasattr(self, "_pm_unresolved_alert_sent"):
             self._pm_unresolved_alert_sent = False
+        if not hasattr(self, "_pm_last_reconciliation_warning_at"):
+            self._pm_last_reconciliation_warning_at: datetime | None = None
         if not hasattr(self, "_pm_last_success_reconcile_time"):
             self._pm_last_success_reconcile_time: datetime | None = None
         if not hasattr(self, "_pm_last_reconcile_result"):
@@ -520,6 +522,64 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 logger.warning,
             )
         return None
+
+    def _pm_reconciliation_incident_signature(self, result: dict[str, Any]) -> tuple:
+        """Durable event-level identity for reconciliation warning de-duplication."""
+        try:
+            intents = tuple(
+                sorted(
+                    (
+                        str(row.client_id),
+                        str(row.state),
+                        str(row.exchange_order_id or ""),
+                        str(row.origin_trade_id or ""),
+                        str(row.last_error or ""),
+                    )
+                    for row in PMOrderIntent.get_unresolved()
+                )
+            )
+        except Exception as exc:
+            intents = (("intent-store-unavailable", exc.__class__.__name__),)
+        try:
+            incidents = tuple(
+                sorted(
+                    (
+                        int(row.id or 0),
+                        str(row.pair),
+                        str(row.exchange_order_id),
+                        str(row.client_id or ""),
+                        str(row.reason or ""),
+                        float(row.max_cumulative_filled or 0.0),
+                        bool(row.saw_filled),
+                    )
+                    for row in PMStreamJournal.get_unresolved()
+                )
+            )
+        except Exception as exc:
+            incidents = ((0, "journal-unavailable", exc.__class__.__name__),)
+        errors = tuple(sorted(str(error) for error in result.get("errors", [])))
+        return errors, intents, incidents
+
+    def _pm_reconciliation_warning_due(self, signature: tuple) -> tuple[bool, bool, int]:
+        """Return (send, is_reminder, interval_minutes) for one incident."""
+        now = datetime.now(UTC)
+        risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
+        reminder_minutes = max(
+            1, int(risk_cfg.get("reconciliation_warning_reminder_minutes", 30))
+        )
+        previous = getattr(self, "_pm_last_reconciliation_warning", None)
+        last_at = getattr(self, "_pm_last_reconciliation_warning_at", None)
+        changed = signature != previous
+        reminder_due = bool(
+            not changed
+            and last_at is not None
+            and now - last_at >= timedelta(minutes=reminder_minutes)
+        )
+        if changed or reminder_due or last_at is None:
+            self._pm_last_reconciliation_warning = signature
+            self._pm_last_reconciliation_warning_at = now
+            return True, reminder_due and not changed, reminder_minutes
+        return False, False, reminder_minutes
 
     def _pm_auto_recovery_due(self) -> bool:
         """Rate-limit auto-triggered FULL recovery sweeps.
@@ -1026,12 +1086,20 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                         self._pm_unblock_orders("user_stream_events_dropped")
                         self._pm_unblock_orders("reconciliation_incomplete")
                         self._pm_last_reconciliation_warning = None
+                        self._pm_last_reconciliation_warning_at = None
                     else:
                         self._pm_block_orders("reconciliation_incomplete")
                         unresolved_count = self._pm_unresolved_intent_count()
-                        signature = (tuple(result["errors"]), unresolved_count)
-                        if signature != getattr(self, "_pm_last_reconciliation_warning", None):
-                            self._pm_last_reconciliation_warning = signature
+                        signature = self._pm_reconciliation_incident_signature(result)
+                        send_warning, is_reminder, reminder_minutes = (
+                            self._pm_reconciliation_warning_due(signature)
+                        )
+                        if send_warning:
+                            reminder_text = (
+                                f" Incident is still unresolved after {reminder_minutes} minute(s)."
+                                if is_reminder
+                                else ""
+                            )
                             self.rpc.send_msg(
                                 {
                                     "type": RPCMessageType.WARNING,
@@ -1040,8 +1108,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                                         "reconciliation did not complete cleanly "
                                         f"({len(result['errors'])} error(s), unresolved "
                                         f"intents={unresolved_count}). New orders stay "
-                                        "BLOCKED (reconciliation_incomplete). Further identical "
-                                        "warnings are suppressed until the incident changes."
+                                        "BLOCKED (reconciliation_incomplete). Event-level "
+                                        "duplicates are suppressed; unchanged incidents are "
+                                        f"reminded every {reminder_minutes} minute(s)."
+                                        f"{reminder_text}"
                                     ),
                                 }
                             )
@@ -2188,6 +2258,12 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 )
         return offenders
 
+    def _pm_origin_trade_kwargs(self, trade: Trade | None) -> dict[str, int]:
+        """Attach immutable pre-send Trade ownership only for live Binance PM."""
+        if trade is None or trade.id is None or not self._pm_db_gate_active():
+            return {}
+        return {"origin_trade_id": int(trade.id)}
+
     def _pm_link_intent_for_order(
         self, exchange_order: dict, trade: Trade, local_order_id: str
     ) -> None:
@@ -2230,86 +2306,95 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
     def _pm_adopt_orphan_reduce_only_order(
         self, intent: dict[str, Any], exchange_order: CcxtOrder | dict[str, Any]
     ) -> tuple[Trade, Order] | None:
-        """Adopt a provably-owned ACK->commit orphaned reduce-only exit.
+        """Adopt only a fully evidenced ACK->commit orphaned reduce-only exit.
 
-        This is deliberately narrow.  An ACKED intent alone is not enough to
-        claim an arbitrary exchange order.  Recovery is allowed only when the
-        durable intent, exchange response and exactly one local open Trade all
-        agree on instrument, client id, exchange id, exit side and full size.
-        Any ambiguity returns ``None`` and leaves the normal PM fail-closed gate
-        in place.
+        Binance identity fields are never filled from the intent.  The durable
+        intent is a second source to compare against, not a substitute for missing
+        exchange evidence.  Trade ownership comes only from ``origin_trade_id``
+        persisted before POST.
         """
-        if intent.get("kind") != "order" or not bool(intent.get("reduce_only")):
-            return None
         client_id = str(intent.get("client_id") or "")
-        exchange_id = str(exchange_order.get("id") or intent.get("exchange_order_id") or "")
-        if not client_id or not exchange_id:
+        if not client_id:
             return None
-        if intent.get("exchange_order_id") and str(intent.get("exchange_order_id")) != exchange_id:
+        persisted = PMOrderIntent.get_by_client_id(client_id)
+        if persisted is None or persisted.state != "ACKED":
             return None
-        pair = self._pm_canonical_pair(str(intent.get("pair") or ""))
-        try:
-            order_pair = self._pm_canonical_pair(str(exchange_order.get("symbol") or pair))
-        except OperationalException:
+        if persisted.kind != "order" or not bool(persisted.reduce_only):
             return None
-        if order_pair != pair:
+        if persisted.origin_trade_id is None or int(persisted.origin_trade_id) < 1:
             return None
+        if not persisted.exchange_order_id:
+            return None
+
+        exchange_id = str(exchange_order.get("id") or "")
+        exchange_symbol = str(exchange_order.get("symbol") or "")
         exchange_client_id = str(exchange_order.get("clientOrderId") or "")
-        if exchange_client_id and exchange_client_id != client_id:
+        exchange_side = str(exchange_order.get("side") or "").lower()
+        if not all((exchange_id, exchange_symbol, exchange_client_id, exchange_side)):
             return None
+        if exchange_side not in {"buy", "sell"}:
+            return None
+        if exchange_client_id != client_id:
+            return None
+        if str(persisted.exchange_order_id) != exchange_id:
+            return None
+
         info = exchange_order.get("info") if isinstance(exchange_order, dict) else None
         info = info if isinstance(info, dict) else {}
-        reduce_only_evidence = info.get("reduceOnly", exchange_order.get("reduceOnly"))
-        if reduce_only_evidence is not None and str(reduce_only_evidence).lower() not in {"true", "1"}:
+        missing = object()
+        reduce_only_evidence = exchange_order.get("reduceOnly", missing)
+        if reduce_only_evidence is missing:
+            reduce_only_evidence = info.get("reduceOnly", missing)
+        if reduce_only_evidence is missing:
             return None
-        side = str(exchange_order.get("side") or intent.get("side") or "").lower()
-        if side not in {"buy", "sell"}:
+        if str(reduce_only_evidence).lower() not in {"true", "1"}:
             return None
+
         try:
-            exchange_amount = float(exchange_order.get("amount") or 0)
+            exchange_amount = float(exchange_order.get("amount"))
         except (TypeError, ValueError):
             return None
         if exchange_amount <= 0:
             return None
 
-        # The durable intent stores contracts while the local Trade stores base
-        # amount.  Validate the intent against the parsed exchange amount after
-        # contract conversion when possible.
-        intent_amount = intent.get("amount")
-        if intent_amount is not None:
-            try:
-                expected = float(intent_amount)
-                if hasattr(self.exchange, "_contracts_to_amount"):
-                    expected = float(self.exchange._contracts_to_amount(pair, expected))
-                tol = max(abs(exchange_amount) * 1e-6, 1e-9)
-                if not isclose(expected, exchange_amount, rel_tol=1e-6, abs_tol=tol):
-                    return None
-            except (TypeError, ValueError):
+        try:
+            pair = self._pm_canonical_pair(str(persisted.pair or ""))
+            order_pair = self._pm_canonical_pair(exchange_symbol)
+        except OperationalException:
+            return None
+        if order_pair != pair:
+            return None
+        if str(persisted.side or "").lower() != exchange_side:
+            return None
+        if persisted.amount is None:
+            return None
+        try:
+            expected = float(persisted.amount)
+            if hasattr(self.exchange, "_contracts_to_amount"):
+                expected = float(self.exchange._contracts_to_amount(pair, expected))
+            tol = max(abs(exchange_amount) * 1e-6, 1e-9)
+            if not isclose(expected, exchange_amount, rel_tol=1e-6, abs_tol=tol):
                 return None
-
-        candidates: list[Trade] = []
-        for trade in Trade.get_open_trades():
-            if not trade.is_open or self._pm_canonical_pair(trade.pair) != pair:
-                continue
-            if side != trade.exit_side:
-                continue
-            tol = max(abs(float(trade.amount)) * 1e-6, 1e-9)
-            if not isclose(float(trade.amount), exchange_amount, rel_tol=1e-6, abs_tol=tol):
-                continue
-            # A different local exit order means ownership is no longer unique.
-            if any(
-                o.ft_order_side == trade.exit_side and str(o.order_id) != exchange_id
-                for o in trade.orders
-                if o.ft_order_side != "stoploss"
-            ):
-                continue
-            candidates.append(trade)
-        if len(candidates) != 1:
+        except (TypeError, ValueError):
             return None
 
-        trade = candidates[0]
+        trade = Trade.session.get(Trade, int(persisted.origin_trade_id))
+        if trade is None or not trade.is_open:
+            return None
+        if self._pm_canonical_pair(trade.pair) != pair or exchange_side != trade.exit_side:
+            return None
+        tol = max(abs(float(trade.amount)) * 1e-6, 1e-9)
+        if not isclose(float(trade.amount), exchange_amount, rel_tol=1e-6, abs_tol=tol):
+            return None
+        if any(
+            o.ft_order_side == trade.exit_side and str(o.order_id) != exchange_id
+            for o in trade.orders
+            if o.ft_order_side != "stoploss"
+        ):
+            return None
         if Order.order_by_id(exchange_id) is not None:
             return None
+
         order_obj = Order.parse_from_ccxt_object(
             exchange_order, trade.pair, trade.exit_side, exchange_amount
         )
@@ -2317,12 +2402,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         trade.exit_reason = trade.exit_reason or "pm_recovered_exit"
         trade.orders.append(order_obj)
         logger.warning(
-            "PM recovery adopted provably-owned reduce-only orphan %s (clientId=%s) "
-            "into Trade #%s %s; local lifecycle reconciliation will now finish it.",
-            exchange_id,
-            client_id,
-            trade.id,
-            trade.pair,
+            "PM recovery adopted fully-evidenced reduce-only orphan %s "
+            "(clientId=%s, originTrade=%s) into Trade #%s %s; local lifecycle "
+            "reconciliation will now finish it.",
+            exchange_id, client_id, persisted.origin_trade_id, trade.id, trade.pair
         )
         return trade, order_obj
 
@@ -2605,7 +2688,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self._pm_unblock_orders("reconciliation_incomplete")
 
     @pm_order_locked
-    def _pm_recover_pending_intents(self) -> dict[str, Any]:
+    def _pm_recover_pending_intents(
+        self, *, allow_exposure_increasing_relay: bool = True, preserve_operator_stop: bool = False
+    ) -> dict[str, Any]:
         """
         Crash/restart recovery for the PM order pipeline.
 
@@ -2636,7 +2721,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         # 0) Relay undispatched outbox rows first (advisory-locked, idempotent).
         if hasattr(self.exchange, "pm_drain_outbox"):
             try:
-                report["outbox"] = self.exchange.pm_drain_outbox()
+                report["outbox"] = self.exchange.pm_drain_outbox(
+                    allow_exposure_increasing=allow_exposure_increasing_relay
+                )
             except Exception as e:
                 logger.warning(f"PM outbox relay failed at startup: {e}")
                 report["outbox"] = {"errors": [f"{e.__class__.__name__}: {e}"]}
@@ -2646,14 +2733,15 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             # Fail-closed: an unreadable intent store must never be treated as empty.
             logger.warning(f"Could not read PM pending order intents: {e}")
             report["store_error"] = f"{e.__class__.__name__}: {e}"
-            self.set_state(State.PAUSED)
+            if not (preserve_operator_stop and self.state == State.STOPPED):
+                self.set_state(State.PAUSED)
             self._pm_block_orders("intent_store_unavailable")
             self.rpc.send_msg(
                 {
                     "type": RPCMessageType.WARNING,
                     "status": (
                         "PM FAIL-CLOSED: the order intent store could not be read at "
-                        f"startup ({e}). Bot PAUSED; new orders BLOCKED."
+                        f"startup ({e}). Bot {self.state.name}; new orders BLOCKED."
                     ),
                 }
             )
@@ -2958,18 +3046,30 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             result["status"] = "mismatch"
         return result
 
-    def _pm_apply_startup_consistency(self, result: dict[str, Any]) -> None:
-        """Apply the configured startup_consistency_mode to a consistency report."""
+    def _pm_apply_startup_consistency(
+        self,
+        result: dict[str, Any],
+        *,
+        preserve_operator_stop: bool = False,
+        allow_exchange_mutations: bool = True,
+    ) -> None:
+        """Apply startup consistency without violating an operator STOPPED boundary."""
+
+        def fail_closed_pause() -> str:
+            if preserve_operator_stop and self.state == State.STOPPED:
+                return "STOPPED"
+            self.set_state(State.PAUSED)
+            return "PAUSED"
         if result["status"] == "error":
             # The consistency check itself failed - never start trading blind.
-            self.set_state(State.PAUSED)
+            fail_closed_state = fail_closed_pause()
             self._pm_block_orders("startup_consistency_error")
             self.rpc.send_msg(
                 {
                     "type": RPCMessageType.WARNING,
                     "status": (
                         "PM FAIL-CLOSED: startup consistency check could not complete "
-                        f"({result.get('error')}). Bot PAUSED; new orders BLOCKED."
+                        f"({result.get('error')}). Bot {fail_closed_state}; new orders BLOCKED."
                     ),
                 }
             )
@@ -2999,6 +3099,20 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 ),
             }
         )
+
+        if mode == "cancel" and not allow_exchange_mutations:
+            self._pm_block_orders("startup_consistency_mismatch")
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        "PM STOPPED RECOVERY: startup_consistency_mode=cancel is "
+                        "suppressed while operator STOPPED. No unmatched exchange "
+                        "orders are canceled; mismatch remains fail-closed."
+                    ),
+                }
+            )
+            mode = "pause"
 
         if mode == "cancel":
             cancelled = 0
@@ -3071,7 +3185,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     "proceeding without blocking."
                 )
             else:
-                self.set_state(State.PAUSED)
+                fail_closed_state = fail_closed_pause()
                 self._pm_block_orders("startup_consistency_mismatch")
                 self.rpc.send_msg(
                     {
@@ -3079,7 +3193,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                         "status": (
                             "PM FAIL-CLOSED (startup cancel mode): "
                             f"{failed} cancel failure(s); second consistency check "
-                            f"status={verify['status']}. Bot PAUSED; new orders BLOCKED "
+                            f"status={verify['status']}. Bot {fail_closed_state}; new orders BLOCKED "
                             "until unknown orders are gone on the exchange."
                         ),
                     }
@@ -3087,27 +3201,27 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
 
         if mode in {"pause", "cancel"} and unknown_positions:
             # Unmatched exchange positions cannot be auto-resolved safely - pause.
-            self.set_state(State.PAUSED)
+            fail_closed_state = fail_closed_pause()
             self._pm_block_orders("startup_consistency_mismatch")
             self.rpc.send_msg(
                 {
                     "type": RPCMessageType.WARNING,
                     "status": (
                         "PM FAIL-CLOSED: exchange positions exist without local trade "
-                        "records. Bot PAUSED; new orders BLOCKED. Manual reconciliation "
+                        f"records. Bot {fail_closed_state}; new orders BLOCKED. Manual reconciliation "
                         "required before resuming."
                     ),
                 }
             )
         elif mode == "pause" and (unknown_orders or unknown_conditional_orders):
-            self.set_state(State.PAUSED)
+            fail_closed_state = fail_closed_pause()
             self._pm_block_orders("startup_consistency_mismatch")
             self.rpc.send_msg(
                 {
                     "type": RPCMessageType.WARNING,
                     "status": (
                         "PM FAIL-CLOSED: exchange open orders (normal or conditional) "
-                        "exist without local order records. Bot PAUSED; new orders "
+                        f"exist without local order records. Bot {fail_closed_state}; new orders "
                         "BLOCKED. Manual reconciliation required before resuming."
                     ),
                 }
@@ -3116,7 +3230,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         if mode == "pause" and (local_flat_trades or local_missing_orders):
             # Reverse direction: the local database claims state the exchange does
             # not confirm. Never auto-mutate - pause and require manual review.
-            self.set_state(State.PAUSED)
+            fail_closed_state = fail_closed_pause()
             self._pm_block_orders("startup_consistency_mismatch")
             self.rpc.send_msg(
                 {
@@ -3124,7 +3238,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     "status": (
                         "PM FAIL-CLOSED: local database records that the exchange does "
                         "NOT confirm (open trade flat on the exchange / open order "
-                        "missing on the exchange). Bot PAUSED; new orders BLOCKED. "
+                        f"missing on the exchange). Bot {fail_closed_state}; new orders BLOCKED. "
                         "Manual reconciliation required before resuming."
                     ),
                 }
@@ -3153,6 +3267,19 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         effect in memory, but the failure is logged CRITICAL and pushed to
         the operator: a restart could resurrect the previous (stale) state.
         """
+        scope = getattr(self, "_pm_operator_state_scope", None)
+        if (
+            scope is not None
+            and getattr(scope, "preserve_stopped", False)
+            and getattr(self, "state", None) == State.STOPPED
+            and state != State.STOPPED
+        ):
+            logger.warning(
+                "PM STOPPED recovery suppressed internal state transition STOPPED -> %s; "
+                "only an operator command may leave STOPPED during this scope.",
+                state.name,
+            )
+            return
         self.state = state
         if not hasattr(self, "config"):
             return
@@ -3255,7 +3382,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         ):
             self._pm_create_listen_key()
 
-    def _pm_cold_start_reconcile(self) -> None:
+    def _pm_cold_start_reconcile(self, *, stopped_mode: bool = False) -> None:
         """Run PM crash recovery independently of the trading RUNNING state.
 
         Persisted STOPPED is a legitimate operator state and must never prevent
@@ -3269,17 +3396,32 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
         ):
             return
-        # 1) Resolve durable intents first (including the narrow, provable
-        #    reduce-only ACK->commit orphan adoption path).
-        self._pm_recover_pending_intents()
-        # 2) Rebuild stoploss child-id ownership before any replayed stream event.
-        self._pm_rebuild_actual_order_map()
-        # 3) Verify full-account consistency before any future /start can expose
-        #    capital.  Failures remain latched fail-closed.
-        consistency = self._pm_startup_consistency_check()
-        self._pm_apply_startup_consistency(consistency)
-        # 4) Full idempotent order/position/protection reconcile.
-        self._pm_order_recovery()
+        if not hasattr(self, "_pm_operator_state_scope"):
+            self._pm_operator_state_scope = local()
+        previous_guard = getattr(self._pm_operator_state_scope, "preserve_stopped", False)
+        if stopped_mode and self.state == State.STOPPED:
+            self._pm_operator_state_scope.preserve_stopped = True
+        try:
+            # 1) Resolve durable intents first (including the narrow, provable
+            #    reduce-only ACK->commit orphan adoption path).
+            self._pm_recover_pending_intents(
+                allow_exposure_increasing_relay=not stopped_mode,
+                preserve_operator_stop=stopped_mode,
+            )
+            # 2) Rebuild stoploss child-id ownership before any replayed stream event.
+            self._pm_rebuild_actual_order_map()
+            # 3) Verify full-account consistency before any future /start can expose
+            #    capital.  Failures remain latched fail-closed.
+            consistency = self._pm_startup_consistency_check()
+            self._pm_apply_startup_consistency(
+                consistency,
+                preserve_operator_stop=stopped_mode,
+                allow_exchange_mutations=not stopped_mode,
+            )
+            # 4) Full idempotent order/position/protection reconcile.
+            self._pm_order_recovery()
+        finally:
+            self._pm_operator_state_scope.preserve_stopped = previous_guard
 
     def process(self) -> None:
         """
@@ -3350,7 +3492,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             # with another full reconcile before entries can be considered.
             self._pm_stopped_cold_reconcile_done = True
             try:
-                self._pm_cold_start_reconcile()
+                self._pm_cold_start_reconcile(stopped_mode=True)
             except Exception as e:
                 self._pm_block_orders("reconciliation_incomplete")
                 logger.exception(
@@ -4052,6 +4194,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             leverage=leverage,
             initial_order=trade is None,
             entry_mode=mode,
+            **self._pm_origin_trade_kwargs(trade),
         )
         order_obj = Order.parse_from_ccxt_object(order, pair, side, amount, enter_limit_requested)
         order_obj.ft_order_tag = enter_tag
@@ -5378,6 +5521,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 reduceOnly=self.trading_mode == TradingMode.FUTURES,
                 time_in_force=time_in_force,
                 initial_order=False,
+                **self._pm_origin_trade_kwargs(trade),
             )
         except InsufficientFundsError as e:
             logger.warning(f"Unable to place order {e}.")

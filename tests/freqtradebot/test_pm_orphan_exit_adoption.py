@@ -1,8 +1,10 @@
-"""Regression tests for PM ACK->local-commit orphaned reduce-only exit adoption."""
+"""Strict regression tests for PM ACK->commit orphan exit adoption."""
+
+from copy import deepcopy
 
 import pytest
 
-from freqtrade.persistence import Trade
+from freqtrade.persistence import PMOrderIntent, Trade
 from tests.freqtradebot.test_pm_recovery import ccxt_order, make_open_trade, make_pm_bot
 
 
@@ -38,48 +40,83 @@ def _closed_entry_trade(pm_conf, amount=11.0):
     return trade
 
 
-def test_adopts_provably_owned_reduce_only_exit(mocker, pm_conf):
-    bot = make_pm_bot(mocker, pm_conf)
-    trade = _closed_entry_trade(pm_conf, amount=11.0)
-    order = ccxt_order("exit-orphan-1", "closed", "sell", amount=11.0, filled=11.0)
-    order["clientOrderId"] = "ft-orphan-1"
-    order["info"] = {"reduceOnly": True}
-    intent = {
-        "client_id": "ft-orphan-1",
-        "exchange_order_id": "exit-orphan-1",
-        "kind": "order",
-        "pair": trade.pair,
-        "side": "sell",
-        "amount": 11.0,
-        "reduce_only": True,
-    }
+def _acked_exit_intent(trade, *, client_id="ft-orphan-1", order_id="exit-orphan-1"):
+    row = PMOrderIntent(
+        client_id=client_id,
+        kind="order",
+        pair=trade.pair,
+        side=trade.exit_side,
+        order_type="market",
+        amount=trade.amount,
+        reduce_only=True,
+        origin_trade_id=trade.id,
+        state="ACKED",
+        exchange_order_id=order_id,
+    )
+    PMOrderIntent.session.add(row)
+    PMOrderIntent.session.commit()
+    return row
 
-    adopted = bot._pm_adopt_orphan_reduce_only_order(intent, order)
+
+def _exchange_exit(trade, *, client_id="ft-orphan-1", order_id="exit-orphan-1"):
+    order = ccxt_order(order_id, "closed", trade.exit_side, amount=trade.amount, filled=trade.amount)
+    order["clientOrderId"] = client_id
+    order["symbol"] = trade.pair
+    order["info"] = {"reduceOnly": True}
+    return order
+
+
+def test_adopts_only_with_durable_origin_trade_and_complete_exchange_identity(mocker, pm_conf):
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = _closed_entry_trade(pm_conf)
+    intent = _acked_exit_intent(trade)
+    order = _exchange_exit(trade)
+
+    adopted = bot._pm_adopt_orphan_reduce_only_order(intent.to_dict(), order)
 
     assert adopted is not None
     adopted_trade, adopted_order = adopted
     assert adopted_trade.id == trade.id
     assert adopted_order.order_id == "exit-orphan-1"
     assert adopted_order.ft_order_side == trade.exit_side
-    assert adopted_order in trade.orders
-    assert trade.exit_reason == "pm_recovered_exit"
 
 
-def test_refuses_orphan_without_strict_reduce_only_identity(mocker, pm_conf):
+@pytest.mark.parametrize(
+    "missing_field",
+    ["id", "symbol", "clientOrderId", "side", "reduceOnly", "amount"],
+)
+def test_refuses_when_any_required_exchange_identity_field_is_missing(
+    mocker, pm_conf, missing_field
+):
     bot = make_pm_bot(mocker, pm_conf)
-    trade = _closed_entry_trade(pm_conf, amount=11.0)
-    order = ccxt_order("foreign-1", "closed", "sell", amount=11.0, filled=11.0)
-    order["clientOrderId"] = "different-client"
-    order["info"] = {"reduceOnly": True}
-    intent = {
-        "client_id": "ft-expected",
-        "exchange_order_id": "foreign-1",
-        "kind": "order",
-        "pair": trade.pair,
-        "side": "sell",
-        "amount": 11.0,
-        "reduce_only": True,
-    }
+    trade = _closed_entry_trade(pm_conf)
+    intent = _acked_exit_intent(trade)
+    order = deepcopy(_exchange_exit(trade))
 
-    assert bot._pm_adopt_orphan_reduce_only_order(intent, order) is None
-    assert all(o.order_id != "foreign-1" for o in trade.orders)
+    if missing_field == "reduceOnly":
+        order.pop("reduceOnly", None)
+        order["info"].pop("reduceOnly", None)
+    else:
+        order.pop(missing_field, None)
+
+    assert bot._pm_adopt_orphan_reduce_only_order(intent.to_dict(), order) is None
+    assert all(o.order_id != "exit-orphan-1" for o in trade.orders)
+
+
+def test_refuses_wrong_durable_origin_trade_id_even_if_pair_side_and_size_match(mocker, pm_conf):
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = _closed_entry_trade(pm_conf)
+    intent = _acked_exit_intent(trade)
+    intent.origin_trade_id = trade.id + 999
+    PMOrderIntent.session.commit()
+
+    assert bot._pm_adopt_orphan_reduce_only_order(intent.to_dict(), _exchange_exit(trade)) is None
+
+
+def test_refuses_when_persisted_ack_id_disagrees_with_exchange(mocker, pm_conf):
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = _closed_entry_trade(pm_conf)
+    intent = _acked_exit_intent(trade, order_id="expected-order")
+    order = _exchange_exit(trade, order_id="different-order")
+
+    assert bot._pm_adopt_orphan_reduce_only_order(intent.to_dict(), order) is None

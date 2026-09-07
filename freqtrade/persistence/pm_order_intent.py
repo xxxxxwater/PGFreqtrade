@@ -89,6 +89,11 @@ class PMOrderIntent(ModelBase):
     raw_response: Mapped[str | None] = mapped_column(Text, nullable=True)
     acked_at: Mapped[datetime | None] = mapped_column(nullable=True)
     # Local linkage, written in the SAME transaction as the Trade/Order commit.
+    # Trade ownership known BEFORE POST for DCA/reduce-only orders.  This is
+    # immutable evidence used by crash recovery; never infer ownership later by
+    # scanning for a same-pair/same-size Trade.  Initial entries legitimately
+    # have no origin Trade yet.
+    origin_trade_id: Mapped[int | None] = mapped_column(nullable=True)
     linked_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     linked_trade_id: Mapped[int | None] = mapped_column(nullable=True)
     linked_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -120,6 +125,7 @@ class PMOrderIntent(ModelBase):
             "exchange_order_id": self.exchange_order_id,
             "raw_response": self.raw_response,
             "acked_at": self.acked_at.isoformat() if self.acked_at else None,
+            "origin_trade_id": self.origin_trade_id,
             "linked_order_id": self.linked_order_id,
             "linked_trade_id": self.linked_trade_id,
             "linked_at": self.linked_at.isoformat() if self.linked_at else None,

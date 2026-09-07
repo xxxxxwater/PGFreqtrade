@@ -3,15 +3,13 @@
 PM database migration rehearsal (read-mostly, for a THROWAWAY copy).
 
 Validates the production migration path against a real PostgreSQL 17 database
-that contains the PRE-REDO ``pm_order_intents`` schema (the shape the live
-database has before the release starts):
+restored from the CURRENT pre-release production backup.
 
-1. the legacy table exists and is missing the redo columns,
-2. ``migrate_pm_tables`` adds exactly the missing columns (TIMESTAMP, not
-   DATETIME - PostgreSQL has no DATETIME type),
-3. legacy ``PENDING`` rows are migrated to ``PREPARED``,
-4. a second run is a no-op (idempotent),
-5. the unresolved-state guard keeps legacy ``PENDING`` fail-closed.
+1. ``pm_order_intents`` and ``pm_outbox`` exist,
+2. the pre-send ``origin_trade_id`` evidence column is absent before migration,
+3. ``migrate_pm_tables`` adds it to BOTH tables without disturbing existing ACK/link evidence,
+4. legacy ``PENDING`` rows are migrated to ``PREPARED``,
+5. a second run is a no-op (idempotent).
 
 Usage (NEVER point this at the production database - use a restored copy):
 
@@ -39,19 +37,21 @@ def main() -> int:
     engine = create_engine(db_url)
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
-    if "pm_order_intents" not in tables:
+    required_tables = {"pm_order_intents", "pm_outbox"}
+    missing_tables = required_tables - tables
+    if missing_tables:
         print(
-            "pm_order_intents table missing - the rehearsal database must be a "
-            "restore of the pre-redo production dump.",
+            f"required PM table(s) missing from rehearsal restore: {sorted(missing_tables)}",
             file=sys.stderr,
         )
         return 2
 
-    def columns() -> set[str]:
-        return {col["name"] for col in inspect(engine).get_columns("pm_order_intents")}
+    def columns(table: str) -> set[str]:
+        return {col["name"] for col in inspect(engine).get_columns(table)}
 
-    before = columns()
-    required = {
+    intent_before = columns("pm_order_intents")
+    outbox_before = columns("pm_outbox")
+    existing_ack_fields = {
         "exchange_order_id",
         "raw_response",
         "acked_at",
@@ -59,8 +59,11 @@ def main() -> int:
         "linked_trade_id",
         "linked_at",
     }
-    if required <= before:
-        print("Table already has the redo columns - cannot rehearse the migration.")
+    if not existing_ack_fields <= intent_before:
+        print("restore is older than the current production schema; use the latest backup")
+        return 2
+    if "origin_trade_id" in intent_before or "origin_trade_id" in outbox_before:
+        print("restore already has origin_trade_id - cannot rehearse this release migration")
         return 2
 
     # Legacy rows: insert a PENDING row as the old build would have written it.
@@ -75,13 +78,16 @@ def main() -> int:
         )
 
     migrate_pm_tables(engine)
-    after = columns()
-    missing = required - after
-    if missing:
-        print(f"FAIL: columns still missing after migration: {sorted(missing)}")
+    intent_after = columns("pm_order_intents")
+    outbox_after = columns("pm_outbox")
+    if "origin_trade_id" not in intent_after:
+        print("FAIL: pm_order_intents.origin_trade_id missing after migration")
+        return 1
+    if "origin_trade_id" not in outbox_after:
+        print("FAIL: pm_outbox.origin_trade_id missing after migration")
         return 1
 
-    # Column types must be PostgreSQL-native TIMESTAMP, never DATETIME.
+    # Existing timestamp evidence must remain PostgreSQL-native TIMESTAMP.
     col_types = {col["name"]: col["type"] for col in inspect(engine).get_columns("pm_order_intents")}
     for name in ("acked_at", "linked_at"):
         typename = str(col_types[name]).upper()
@@ -110,8 +116,8 @@ def main() -> int:
             return 1
 
     print(
-        "MIGRATION REHEARSAL OK: columns added with TIMESTAMP types, "
-        "PENDING->PREPARED migrated, idempotent."
+        "MIGRATION REHEARSAL OK: origin_trade_id added to intent+outbox, "
+        "existing evidence preserved, PENDING->PREPARED migrated, idempotent."
     )
     return 0
 

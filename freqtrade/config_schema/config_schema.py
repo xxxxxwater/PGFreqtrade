@@ -1328,6 +1328,26 @@ CONF_SCHEMA = {
                             "maximum": 1,
                             "default": 0.01,
                         },
+                        "allow_foreign_positions": {
+                            "description": (
+                                "Allow manual/external PM positions to coexist with the bot. "
+                                "Foreign-only instruments do not trigger the global quantity "
+                                "gate, but the bot refuses exposure-increasing orders on the "
+                                "same instrument. Default: false."
+                            ),
+                            "type": "boolean",
+                            "default": False,
+                        },
+                        "emergency_close_foreign_positions": {
+                            "description": (
+                                "When true, account-level PM emergency close also liquidates "
+                                "manual/external positions. Set false when manual positions are "
+                                "operator-owned and the bot must only close BOT-owned exposure. "
+                                "Default: true for backward compatibility."
+                            ),
+                            "type": "boolean",
+                            "default": True,
+                        },
                         "user_stream_journal_retention_days": {
                             "description": (
                                 "Days resolved PM stream-journal incidents are retained as "

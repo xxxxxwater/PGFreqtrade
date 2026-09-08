@@ -2,6 +2,7 @@
 Freqtrade is the main module of this bot. It contains the FreqtradeBot class.
 """
 
+import json
 import logging
 import time as _time
 import traceback
@@ -56,6 +57,7 @@ from freqtrade.mixins import LoggingMixin
 from freqtrade.persistence import Order, PairLocks, Trade, init_db
 from freqtrade.persistence.key_value_store import set_startup_time
 from freqtrade.persistence.pm_order_intent import PMOrderIntent
+from freqtrade.persistence.pm_outbox import PMOutbox
 from freqtrade.pm_order_ownership import PMOrderOwnershipMixin, PMOwnershipClass, pm_order_locked
 from freqtrade.persistence.pm_stream_journal import PMStreamJournal
 from freqtrade.plugins.pairlistmanager import PairListManager
@@ -392,6 +394,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self._pm_unresolved_instrument_ids: dict[str, dict[str, Any]] = {}
         if not hasattr(self, "_pm_position_mismatch_alerted"):
             self._pm_position_mismatch_alerted = False
+        if not hasattr(self, "_pm_foreign_position_pairs"):
+            self._pm_foreign_position_pairs: set[str] = set()
+        if not hasattr(self, "_pm_foreign_order_pairs"):
+            self._pm_foreign_order_pairs: set[str] = set()
         if not hasattr(self, "_pm_stop_protection_missing_alerted"):
             self._pm_stop_protection_missing_alerted = False
         if not hasattr(self, "_pm_last_journal_purge_at"):
@@ -480,6 +486,181 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             and not self.config.get("dry_run", True)
             and getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
         )
+
+    def _pm_allow_foreign_positions(self) -> bool:
+        """Whether operator-owned/manual PM exposure may coexist with BOT-owned exposure."""
+        return bool(
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("allow_foreign_positions", False)
+        )
+
+    def _pm_close_foreign_positions_on_emergency(self) -> bool:
+        """Whether account emergency-close is authorized to liquidate FOREIGN positions."""
+        return bool(
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("emergency_close_foreign_positions", True)
+        )
+
+    def _pm_active_bot_owned_pairs(self) -> set[str]:
+        """Pairs with current durable BOT ownership evidence.
+
+        Open local Trades are authoritative. Active intent rows cover the crash
+        window before/after exchange POST, including an initial entry whose local
+        Trade has not committed yet. Store failure propagates and therefore fails
+        closed in the caller; it must never turn uncertain BOT exposure into FOREIGN.
+        """
+        pairs = {
+            self._pm_canonical_pair(trade.pair)
+            for trade in Trade.get_open_trades()
+            if trade.is_open
+        }
+        if self._pm_db_gate_active():
+            active_states = ("PENDING", "PREPARED", "ACKED", "LINKED", "UNKNOWN")
+            rows = PMOrderIntent.session.query(PMOrderIntent).filter(
+                PMOrderIntent.state.in_(active_states)
+            ).all()
+            for row in rows:
+                pairs.add(self._pm_canonical_pair(row.pair))
+
+            # The outbox is a second durable source.  If intent state is ever
+            # damaged/missing while delivery evidence remains active, ownership
+            # must stay BOT-owned rather than being downgraded to FOREIGN.
+            outbox_rows = PMOutbox.session.query(PMOutbox).filter(
+                PMOutbox.state.in_(("PENDING", "ACKED", "LINKED"))
+            ).all()
+            for row in outbox_rows:
+                payload = json.loads(row.payload or "{}")
+                if not isinstance(payload, dict):
+                    raise OperationalException("PM outbox payload is not an object")
+                raw_pair = payload.get("pair") or payload.get("symbol")
+                if not raw_pair:
+                    raise OperationalException(
+                        f"Active PM outbox {row.client_id} has no instrument identity"
+                    )
+                pairs.add(self._pm_canonical_pair(str(raw_pair)))
+        return pairs
+
+    def _pm_exchange_order_is_bot_owned(self, order: dict[str, Any]) -> bool:
+        """Return True only when an unmatched exchange order has BOT identity evidence."""
+        info = order.get("info") if isinstance(order, dict) else {}
+        info = info if isinstance(info, dict) else {}
+        client_id = str(
+            order.get("clientOrderId")
+            or order.get("clientAlgoId")
+            or info.get("clientOrderId")
+            or info.get("clientAlgoId")
+            or info.get("clientStrategyId")
+            or ""
+        )
+        if client_id.startswith(("ft", "st")):
+            return True
+        if self._pm_db_gate_active() and client_id:
+            evidence = PMOutbox.get_by_client_id(client_id) or PMOrderIntent.get_by_client_id(
+                client_id
+            )
+            return evidence is not None
+        return False
+
+    def _pm_refresh_foreign_order_pairs(self, pair: str | None = None) -> set[str]:
+        """Refresh FOREIGN normal/conditional order ownership from the exchange.
+
+        Unknown exchange orders with BOT client-id/durable evidence are NOT
+        classified foreign: they are an ownership failure and must fail closed.
+        Pure external/manual orders are read-only and only create a same-pair
+        exposure-increase conflict when coexistence mode is enabled.
+        """
+        self._pm_init_user_stream_state()
+        if not self._pm_allow_foreign_positions() or not self._pm_db_gate_active():
+            self._pm_foreign_order_pairs = set()
+            return set()
+        canonical_filter = self._pm_canonical_pair(pair) if pair else None
+        open_trades = Trade.get_open_trades()
+        known_normal = {
+            (self._pm_canonical_pair(trade.pair), str(order.order_id))
+            for trade in open_trades
+            for order in trade.open_orders
+        }
+        known_conditional = {
+            (self._pm_canonical_pair(trade.pair), str(order.order_id))
+            for trade in open_trades
+            for order in trade.open_sl_orders
+        }
+        normal = self.exchange.fetch_open_orders(pair=canonical_filter)
+        conditional = self.exchange.fetch_open_conditional_orders(pair=canonical_filter)
+        foreign: set[str] = set()
+        for order in normal:
+            raw = order.get("symbol")
+            canonical = self._pm_canonical_pair(raw)
+            oid = str(order.get("id") or "")
+            if oid and (canonical, oid) in known_normal:
+                continue
+            if self._pm_exchange_order_is_bot_owned(order):
+                raise OperationalException(
+                    f"Untracked BOT-owned normal order {oid or '<missing>'} on {canonical}"
+                )
+            foreign.add(canonical)
+        for order in conditional:
+            raw = order.get("symbol")
+            canonical = self._pm_canonical_pair(raw)
+            oid = str(order.get("id") or order.get("clientAlgoId") or "")
+            if oid and (canonical, oid) in known_conditional:
+                continue
+            if self._pm_exchange_order_is_bot_owned(order):
+                raise OperationalException(
+                    f"Untracked BOT-owned conditional order {oid or '<missing>'} on {canonical}"
+                )
+            foreign.add(canonical)
+        if canonical_filter is None:
+            self._pm_foreign_order_pairs = foreign
+        else:
+            self._pm_foreign_order_pairs.discard(canonical_filter)
+            if canonical_filter in foreign:
+                self._pm_foreign_order_pairs.add(canonical_filter)
+        return foreign
+
+    def _pm_pair_entry_block_reasons(self, pair: str) -> list[str]:
+        """Fresh pair-local FOREIGN ownership gate immediately before risk increase."""
+        if not self._pm_allow_foreign_positions() or not self._pm_db_gate_active():
+            return []
+        self._pm_init_user_stream_state()
+        canonical = self._pm_canonical_pair(pair)
+        reasons: list[str] = []
+        try:
+            mismatches = self._pm_account_position_reconcile()
+        except Exception as exc:
+            self.log_once(
+                f"PM pre-entry position ownership check unavailable for {canonical}: {exc}",
+                logger.warning,
+            )
+            return ["foreign_ownership_check_unavailable"]
+        if mismatches:
+            # These are BOT-owned quantity mismatches only in coexistence mode.
+            self._pm_block_orders("position_quantity_mismatch")
+            reasons.append("position_quantity_mismatch")
+        else:
+            self._pm_unblock_orders("position_quantity_mismatch")
+        if canonical in self._pm_foreign_position_pairs:
+            reasons.append("foreign_position_conflict")
+        try:
+            self._pm_refresh_foreign_order_pairs(canonical)
+        except Exception as exc:
+            # A proven BOT-owned but untracked exchange order is a global
+            # ownership incident. A generic read failure refuses THIS entry and
+            # leaves scheduled recovery/risk health to decide broader state.
+            if "BOT-owned" in str(exc):
+                self._pm_block_orders("reconciliation_incomplete")
+                reasons.append("bot_order_ownership_conflict")
+            else:
+                reasons.append("foreign_ownership_check_unavailable")
+            self.log_once(
+                f"PM pre-entry order ownership check failed for {canonical}: {exc}",
+                logger.warning,
+            )
+        if canonical in self._pm_foreign_order_pairs:
+            reasons.append("foreign_order_conflict")
+        return list(dict.fromkeys(reasons))
 
     def _pm_has_unresolved_intents(self) -> bool:
         """Authoritative unresolved-intent check (store failure => True, fail-closed)."""
@@ -1456,17 +1637,17 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         return total
 
     def _pm_emergency_close_all(self) -> None:
-        """
-        Force-close EVERY open PM position on the account - including manual /
-        external positions with no local trade - and CONFIRM each one is flat on
-        the exchange before counting it closed.
+        """Emergency-close BOT-owned PM exposure and optionally FOREIGN exposure.
 
-        Creating an exit order is NOT proof of safety: after each attempt the
-        position is re-fetched per-symbol (fresh, bypassing the account-wide
-        snapshot cache) and only a zero contract count counts as closed.
+        Account risk metrics remain account-wide.  When
+        ``emergency_close_foreign_positions=false``, manual/external positions
+        are intentionally left untouched; BOT-owned positions and a provable
+        BOT orphan (active durable intent on the pair) are still closed and
+        verified flat.  Creating an exit order is never treated as proof.
         """
         risk_cfg = self.config.get("exchange", {}).get("portfolio_margin_risk", {})
         max_retries = int(risk_cfg.get("emergency_close_retries", 3))
+        close_foreign = self._pm_close_foreign_positions_on_emergency()
         try:
             all_positions = [
                 p
@@ -1480,8 +1661,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     "type": RPCMessageType.WARNING,
                     "status": (
                         "PM EMERGENCY CLOSE FAILED: exchange positions could not be "
-                        f"enumerated ({e.__class__.__name__}). Manual intervention "
-                        "required."
+                        f"enumerated ({e.__class__.__name__}). Manual intervention required."
                     ),
                 }
             )
@@ -1489,15 +1669,43 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         if not all_positions:
             logger.info("PM emergency close: account is already flat.")
             return
+
+        bot_owned_pairs: set[str] = set()
+        ownership_error: str | None = None
+        if not close_foreign:
+            try:
+                bot_owned_pairs = self._pm_active_bot_owned_pairs()
+            except Exception as e:
+                ownership_error = f"{e.__class__.__name__}: {e}"
+                logger.error(
+                    "PM emergency close: ownership store unavailable; untracked positions "
+                    "will be preserved rather than risk liquidating operator assets: %s", e
+                )
+
         closed = 0
         failed = 0
+        preserved = 0
         failed_details: list[str] = []
+        preserved_details: list[str] = []
         with self._exit_lock:
             for position in all_positions:
                 symbol = str(position.get("symbol") or "")
                 side = str(position.get("side") or "")
                 contracts = abs(float(position.get("contracts") or 0))
                 trade = self._pm_open_trade_for_position(symbol, side)
+
+                if trade is None and not close_foreign:
+                    canonical = self._pm_canonical_pair(symbol)
+                    if canonical not in bot_owned_pairs:
+                        preserved += 1
+                        preserved_details.append(f"{canonical} ({side}, {contracts})")
+                        logger.warning(
+                            "PM emergency close: preserving FOREIGN position %s (%s, %s contracts) "
+                            "by policy; account risk metrics still include it.",
+                            canonical, side, contracts,
+                        )
+                        continue
+
                 success = False
                 last_error = "unknown"
                 for attempt in range(1, max_retries + 1):
@@ -1506,13 +1714,12 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                             if not self._safe_force_exit(trade):
                                 last_error = f"attempt {attempt}: exit order not confirmed"
                         else:
+                            # No local Trade but durable ownership proves this pair
+                            # belongs to an in-flight/orphaned BOT operation.
                             if not self._pm_force_close_foreign_position(symbol, side, contracts):
-                                last_error = f"attempt {attempt}: foreign close failed"
+                                last_error = f"attempt {attempt}: untracked BOT close failed"
                     except Exception as e:
                         last_error = f"attempt {attempt}: {e}"
-                    # Creating an order is NOT proof of safety: verify FLAT with a
-                    # fresh per-symbol fetch (the account-wide snapshot cache must
-                    # never mask an unfilled exit) - even after a "successful" exit.
                     try:
                         fresh = self.exchange.fetch_positions(pair=symbol)
                         remaining = sum(
@@ -1534,17 +1741,28 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     failed_details.append(f"{symbol} ({side}): {last_error}")
         Trade.commit()
         logger.warning(
-            f"PM emergency close: {closed} closed, {failed} failed, "
-            f"out of {len(all_positions)} total."
+            "PM emergency close: %d closed, %d failed, %d FOREIGN preserved, out of %d total.",
+            closed, failed, preserved, len(all_positions),
         )
         if failed:
             self.rpc.send_msg(
                 {
                     "type": RPCMessageType.WARNING,
                     "status": (
-                        f"PM EMERGENCY CLOSE PARTIAL FAILURE: {failed} position(s) could "
-                        f"NOT be confirmed flat and remain OPEN: "
+                        f"PM EMERGENCY CLOSE PARTIAL FAILURE: {failed} BOT-owned position(s) "
+                        f"could NOT be confirmed flat and remain OPEN: "
                         f"{', '.join(failed_details[:5])}. Manual intervention is required."
+                    ),
+                }
+            )
+        if preserved:
+            suffix = f" Ownership-store error: {ownership_error}." if ownership_error else ""
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM emergency policy preserved {preserved} FOREIGN/manual position(s) "
+                        f"without liquidation: {', '.join(preserved_details[:5])}." + suffix
                     ),
                 }
             )
@@ -1714,6 +1932,18 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self._pm_position_mismatch_alerted = False
             self._pm_unblock_orders("position_quantity_mismatch")
 
+        if self._pm_allow_foreign_positions():
+            result["foreign_position_pairs"] = sorted(self._pm_foreign_position_pairs)
+            try:
+                self._pm_refresh_foreign_order_pairs()
+                result["foreign_order_pairs"] = sorted(self._pm_foreign_order_pairs)
+            except Exception as e:
+                result["foreign_order_pairs"] = sorted(self._pm_foreign_order_pairs)
+                result["errors"].append(f"foreign order ownership refresh: {e}")
+        else:
+            result["foreign_position_pairs"] = []
+            result["foreign_order_pairs"] = []
+
         # Stop-protection invariant: a settled non-zero position must have
         # verifiable conditional protection on the exchange. Unverifiable
         # listing fails closed; missing protection blocks risk increase until
@@ -1882,22 +2112,20 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         return False
 
     def _pm_account_position_reconcile(self) -> list[str]:
-        """Full-account quantity invariant with a bounded in-flight model.
+        """BOT-owned PM quantity invariant with explicit FOREIGN coexistence.
 
-        For every instrument the exchange position must fall inside the
-        explainable interval:
+        With ``allow_foreign_positions=false`` (legacy/default), every non-zero
+        exchange position participates in the full-account quantity invariant.
 
-            confirmed local exposure
-            + possible remaining risk-INCREASING fills (open entry/DCA orders)
-            - possible remaining risk-REDUCING fills (open exit orders)
+        With coexistence enabled, a position on an instrument with NO active BOT
+        ownership evidence is classified FOREIGN/MANUAL: it remains visible to
+        account equity/uniMMR, is never imported into Trade, and does not trigger
+        the global quantity gate.  The pair is remembered so exposure-increasing
+        BOT orders on that SAME instrument are refused by the pair-local gate.
 
-        built per open order from side/origQty/executedQty/remaining and the
-        trade direction. In-flight allowances expire: an open order older than
-        the configured deadline stops exempting its instrument (a permanent
-        working order must never mask a real quantity mismatch).
-
-        Returns human-readable mismatch descriptions (empty list = consistent).
-        Raises when the exchange view is unreadable (caller fails closed).
+        Instruments with local open Trades or active durable PM intents remain
+        BOT-owned and keep the strict bounded in-flight invariant.  Therefore a
+        lost/misaligned BOT position still blocks ALL new exposure fail-closed.
         """
         mismatches: list[str] = []
         if not (
@@ -1907,6 +2135,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         ):
             return mismatches
         self._pm_init_user_stream_state()
+        allow_foreign = self._pm_allow_foreign_positions()
         positions = self.exchange.fetch_positions()
         exchange_by_pair: dict[str, float] = {}
         for position in positions:
@@ -1914,8 +2143,6 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             raw = position.get("symbol")
             if not raw or contracts == 0:
                 continue
-            # PM fetch_positions returns canonical settled symbols; resolve
-            # defensively (never drop an unownable position silently).
             pair = self._pm_canonical_pair(raw)
             signed = contracts if position.get("side") != "short" else -contracts
             exchange_by_pair[pair] = exchange_by_pair.get(pair, 0.0) + signed
@@ -1940,9 +2167,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             trade_sign = -1.0 if trade.is_short else 1.0
             signed = float(trade.amount) * trade_sign
             local_by_pair[pair] = local_by_pair.get(pair, 0.0) + signed
-            entry = inflight.setdefault(
-                pair, {"low": 0.0, "high": 0.0, "stale": False}
-            )
+            entry = inflight.setdefault(pair, {"low": 0.0, "high": 0.0, "stale": False})
             for order in trade.open_orders:
                 try:
                     filled = float(order.filled or 0)
@@ -1963,7 +2188,23 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     if (now - order_date).total_seconds() > inflight_max_s:
                         entry["stale"] = True
 
+        bot_owned_pairs = set(local_by_pair)
+        if allow_foreign:
+            # Active intent rows are the crash-window ownership proof for a BOT
+            # order whose local Trade may not have committed yet. A store failure
+            # propagates to the caller and therefore remains fail-closed.
+            bot_owned_pairs |= self._pm_active_bot_owned_pairs()
+            foreign_pairs = {
+                pair for pair in exchange_by_pair if pair not in bot_owned_pairs
+            }
+            self._pm_foreign_position_pairs = foreign_pairs
+        else:
+            self._pm_foreign_position_pairs = set()
+            bot_owned_pairs |= set(exchange_by_pair)
+
         for pair in sorted(set(exchange_by_pair) | set(local_by_pair)):
+            if allow_foreign and pair in self._pm_foreign_position_pairs:
+                continue
             exchange_amount = self.exchange._contracts_to_amount(
                 pair, exchange_by_pair.get(pair, 0.0)
             )
@@ -2878,11 +3119,16 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             "unknown_positions": [],
             "unknown_orders": [],
             "unknown_conditional_orders": [],
+            "foreign_positions": [],
+            "foreign_orders": [],
+            "foreign_conditional_orders": [],
             "local_open_trades_flat_on_exchange": [],
             "local_open_orders_missing_on_exchange": [],
             "recent_closed_order_mismatches": [],
         }
         try:
+            allow_foreign = self._pm_allow_foreign_positions()
+            bot_owned_pairs = self._pm_active_bot_owned_pairs() if allow_foreign else set()
             positions = self.exchange.fetch_positions()
             for position in positions:
                 contracts = position.get("contracts", 0) or 0
@@ -2893,9 +3139,12 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     {"pair": pair, "side": position.get("side"), "contracts": contracts}
                 )
                 if not self._pm_has_open_trade_for(pair, position.get("side")):
-                    result["unknown_positions"].append(
-                        {"pair": pair, "side": position.get("side"), "contracts": contracts}
-                    )
+                    record = {"pair": pair, "side": position.get("side"), "contracts": contracts}
+                    canonical = self._pm_canonical_pair(pair)
+                    if allow_foreign and canonical not in bot_owned_pairs:
+                        result["foreign_positions"].append(record)
+                    else:
+                        result["unknown_positions"].append(record)
 
             open_trades = Trade.get_open_trades()
             known_order_ids = {
@@ -2918,9 +3167,11 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     {"order_id": order_id, "symbol": symbol}
                 )
                 if (symbol, order_id) not in known_order_ids:
-                    result["unknown_orders"].append(
-                        {"order_id": order_id, "symbol": symbol}
-                    )
+                    record = {"order_id": order_id, "symbol": symbol}
+                    if allow_foreign and not self._pm_exchange_order_is_bot_owned(order):
+                        result["foreign_orders"].append(record)
+                    else:
+                        result["unknown_orders"].append(record)
 
             # Conditional (stoploss) open orders live on a separate PAPI endpoint and
             # are identified by strategy ids - never mix them with normal order ids.
@@ -2934,9 +3185,11 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     {"order_id": strategy_id, "symbol": symbol}
                 )
                 if (symbol, strategy_id) not in known_strategy_ids:
-                    result["unknown_conditional_orders"].append(
-                        {"order_id": strategy_id, "symbol": symbol}
-                    )
+                    record = {"order_id": strategy_id, "symbol": symbol}
+                    if allow_foreign and not self._pm_exchange_order_is_bot_owned(order):
+                        result["foreign_conditional_orders"].append(record)
+                    else:
+                        result["unknown_conditional_orders"].append(record)
 
             # --- Reverse direction: local records the exchange does NOT confirm ---
             # (one-way mode, so position matching is side-agnostic)
@@ -3034,6 +3287,31 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             result["status"] = "error"
             result["error"] = f"{e.__class__.__name__}: {e}"
             return result
+
+        if self._pm_allow_foreign_positions():
+            self._pm_init_user_stream_state()
+            self._pm_foreign_position_pairs = {
+                self._pm_canonical_pair(item["pair"])
+                for item in result["foreign_positions"]
+            }
+            self._pm_foreign_order_pairs = {
+                self._pm_canonical_pair(item["symbol"])
+                for item in (
+                    result["foreign_orders"] + result["foreign_conditional_orders"]
+                )
+            }
+            if (
+                result["foreign_positions"]
+                or result["foreign_orders"]
+                or result["foreign_conditional_orders"]
+            ):
+                logger.info(
+                    "PM ownership coexistence: observing %d FOREIGN position(s), %d normal "
+                    "order(s), %d conditional order(s); read-only and pair-local only.",
+                    len(result["foreign_positions"]),
+                    len(result["foreign_orders"]),
+                    len(result["foreign_conditional_orders"]),
+                )
 
         if (
             result["unknown_positions"]
@@ -4117,6 +4395,19 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             if mode == "initial":
                 self._pm_record_signal_decision(
                     pair, decision="blocked", reason="; ".join(self._pm_blocked_order_reasons())
+                )
+            return False
+
+        pair_block_reasons = self._pm_pair_entry_block_reasons(pair)
+        if pair_block_reasons:
+            self.log_once(
+                f"Refusing exposure increase on {pair}. PM pair ownership blocked: "
+                + ", ".join(pair_block_reasons),
+                logger.warning,
+            )
+            if mode == "initial":
+                self._pm_record_signal_decision(
+                    pair, decision="blocked", reason="; ".join(pair_block_reasons)
                 )
             return False
 

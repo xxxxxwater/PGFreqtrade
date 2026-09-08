@@ -126,6 +126,8 @@ class Binance(Exchange):
         "user_stream_auto_recovery_cooldown_seconds",
         "reconciliation_warning_reminder_minutes",
         "account_position_quantity_tolerance",
+        "allow_foreign_positions",
+        "emergency_close_foreign_positions",
         "user_stream_journal_retention_days",
         "account_position_inflight_max_seconds",
     }

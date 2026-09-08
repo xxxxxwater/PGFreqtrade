@@ -109,6 +109,7 @@ class Binance(Exchange):
         "user_stream_recover_unmatched_orders",
         "monitor_interval_minutes",
         "order_recovery_interval_minutes",
+        "uncertain_stop_emergency_exit_seconds",
         "reconciliation_warning_reminder_minutes",
         "heartbeat_risk_cache_seconds",
         "max_leverage",
@@ -147,6 +148,7 @@ class Binance(Exchange):
         "user_stream_max_restarts_per_hour",
         "monitor_interval_minutes",
         "order_recovery_interval_minutes",
+        "uncertain_stop_emergency_exit_seconds",
         "heartbeat_risk_cache_seconds",
         "emergency_close_retries",
     }
@@ -193,6 +195,8 @@ class Binance(Exchange):
             or str(exchange_conf.get("account_type", "")).lower() in {"pm", "portfolio_margin"}
         )
         self._pm_user_stream: BinancePMUserStream | None = None
+        self._pm_last_account_read_at: datetime | None = None
+        self._pm_last_positions_read_at: datetime | None = None
         # NOTE: the stream lock is a LAZY attribute (see the property below):
         # keeping an RLock in __dict__ makes the instance unpicklable, which
         # breaks multiprocessing consumers (e.g. hyperopt --parallel).
@@ -1000,22 +1004,44 @@ class Binance(Exchange):
                 # returned instead of raising), so a newer intent is always safe
                 # and prevents the relay from re-POSTing zombie rows later.
                 # UNKNOWN rows are never superseded (their outcome is uncertain).
-                stale = (
+                new_reduce_only = bool(intent.get("reduce_only", False))
+                existing_same_kind = (
                     PMOrderIntent.session.query(PMOrderIntent)
                     .filter(
                         PMOrderIntent.kind == str(intent.get("kind")),
-                        PMOrderIntent.state == "PREPARED",
+                        PMOrderIntent.state.in_(("PENDING", "PREPARED", "ACKED", "UNKNOWN")),
                     )
                     .all()
                 )
-                for old in stale:
+                for old in existing_same_kind:
                     if self.pm_canonical_pair(old.pair) != pair_str:
                         continue
                     old_outbox = PMOutbox.get_by_client_id(old.client_id)
-                    if old_outbox is not None:
-                        old_outbox.state = "REJECTED"
-                        old_outbox.processed_at = dt_now()
-                        old_outbox.last_error = "superseded by a newer intent"
+                    pristine = (
+                        old.state in {"PENDING", "PREPARED"}
+                        and old_outbox is not None
+                        and old_outbox.dispatch_started_at is None
+                        and int(old_outbox.dispatch_attempts or 0) == 0
+                    )
+                    if not pristine and (not new_reduce_only or bool(old.reduce_only)):
+                        # Exposure-increasing work is blocked by any may-have-been-sent
+                        # same-kind intent.  Risk-reducing work remains available when
+                        # the unresolved older intent was exposure-increasing; however a
+                        # may-have-been-sent reduce-only order blocks a second reduce-only
+                        # client id to prevent duplicate exits.
+                        raise OperationalException(
+                            f"PM intent {old.client_id} for {pair_str} is unresolved/may "
+                            "already have been sent; refusing a fresh client id. Recovery "
+                            "must resolve the existing intent first."
+                        )
+                    if not pristine:
+                        # Safe bypass: new reduce-only vs old exposure-increasing intent.
+                        continue
+                    # Only a provably pristine row (no send marker, no attempts) is
+                    # safe to supersede.
+                    old_outbox.state = "REJECTED"
+                    old_outbox.processed_at = dt_now()
+                    old_outbox.last_error = "superseded pristine unsent intent"
                     PMOrderIntent.session.delete(old)
                 row = PMOrderIntent(
                     client_id=client_id,
@@ -1302,9 +1328,21 @@ class Binance(Exchange):
         PMOrderIntent = self._pm_intent_model()
         try:
             result = []
+            PMOutbox = self._pm_outbox_model()
             for row in PMOrderIntent.get_unresolved():
                 entry = row.to_dict()
                 entry["pair"] = self.pm_canonical_pair(entry["pair"])
+                outbox = PMOutbox.get_by_client_id(row.client_id)
+                entry["dispatch_started_at"] = (
+                    outbox.dispatch_started_at.isoformat()
+                    if outbox is not None and outbox.dispatch_started_at is not None
+                    else None
+                )
+                entry["dispatch_attempts"] = (
+                    outbox.dispatch_attempts if outbox is not None else None
+                )
+                entry["outbox_present"] = outbox is not None
+                entry["outbox_state"] = outbox.state if outbox is not None else None
                 result.append(entry)
             return result
         except Exception as e:
@@ -1403,6 +1441,13 @@ class Binance(Exchange):
             report["uncertain"] = True
             report["error"] = "intent is malformed (missing client_id/pair)"
             return report
+        if intent.get("outbox_present") is False:
+            report["uncertain"] = True
+            report["error"] = (
+                "intent_outbox_inconsistent: durable outbox row missing; "
+                "fresh client-id generation forbidden"
+            )
+            return report
         try:
             pair = self.pm_canonical_pair(pair)
             report["pair"] = pair
@@ -1419,6 +1464,21 @@ class Binance(Exchange):
         except Exception as e:
             report["uncertain"] = True
             report["error"] = f"{e.__class__.__name__}: {e}"
+            return report
+        if order is None and intent.get("dispatch_started_at"):
+            # A durable dispatch marker proves the process crossed the
+            # send-before-POST boundary.  One same-id lookup returning absent is
+            # not proof Binance never accepted the request (eventual visibility /
+            # endpoint races are possible).  Keep the incident unresolved and
+            # NEVER turn it back into an automatically dispatchable intent.
+            report["uncertain"] = True
+            report["error"] = (
+                "dispatch_started_but_same_id_currently_absent; automatic re-POST forbidden"
+            )
+            try:
+                self._pm_intent_mark_uncertain(client_id, report["error"])
+            except Exception:
+                pass
             return report
         report["resolved"] = True
         report["exists"] = order is not None
@@ -1581,6 +1641,27 @@ class Binance(Exchange):
         if cache is not None:
             cache["available"] = True
 
+    def _pm_dispatch_marker_set(self, client_id: str) -> None:
+        """Persist MAY_HAVE_BEEN_SENT before any exchange POST is attempted."""
+        PMOutbox = self._pm_outbox_model()
+        outbox = PMOutbox.get_by_client_id(client_id)
+        if outbox is None:
+            raise OperationalException(
+                f"PM outbox row missing for {client_id}; refusing to submit (fail-closed)."
+            )
+        if outbox.dispatch_started_at is not None:
+            return
+        outbox.dispatch_started_at = dt_now()
+        outbox.dispatch_attempts += 1
+        outbox.last_error = None
+        try:
+            PMOutbox.session.commit()
+        except Exception as e:
+            PMOutbox.session.rollback()
+            raise OperationalException(
+                f"PM dispatch marker could not be persisted for {client_id}; refusing POST: {e}"
+            ) from e
+
     def _pm_dispatch_order(
         self,
         client_id: str,
@@ -1590,16 +1671,12 @@ class Binance(Exchange):
         from_relay: bool = False,
         priority: str = "normal",
     ) -> dict[str, Any]:
-        """
-        Exactly-once POST for one enqueued order (under the PM pipeline lock).
+        """Crash-safe ordinary-order dispatch.
 
-        * Exchange ACK -> intent ACKED (id + raw response persisted), returns the
-          raw order.
-        * Deterministic rejection -> intent tombstoned, outbox REJECTED, raise.
-        * Transient failure -> resolve by client id; found -> ACK and return it;
-          definitively absent -> the intent stays PREPARED and the outbox stays
-          PENDING for the relay (re-dispatch is idempotent); unresolvable ->
-          intent UNKNOWN (blocks new exposure).
+        The first POST is permitted only after ``dispatch_started_at`` is durably
+        committed.  Once that marker exists the intent is MAY_HAVE_BEEN_SENT:
+        all future invocations are lookup/reconcile-only and can never POST this
+        client id again merely because a lookup currently returns no record.
         """
         PMOutbox = self._pm_outbox_model()
         pair = self._pm_response_pair(request.get("symbol"), pair)
@@ -1608,25 +1685,42 @@ class Binance(Exchange):
                 outbox = PMOutbox.get_by_client_id(client_id)
                 if outbox is None:
                     raise OperationalException(
-                        f"PM outbox row missing for {client_id}; refusing to submit "
-                        "(fail-closed)."
+                        f"PM outbox row missing for {client_id}; refusing to submit (fail-closed)."
                     )
                 if outbox.state == "REJECTED":
-                    # Superseded or deterministically rejected: never re-POST.
                     raise OperationalException(
                         f"PM outbox row {client_id} is REJECTED ({outbox.last_error}); "
                         "refusing to re-submit."
                     )
-                if not from_relay and outbox.state == "ACKED":
-                    # Already dispatched: resolve and return the existing order.
-                    existing = self._pm_fetch_order_by_client_id(client_id, pair)
-                    if existing is not None:
-                        return existing
-                if outbox.dispatch_attempts > 0:
-                    existing = self._pm_fetch_order_by_client_id(client_id, pair)
+
+                # ACKED/LINKED or a persisted send marker means Binance may already
+                # own this id.  This path is permanently lookup-only.
+                if outbox.state in {"ACKED", "LINKED"} or outbox.dispatch_started_at is not None:
+                    try:
+                        existing = self._pm_fetch_order_by_client_id(client_id, pair)
+                    except Exception as lookup_error:
+                        self._pm_intent_mark_uncertain(client_id, str(lookup_error))
+                        raise TemporaryError(
+                            f"Binance PM order {client_id} may already have been sent; "
+                            "same-id lookup failed and automatic re-POST is forbidden."
+                        ) from lookup_error
                     if existing is not None:
                         self._pm_ack(client_id, existing, str(existing.get("id")))
                         return existing
+                    self._pm_intent_mark_uncertain(
+                        client_id,
+                        "dispatch_started_but_same_id_currently_absent; automatic re-POST forbidden",
+                    )
+                    raise TemporaryError(
+                        f"Binance PM order {client_id} crossed the durable dispatch boundary, "
+                        "but the exchange currently reports no same-id order. This remains "
+                        "UNKNOWN; automatic re-POST is forbidden."
+                    )
+
+                # Pristine PENDING row: persist the boundary FIRST, then and only
+                # then perform the single allowed POST for this client id.
+                self._pm_dispatch_marker_set(client_id)
+                outbox = PMOutbox.get_by_client_id(client_id)
                 try:
                     raw = self._papi_request(
                         f"{self._pm_namespace_for_pair(pair)}/order",
@@ -1634,54 +1728,55 @@ class Binance(Exchange):
                         request,
                         priority=priority,
                     )
-                except (ccxt.InvalidOrder, ccxt.InsufficientFunds, ccxt.BadRequest, ccxt.OperationRejected) as e:
-                    # Deterministic exchange rejections: never an uncertain state.
+                except (
+                    ccxt.InvalidOrder,
+                    ccxt.InsufficientFunds,
+                    ccxt.BadRequest,
+                    ccxt.OperationRejected,
+                ) as e:
                     self._pm_reject(client_id, str(e))
                     raise
                 except (TemporaryError, ccxt.OperationFailed) as e:
                     try:
                         existing = self._pm_fetch_order_by_client_id(client_id, pair)
-                    except (TemporaryError, ccxt.OperationFailed):
+                    except Exception as lookup_error:
                         self._pm_intent_mark_uncertain(client_id, str(e))
-                        outbox.dispatch_attempts += 1
-                        outbox.last_error = str(e)[:250]
-                        PMOutbox.session.commit()
+                        if outbox is not None:
+                            outbox.last_error = str(e)[:250]
+                            PMOutbox.session.commit()
                         raise TemporaryError(
-                            f"Binance PM order {client_id} submit failed and the idempotency "
-                            "lookup also failed; order state is uncertain and the intent is "
-                            "UNKNOWN. Recovery resolves it before any new order is allowed."
-                        ) from e
+                            f"Binance PM order {client_id} POST outcome is uncertain and "
+                            "same-id lookup failed; automatic re-POST is forbidden."
+                        ) from lookup_error
                     if existing is not None:
                         self._pm_ack(client_id, existing, str(existing.get("id")))
                         logger.warning(
-                            f"Binance PM order {client_id} submit raised "
-                            f"{e.__class__.__name__}; resolved the already-placed order "
-                            f"{existing.get('id')} and returning it (no duplicate submitted)."
+                            "Binance PM order %s POST raised %s; same-id lookup found "
+                            "exchange order %s (no duplicate submitted).",
+                            client_id,
+                            e.__class__.__name__,
+                            existing.get("id"),
                         )
                         return existing
-                    # Definitive absence + transient submit error: keep the intent
-                    # PREPARED and the outbox PENDING so the relay re-dispatches
-                    # exactly once (resolve-by-id makes this idempotent).
-                    outbox.dispatch_attempts += 1
-                    outbox.last_error = str(e)[:250]
-                    PMOutbox.session.commit()
-                    raise
+                    self._pm_intent_mark_uncertain(
+                        client_id,
+                        "POST raised transient error; same-id currently absent; re-POST forbidden",
+                    )
+                    raise TemporaryError(
+                        f"Binance PM order {client_id} POST raised {e.__class__.__name__}; "
+                        "same-id lookup is currently absent. Because dispatch had already "
+                        "started, the intent is UNKNOWN and will NOT be re-POSTed."
+                    ) from e
                 except ccxt.ExchangeError as e:
-                    # Remaining exchange errors are deterministic.
                     self._pm_reject(client_id, str(e))
                     raise
                 except ccxt.BaseError as e:
                     self._pm_intent_mark_uncertain(client_id, str(e))
-                    outbox.dispatch_attempts += 1
-                    outbox.last_error = str(e)[:250]
-                    PMOutbox.session.commit()
                     raise OperationalException(e) from e
+
                 try:
                     parsed = self._parse_pm_order(raw, pair)
                 except OperationalException as identity_error:
-                    # POST may have succeeded. Preserve its exchange evidence
-                    # even if the response cannot safely be linked to this pair;
-                    # never leave a replaceable PREPARED row after this ACK.
                     try:
                         self._pm_ack(client_id, raw, str(raw.get("orderId") or ""))
                     finally:
@@ -1691,15 +1786,11 @@ class Binance(Exchange):
                 try:
                     self._pm_ack(client_id, raw, str(parsed.get("id")))
                 except OperationalException as ack_error:
-                    # The order EXISTS on the exchange. Return it so the local
-                    # Trade/Order can be committed (the local order row itself
-                    # preserves the exchange id as evidence); the intent stays
-                    # PREPARED and blocks new exposure until recovery links it.
                     logger.critical(
-                        "PM order %s ACK evidence could not be persisted: %s. The "
-                        "order exists on the exchange; returning it so the local "
-                        "record can be committed. The intent stays PREPARED and new "
-                        "exposure stays blocked until recovery links it.",
+                        "PM order %s ACK evidence could not be persisted: %s. "
+                        "dispatch_started_at remains durable, so this client id can "
+                        "never be POSTed again automatically; new exposure stays blocked "
+                        "until recovery resolves the intent.",
                         client_id,
                         ack_error,
                     )
@@ -1714,12 +1805,7 @@ class Binance(Exchange):
     def _pm_dispatch_conditional(
         self, client_id: str, pair: str, request: dict[str, Any], *, from_relay: bool = False
     ) -> dict[str, Any]:
-        """
-        Exactly-once POST for one enqueued algo (stoploss) order (advisory lock).
-        Same state machine as _pm_dispatch_order, resolved through the algo
-        endpoints. Always dispatched with governor priority "critical"
-        (reduce-only protection must never be deferred).
-        """
+        """Crash-safe PM algo-stop dispatch with the same send-before-POST boundary."""
         PMOutbox = self._pm_outbox_model()
         pair = self._pm_response_pair(request.get("symbol"), pair)
         try:
@@ -1727,23 +1813,38 @@ class Binance(Exchange):
                 outbox = PMOutbox.get_by_client_id(client_id)
                 if outbox is None:
                     raise OperationalException(
-                        f"PM outbox row missing for {client_id}; refusing to submit "
-                        "(fail-closed)."
+                        f"PM outbox row missing for {client_id}; refusing to submit (fail-closed)."
                     )
                 if outbox.state == "REJECTED":
                     raise OperationalException(
                         f"PM outbox row {client_id} is REJECTED ({outbox.last_error}); "
                         "refusing to re-submit."
                     )
-                if not from_relay and outbox.state == "ACKED":
-                    existing = self.fetch_stoploss_order(client_id, pair)
-                    if existing is not None:
-                        return existing
-                if outbox.dispatch_attempts > 0:
-                    existing = self.fetch_stoploss_order(client_id, pair)
+                if outbox.state in {"ACKED", "LINKED"} or outbox.dispatch_started_at is not None:
+                    try:
+                        existing = self.fetch_stoploss_order(client_id, pair)
+                    except InvalidOrderException:
+                        existing = None
+                    except Exception as lookup_error:
+                        self._pm_intent_mark_uncertain(client_id, str(lookup_error))
+                        raise TemporaryError(
+                            f"Binance PM stoploss {client_id} may already have been sent; "
+                            "lookup failed and automatic re-POST is forbidden."
+                        ) from lookup_error
                     if existing is not None:
                         self._pm_ack(client_id, existing, str(existing.get("id")))
                         return existing
+                    self._pm_intent_mark_uncertain(
+                        client_id,
+                        "conditional dispatch started but same-id currently absent; re-POST forbidden",
+                    )
+                    raise TemporaryError(
+                        f"Binance PM stoploss {client_id} crossed the durable dispatch boundary "
+                        "but is currently absent from lookup/history. It remains UNKNOWN; "
+                        "automatic re-POST is forbidden."
+                    )
+
+                self._pm_dispatch_marker_set(client_id)
                 try:
                     raw = self._papi_request(
                         f"{self._pm_namespace_for_pair(pair)}/algo/order",
@@ -1751,7 +1852,12 @@ class Binance(Exchange):
                         request,
                         priority="critical",
                     )
-                except (ccxt.InvalidOrder, ccxt.InsufficientFunds, ccxt.BadRequest, ccxt.OperationRejected) as e:
+                except (
+                    ccxt.InvalidOrder,
+                    ccxt.InsufficientFunds,
+                    ccxt.BadRequest,
+                    ccxt.OperationRejected,
+                ) as e:
                     self._pm_reject(client_id, str(e))
                     raise
                 except (TemporaryError, ccxt.OperationFailed, ccxt.ExchangeError) as e:
@@ -1759,33 +1865,26 @@ class Binance(Exchange):
                         existing = self.fetch_stoploss_order(client_id, pair)
                     except InvalidOrderException:
                         existing = None
-                    except Exception:
+                    except Exception as lookup_error:
                         self._pm_intent_mark_uncertain(client_id, str(e))
-                        outbox.dispatch_attempts += 1
-                        outbox.last_error = str(e)[:250]
-                        PMOutbox.session.commit()
                         raise TemporaryError(
-                            f"Binance PM stoploss {client_id} submit failed and the "
-                            "same-id lookup also failed; the intent is UNKNOWN and will "
-                            "be resolved before any new order is allowed."
-                        ) from e
+                            f"Binance PM stoploss {client_id} POST outcome is uncertain and "
+                            "same-id lookup failed; automatic re-POST is forbidden."
+                        ) from lookup_error
                     if existing is not None:
                         self._pm_ack(client_id, existing, str(existing.get("id")))
-                        logger.warning(
-                            f"Binance PM stoploss {client_id} submit raised "
-                            f"{e.__class__.__name__}; resolved the already-placed "
-                            f"conditional order {existing.get('id')} (no duplicate submitted)."
-                        )
                         return existing
-                    outbox.dispatch_attempts += 1
-                    outbox.last_error = str(e)[:250]
-                    PMOutbox.session.commit()
-                    raise
+                    self._pm_intent_mark_uncertain(
+                        client_id,
+                        "conditional POST transient error; same-id absent; re-POST forbidden",
+                    )
+                    raise TemporaryError(
+                        f"Binance PM stoploss {client_id} POST raised {e.__class__.__name__}; "
+                        "same-id lookup is currently absent. The intent is UNKNOWN and "
+                        "will NOT be re-POSTed."
+                    ) from e
                 except ccxt.BaseError as e:
                     self._pm_intent_mark_uncertain(client_id, str(e))
-                    outbox.dispatch_attempts += 1
-                    outbox.last_error = str(e)[:250]
-                    PMOutbox.session.commit()
                     raise OperationalException(e) from e
                 try:
                     parsed = self._parse_pm_conditional_order(raw, pair)
@@ -1802,10 +1901,10 @@ class Binance(Exchange):
                     self._pm_ack(client_id, raw, str(parsed.get("id")))
                 except OperationalException as ack_error:
                     logger.critical(
-                        "PM stoploss %s ACK evidence could not be persisted: %s. The "
-                        "conditional order exists on the exchange; returning it so the "
-                        "local record can be committed. The intent stays PREPARED and "
-                        "blocks new exposure until recovery links it.",
+                        "PM stoploss %s ACK evidence could not be persisted: %s. "
+                        "dispatch_started_at remains durable, so this client id can "
+                        "never be POSTed again automatically; new exposure stays blocked "
+                        "until recovery resolves the intent.",
                         client_id,
                         ack_error,
                     )
@@ -1977,6 +2076,7 @@ class Binance(Exchange):
 
         def _fetch() -> dict[str, Any]:
             account = self._papi_request("account", "GET")
+            self._pm_last_account_read_at = datetime.now(UTC)
             self._log_exchange_response("papi_account", account)
             return account
 
@@ -2446,6 +2546,21 @@ class Binance(Exchange):
             return []
         return stream.pop_events(max_events)
 
+    def get_pm_read_freshness_stats(self) -> dict[str, Any]:
+        """Age of the last successful REAL PAPI account/position reads (not cache hits)."""
+        now = datetime.now(UTC)
+
+        def pack(value: datetime | None) -> dict[str, Any]:
+            return {
+                "at": value.isoformat() if value is not None else None,
+                "age_s": max(0.0, (now - value).total_seconds()) if value is not None else None,
+            }
+
+        return {
+            "account": pack(self._pm_last_account_read_at),
+            "positions": pack(self._pm_last_positions_read_at),
+        }
+
     def get_pm_user_stream_stats(self) -> dict[str, Any]:
         with self._pm_user_stream_lock:
             stream = self._pm_user_stream
@@ -2461,6 +2576,7 @@ class Binance(Exchange):
             "connected": False,
             "listen_key_set": False,
             "queued_events": 0,
+            "oldest_queued_event_age_s": None,
             "events_received": 0,
             "events_dropped": 0,
             "reconnects": 0,
@@ -2744,6 +2860,7 @@ class Binance(Exchange):
                     parsed = self._parse_pm_position(raw_position, namespace=namespace)
                     if parsed and (pair is None or parsed["symbol"] == pair):
                         positions.append(parsed)
+            self._pm_last_positions_read_at = datetime.now(UTC)
             self._log_exchange_response("papi_positions", positions, add_info=params)
             return positions
 
@@ -3137,6 +3254,8 @@ class Binance(Exchange):
         order_types: dict,
         side: BuySell,
         leverage: float,
+        *,
+        origin_trade_id: int | None = None,
     ) -> CcxtOrder:
         """
         Create a stoploss through the PM PAPI UM algo-order endpoint.
@@ -3154,6 +3273,7 @@ class Binance(Exchange):
                 order_types=order_types,
                 side=side,
                 leverage=leverage,
+                origin_trade_id=origin_trade_id,
             )
 
         user_order_type = order_types.get("stoploss", "market")
@@ -3221,6 +3341,7 @@ class Binance(Exchange):
                 "stop_price": stop_price_norm,
                 "price": limit_rate,
                 "reduce_only": True,
+                "origin_trade_id": origin_trade_id,
                 "ts": time.time(),
             },
             payload=request,

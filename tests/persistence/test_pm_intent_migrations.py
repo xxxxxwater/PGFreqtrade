@@ -129,3 +129,42 @@ def test_pm_intent_migration_emits_postgresql_compatible_sql(mocker) -> None:
 def test_legacy_pending_is_fail_closed_until_startup_migration_runs() -> None:
     """A failed/interrupted migration must never make an old intent invisible."""
     assert "PENDING" in UNRESOLVED_STATES
+
+def test_migration_marks_historical_acked_unknown_as_may_have_been_sent() -> None:
+    engine = create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE pm_order_intents ("
+            "id INTEGER PRIMARY KEY, client_id VARCHAR(40) NOT NULL, state VARCHAR(16) NOT NULL, "
+            "exchange_order_id VARCHAR(64), raw_response TEXT, acked_at TIMESTAMP)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE pm_outbox ("
+            "id INTEGER PRIMARY KEY, client_id VARCHAR(40) NOT NULL, state VARCHAR(16) NOT NULL, "
+            "exchange_order_id VARCHAR(64), raw_response TEXT, dispatch_attempts INTEGER NOT NULL, "
+            "created_at TIMESTAMP NOT NULL, processed_at TIMESTAMP)"
+        ))
+        connection.execute(text(
+            "INSERT INTO pm_order_intents "
+            "(id, client_id, state, exchange_order_id, raw_response, acked_at) VALUES "
+            "(1, 'acked-zero', 'ACKED', '123', '{}', CURRENT_TIMESTAMP), "
+            "(2, 'unknown-zero', 'UNKNOWN', NULL, NULL, NULL), "
+            "(3, 'pristine', 'PREPARED', NULL, NULL, NULL)"
+        ))
+        connection.execute(text(
+            "INSERT INTO pm_outbox "
+            "(id, client_id, state, exchange_order_id, raw_response, dispatch_attempts, created_at) VALUES "
+            "(1, 'acked-zero', 'PENDING', NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(2, 'unknown-zero', 'PENDING', NULL, NULL, 0, CURRENT_TIMESTAMP), "
+            "(3, 'pristine', 'PENDING', NULL, NULL, 0, CURRENT_TIMESTAMP)"
+        ))
+
+    migrate_pm_tables(engine)
+
+    with engine.connect() as connection:
+        rows = dict(connection.execute(text(
+            "SELECT client_id, dispatch_started_at FROM pm_outbox ORDER BY id"
+        )).all())
+    assert rows["acked-zero"] is not None
+    assert rows["unknown-zero"] is not None
+    assert rows["pristine"] is None

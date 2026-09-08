@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from freqtrade.exceptions import OperationalException, TemporaryError
+from freqtrade.exceptions import InvalidOrderException, OperationalException, TemporaryError
 from freqtrade.exchange.binance import Binance
 from freqtrade.persistence import PMOrderIntent, PMOutbox, init_db
 from tests.conftest import get_markets, get_patched_exchange
@@ -132,65 +132,141 @@ def test_deterministic_rejection_tombstones_intent_keeps_outbox(mocker, default_
     assert len(rejected) == 1
 
 
-def test_outbox_relay_redispaches_pending_row(mocker, default_conf_usdt):
-    """
-    A PENDING outbox row whose POST never happened is re-dispatched by the relay
-    exactly once (resolve-by-client-id first, then POST).
-    """
+def test_transient_submit_absent_lookup_never_reposts(mocker, default_conf_usdt):
+    """Once dispatch_started_at is durable, an absent lookup can NEVER cause a second POST."""
     exchange = make_exchange(mocker, default_conf_usdt)
     exchange._order_contracts_to_amount = MagicMock(side_effect=lambda o: o)
-    # First POST fails transiently, the lookup finds nothing, the row stays
-    # PENDING; the relay then POSTs again (mocked to succeed).
-    exchange._papi_request = MagicMock(side_effect=[TemporaryError("timeout"), PM_ORDER])
+    exchange._papi_request = MagicMock(side_effect=TemporaryError("timeout"))
     exchange._pm_fetch_order_by_client_id = MagicMock(return_value=None)
 
-    with pytest.raises(TemporaryError):
+    with pytest.raises(TemporaryError, match="will NOT be re-POSTed"):
         exchange._pm_place_order(
             "ETH/USDT:USDT", "limit", "buy", 1, 100, {}, log_tag="papi_create_order"
         )
 
-    pending = PMOutbox.get_pending()
-    assert len(pending) == 1
+    intent = PMOrderIntent.get_unresolved()[0]
+    outbox = PMOutbox.get_by_client_id(intent.client_id)
+    assert intent.state == "UNKNOWN"
+    assert outbox.dispatch_started_at is not None
+    assert outbox.dispatch_attempts == 1
+    first_posts = [c for c in exchange._papi_request.call_args_list if c[0][1] == "POST"]
+    assert len(first_posts) == 1
 
-    report = exchange.pm_drain_outbox()
-    assert report["acked"] == 1
-    intents = PMOrderIntent.get_unresolved()
-    assert len(intents) == 1
-    assert intents[0].state == "ACKED"
-
-
-def test_enqueue_supersedes_stale_prepared_same_pair(mocker, default_conf_usdt):
-    """A newer same-kind intent for the same pair supersedes a stale PREPARED one."""
-    exchange = make_exchange(mocker, default_conf_usdt)
-    exchange._order_contracts_to_amount = MagicMock(side_effect=lambda o: o)
-    exchange._papi_request = MagicMock(
-        side_effect=[TemporaryError("timeout"), PM_ORDER]
-    )
-    exchange._pm_fetch_order_by_client_id = MagicMock(return_value=None)
-
-    with pytest.raises(TemporaryError):
-        exchange._pm_place_order(
-            "ETH/USDT:USDT", "limit", "buy", 1, 100, {}, log_tag="papi_create_order"
-        )
-    # First intent left PREPARED/PENDING.
-    assert len(PMOrderIntent.get_unresolved()) == 1
-
-    # Second attempt for the same pair: supersedes the stale row.
+    # Relay/restart path: same-id lookup still absent.  It must remain UNKNOWN
+    # and never call POST again.
     exchange._papi_request = MagicMock(return_value=PM_ORDER)
-    order = exchange._pm_place_order(
-        "ETH/USDT:USDT", "limit", "buy", 1, 100, {}, log_tag="papi_create_order"
+    report = exchange.pm_drain_outbox()
+    assert report["acked"] == 0
+    assert report["deferred"] == 1
+    assert [c for c in exchange._papi_request.call_args_list if c[0][1] == "POST"] == []
+    assert PMOrderIntent.get_by_client_id(intent.client_id).state == "UNKNOWN"
+
+
+def test_pristine_unsent_prepared_can_be_superseded(mocker, default_conf_usdt):
+    """Only a PREPARED row with no dispatch marker/attempt is safe to supersede."""
+    exchange = make_exchange(mocker, default_conf_usdt)
+    exchange._pm_enqueue(
+        "ft-pristine-1",
+        {
+            "kind": "order",
+            "pair": "ETH/USDT:USDT",
+            "side": "buy",
+            "type": "limit",
+            "amount": 1.0,
+            "price": 100.0,
+            "reduce_only": False,
+        },
+        payload={"symbol": "ETHUSDT", "newClientOrderId": "ft-pristine-1"},
     )
-    assert order["id"] == "123"
-    unresolved = PMOrderIntent.get_unresolved()
-    assert len(unresolved) == 1
-    assert unresolved[0].state == "ACKED"
-    superseded = (
-        PMOutbox.session.query(PMOutbox)
-        .filter(PMOutbox.state == "REJECTED")
-        .all()
+    old = PMOutbox.get_by_client_id("ft-pristine-1")
+    assert old.dispatch_started_at is None
+    assert old.dispatch_attempts == 0
+
+    exchange._pm_enqueue(
+        "ft-pristine-2",
+        {
+            "kind": "order",
+            "pair": "ETH/USDT:USDT",
+            "side": "buy",
+            "type": "limit",
+            "amount": 1.0,
+            "price": 101.0,
+            "reduce_only": False,
+        },
+        payload={"symbol": "ETHUSDT", "newClientOrderId": "ft-pristine-2"},
     )
-    assert len(superseded) == 1
-    assert "superseded" in (superseded[0].last_error or "")
+    assert PMOrderIntent.get_by_client_id("ft-pristine-1") is None
+    assert PMOutbox.get_by_client_id("ft-pristine-1").state == "REJECTED"
+    assert PMOrderIntent.get_by_client_id("ft-pristine-2").state == "PREPARED"
+
+
+def test_may_have_been_sent_intent_cannot_be_superseded(mocker, default_conf_usdt):
+    exchange = make_exchange(mocker, default_conf_usdt)
+    exchange._papi_request = MagicMock(side_effect=TemporaryError("timeout"))
+    exchange._pm_fetch_order_by_client_id = MagicMock(return_value=None)
+    with pytest.raises(TemporaryError):
+        exchange._pm_place_order(
+            "ETH/USDT:USDT", "limit", "buy", 1, 100, {}, log_tag="papi_create_order"
+        )
+    old = PMOrderIntent.get_unresolved()[0]
+    assert old.state == "UNKNOWN"
+
+    with pytest.raises(OperationalException, match="refusing a fresh client id"):
+        exchange._pm_enqueue(
+            "ft-new-id",
+            {
+                "kind": "order",
+                "pair": "ETH/USDT:USDT",
+                "side": "buy",
+                "type": "limit",
+                "amount": 1.0,
+                "price": 101.0,
+                "reduce_only": False,
+            },
+            payload={"symbol": "ETHUSDT", "newClientOrderId": "ft-new-id"},
+        )
+    assert PMOrderIntent.get_by_client_id(old.client_id) is not None
+    assert PMOrderIntent.get_by_client_id("ft-new-id") is None
+
+
+def test_conditional_transient_absent_lookup_never_reposts(mocker, default_conf_usdt):
+    exchange = make_exchange(mocker, default_conf_usdt)
+    exchange._papi_request = MagicMock(side_effect=TemporaryError("timeout"))
+    exchange.fetch_stoploss_order = MagicMock(side_effect=InvalidOrderException("absent"))
+    request = {
+        "algoType": "CONDITIONAL",
+        "symbol": "ETHUSDT",
+        "side": "SELL",
+        "type": "STOP_MARKET",
+        "reduceOnly": "true",
+        "triggerPrice": 90,
+        "workingType": "CONTRACT_PRICE",
+        "clientAlgoId": "st-boundary-1",
+        "quantity": 1,
+    }
+    exchange._pm_enqueue(
+        "st-boundary-1",
+        {
+            "kind": "conditional",
+            "pair": "ETH/USDT:USDT",
+            "side": "sell",
+            "type": "STOP_MARKET",
+            "amount": 1.0,
+            "stop_price": 90,
+            "reduce_only": True,
+        },
+        payload=request,
+    )
+    with pytest.raises(TemporaryError, match="will NOT be re-POSTed"):
+        exchange._pm_dispatch_conditional("st-boundary-1", "ETH/USDT:USDT", request)
+    outbox = PMOutbox.get_by_client_id("st-boundary-1")
+    assert outbox.dispatch_started_at is not None
+    assert outbox.dispatch_attempts == 1
+
+    exchange._papi_request = MagicMock(return_value={"algoId": 999})
+    with pytest.raises(TemporaryError, match="automatic re-POST is forbidden"):
+        exchange._pm_dispatch_conditional("st-boundary-1", "ETH/USDT:USDT", request)
+    assert [c for c in exchange._papi_request.call_args_list if c[0][1] == "POST"] == []
 
 
 def test_outbox_row_missing_fails_closed(mocker, default_conf_usdt):
@@ -198,3 +274,125 @@ def test_outbox_row_missing_fails_closed(mocker, default_conf_usdt):
     exchange._papi_request = MagicMock(return_value=PM_ORDER)
     with pytest.raises(OperationalException, match="outbox row missing"):
         exchange._pm_dispatch_order("ftnone", "ETH/USDT:USDT", {"symbol": "ETHUSDT"})
+
+def test_intent_without_outbox_stays_unresolved_and_blocks_fresh_client_id(
+    mocker, default_conf_usdt
+):
+    exchange = make_exchange(mocker, default_conf_usdt)
+    PMOrderIntent.session.add(
+        PMOrderIntent(
+            client_id="ft-missing-outbox",
+            kind="order",
+            pair="ETH/USDT:USDT",
+            side="buy",
+            order_type="limit",
+            amount=1.0,
+            reduce_only=False,
+            state="UNKNOWN",
+        )
+    )
+    PMOrderIntent.session.commit()
+    exchange._pm_fetch_order_by_client_id = MagicMock()
+
+    intent = exchange.list_pm_pending_intents()[0]
+    assert intent["outbox_present"] is False
+    result = exchange.resolve_pm_pending_intent(intent)
+    assert result["uncertain"] is True
+    assert "outbox" in result["error"]
+    exchange._pm_fetch_order_by_client_id.assert_not_called()
+
+    with pytest.raises(OperationalException, match="refusing a fresh client id"):
+        exchange._pm_enqueue(
+            "ft-fresh-bypass",
+            {
+                "kind": "order",
+                "pair": "ETH/USDT:USDT",
+                "side": "buy",
+                "type": "limit",
+                "amount": 1.0,
+                "price": 100.0,
+                "reduce_only": False,
+            },
+            payload={"symbol": "ETHUSDT", "newClientOrderId": "ft-fresh-bypass"},
+        )
+    assert PMOrderIntent.get_by_client_id("ft-missing-outbox") is not None
+    assert PMOrderIntent.get_by_client_id("ft-fresh-bypass") is None
+
+def test_marker_committed_crash_before_post_never_redispatches(mocker, default_conf_usdt):
+    """Crash after the durable send marker but before POST is lookup-only forever."""
+    exchange = make_exchange(mocker, default_conf_usdt)
+    exchange._pm_enqueue(
+        "ft-marker-crash",
+        {
+            "kind": "order",
+            "pair": "ETH/USDT:USDT",
+            "side": "buy",
+            "type": "limit",
+            "amount": 1.0,
+            "price": 100.0,
+            "reduce_only": False,
+        },
+        payload={"symbol": "ETHUSDT", "newClientOrderId": "ft-marker-crash"},
+    )
+    exchange._pm_dispatch_marker_set("ft-marker-crash")
+    row = PMOutbox.get_by_client_id("ft-marker-crash")
+    assert row.dispatch_started_at is not None
+    assert row.dispatch_attempts == 1
+
+    # Process disappears HERE: no POST happened. A restart must still refuse to
+    # infer "unsent" from an absent lookup because the durable marker means the
+    # process may have crossed the network boundary.
+    exchange._pm_fetch_order_by_client_id = MagicMock(return_value=None)
+    exchange._papi_request = MagicMock(return_value=PM_ORDER)
+    report = exchange.pm_drain_outbox()
+
+    assert report["acked"] == 0
+    assert report["deferred"] == 1
+    assert [c for c in exchange._papi_request.call_args_list if c.args[1] == "POST"] == []
+    intent = PMOrderIntent.get_by_client_id("ft-marker-crash")
+    assert intent is not None and intent.state == "UNKNOWN"
+    assert PMOutbox.get_by_client_id("ft-marker-crash").dispatch_started_at is not None
+
+
+def test_conditional_marker_committed_crash_before_post_never_redispatches(
+    mocker, default_conf_usdt
+):
+    """Protective conditional marker-before-POST crash also stays same-ID lookup-only."""
+    exchange = make_exchange(mocker, default_conf_usdt)
+    request = {
+        "algoType": "CONDITIONAL",
+        "symbol": "ETHUSDT",
+        "side": "SELL",
+        "type": "STOP_MARKET",
+        "reduceOnly": "true",
+        "triggerPrice": 90,
+        "workingType": "CONTRACT_PRICE",
+        "clientAlgoId": "st-marker-crash",
+        "quantity": 1,
+    }
+    exchange._pm_enqueue(
+        "st-marker-crash",
+        {
+            "kind": "conditional",
+            "pair": "ETH/USDT:USDT",
+            "side": "sell",
+            "type": "STOP_MARKET",
+            "amount": 1.0,
+            "stop_price": 90,
+            "reduce_only": True,
+            "origin_trade_id": 17,
+        },
+        payload=request,
+    )
+    exchange._pm_dispatch_marker_set("st-marker-crash")
+    exchange.fetch_stoploss_order = MagicMock(side_effect=InvalidOrderException("not visible"))
+    exchange._papi_request = MagicMock(return_value={"algoId": 777})
+
+    report = exchange.pm_drain_outbox()
+
+    assert report["acked"] == 0
+    assert report["deferred"] == 1
+    assert [c for c in exchange._papi_request.call_args_list if c.args[1] == "POST"] == []
+    intent = PMOrderIntent.get_by_client_id("st-marker-crash")
+    assert intent is not None and intent.state == "UNKNOWN"
+    assert intent.origin_trade_id == 17

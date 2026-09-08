@@ -19,9 +19,9 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from freqtrade.exceptions import InvalidOrderException, TemporaryError
-from freqtrade.persistence import Order, Trade
+from freqtrade.persistence import Order, PMOrderIntent, PMOutbox, Trade
 from tests.freqtradebot.test_pm_order_ownership import event
-from tests.freqtradebot.test_pm_recovery import ccxt_order, make_pm_bot, make_stoploss_trade
+from tests.freqtradebot.test_pm_recovery import ccxt_order, make_open_trade, make_pm_bot, make_stoploss_trade
 from tests.freqtradebot.test_pm_recovery import pm_conf as _pm_conf
 
 
@@ -100,6 +100,7 @@ def test_invalid_replacement_never_retires_old_protection(mocker, pm_conf, check
     bot.exchange.cancel_stoploss_order_with_result.assert_not_called()
     assert {sl.order_id for sl in trade.open_sl_orders} == {"stold", "stnew"}
     assert "stop_protection_missing" in bot._pm_blocked_order_reasons()
+    assert "stop_retire_unresolved" not in bot._pm_blocked_order_reasons()
     bot.rpc.send_msg.assert_called_once()  # one SAFE_HOLD alert
 
 
@@ -131,7 +132,13 @@ def test_closed_replacement_processes_fill_first_and_keeps_old(mocker, pm_conf):
     bot.exchange.fetch_stoploss_order = MagicMock(
         return_value=conditional("stnew", status="closed", info={"reduceOnly": True})
     )
-    bot.update_trade_state = MagicMock()
+    def close_trade(*args, **kwargs):
+        trade.is_open = False
+        trade.amount = 0.0
+        return False
+
+    bot.update_trade_state = MagicMock(side_effect=close_trade)
+    bot.emergency_exit = MagicMock()
 
     verdict = bot._pm_replace_stop_protection(trade, ["stold"], new_stop_price=0.009)
 
@@ -139,6 +146,7 @@ def test_closed_replacement_processes_fill_first_and_keeps_old(mocker, pm_conf):
     # The fill was processed FIRST through the full lifecycle...
     bot.update_trade_state.assert_called_once()
     assert bot.update_trade_state.call_args.args[1] == "stnew"
+    bot.emergency_exit.assert_not_called()
     # ...and the old protection was NOT blindly canceled.
     bot.exchange.cancel_stoploss_order_with_result.assert_not_called()
     assert {sl.order_id for sl in trade.open_sl_orders} == {"stold", "stnew"}
@@ -210,6 +218,7 @@ def test_dca_fill_kill_between_stages_keeps_old_protection(mocker, pm_conf):
     bot.exchange.cancel_stoploss_order_with_result.assert_not_called()
     assert {sl.order_id for sl in trade.open_sl_orders} == {"stold", "stnew"}
     assert "stop_protection_missing" in bot._pm_blocked_order_reasons()
+    assert "stop_retire_unresolved" not in bot._pm_blocked_order_reasons()
 
 
 # ---------------------------------------------------------------------------
@@ -400,3 +409,242 @@ def test_stop_fill_event_never_retires_other_protection(mocker, pm_conf):
 
     bot.exchange.cancel_stoploss_order_with_result.assert_not_called()
     assert {sl.order_id for sl in trade.open_sl_orders} == {"stold", "stnew"}
+
+def test_retire_not_found_then_history_absent_keeps_local_pending(mocker, pm_conf):
+    """DELETE not-found + no lifecycle proof must never be rewritten as canceled."""
+    bot, trade = switch_bot(mocker, pm_conf)
+    old = trade.open_sl_orders[0]
+    bot.exchange.cancel_stoploss_order_with_result = MagicMock(
+        side_effect=InvalidOrderException("delete says not found")
+    )
+    bot.exchange.fetch_stoploss_order = MagicMock(
+        side_effect=InvalidOrderException("not open, not in history")
+    )
+
+    resolved = bot._pm_retire_stop_ids(trade, [str(old.order_id)])
+
+    assert resolved is False
+    assert old.ft_is_open is True
+    assert old.status not in {"canceled", "cancelled"}
+    assert "stop_retire_unresolved" in bot._pm_blocked_order_reasons()
+    bot.update_trade_state.assert_not_called() if isinstance(bot.update_trade_state, MagicMock) else None
+
+
+def test_retire_not_found_then_triggered_child_processes_lifecycle(mocker, pm_conf):
+    """If history proves the old strategy triggered, process the child instead of canceling it."""
+    bot, trade = switch_bot(mocker, pm_conf)
+    old = trade.open_sl_orders[0]
+    bot.exchange.cancel_stoploss_order_with_result = MagicMock(
+        side_effect=InvalidOrderException("delete says not found")
+    )
+    triggered = conditional(
+        str(old.order_id),
+        status="closed",
+        info={"algo_status": "TRIGGERED", "actual_order_id": "real-777", "actual_order": {"id": "real-777"}, "reduceOnly": True},
+    )
+    triggered["status_stop"] = "triggered"
+    bot.exchange.fetch_stoploss_order = MagicMock(return_value=triggered)
+    bot.update_trade_state = MagicMock()
+
+    resolved = bot._pm_retire_stop_ids(trade, [str(old.order_id)])
+
+    assert resolved is True
+    bot.update_trade_state.assert_called_once_with(
+        trade, str(old.order_id), triggered, stoploss_order=True
+    )
+    assert old.status != "canceled"
+
+
+def test_replace_verified_new_but_old_retire_ambiguous_stays_fail_closed(mocker, pm_conf):
+    bot, trade = switch_bot(mocker, pm_conf)
+    bot.exchange.fetch_stoploss_order = MagicMock(
+        side_effect=[
+            conditional("stnew", amount=11.0, info={"reduceOnly": True}),
+            InvalidOrderException("old absent from lifecycle"),
+        ]
+    )
+    bot.exchange.cancel_stoploss_order_with_result = MagicMock(
+        side_effect=InvalidOrderException("old cancel not found")
+    )
+
+    verdict = bot._pm_replace_stop_protection(trade, ["stold"], new_stop_price=0.009)
+
+    assert verdict == "kept_old"
+    old = next(sl for sl in trade.open_sl_orders if sl.order_id == "stold")
+    assert old.ft_is_open is True
+    assert old.status != "canceled"
+    assert "stop_retire_unresolved" in bot._pm_blocked_order_reasons()
+    assert "stop_protection_missing" not in bot._pm_blocked_order_reasons()
+
+def test_triggered_child_partial_fill_is_pending_not_terminal(mocker, pm_conf):
+    bot, trade = switch_bot(mocker, pm_conf)
+    check = conditional("stnew", status="open", amount=11.0, info={"reduceOnly": True, "actual_order": {"id": "child1"}})
+    check["status_stop"] = "triggered"
+    check["filled"] = 4.0
+    check["remaining"] = 7.0
+    bot.exchange.fetch_stoploss_order = MagicMock(return_value=check)
+    bot.update_trade_state = MagicMock()
+    bot.emergency_exit = MagicMock()
+
+    verdict = bot._pm_replace_stop_protection(trade, ["stold"], new_stop_price=0.009)
+
+    assert verdict == "triggered_pending"
+    bot.update_trade_state.assert_called_once()
+    bot.emergency_exit.assert_not_called()
+    bot.exchange.cancel_stoploss_order_with_result.assert_not_called()
+    assert "stop_triggered_exit_pending" in bot._pm_blocked_order_reasons()
+
+
+def test_triggered_child_terminal_partial_books_fill_then_exits_remainder(mocker, pm_conf):
+    bot, trade = switch_bot(mocker, pm_conf)
+    check = conditional("stnew", status="canceled", amount=11.0, info={"reduceOnly": True, "actual_order": {"id": "child1"}})
+    check["status_stop"] = "triggered"
+    check["filled"] = 4.0
+    check["remaining"] = 7.0
+    bot.exchange.fetch_stoploss_order = MagicMock(return_value=check)
+
+    def apply_partial(*args, **kwargs):
+        trade.amount = 7.0
+        trade.is_open = True
+        return False
+
+    bot.update_trade_state = MagicMock(side_effect=apply_partial)
+    bot.emergency_exit = MagicMock()
+
+    verdict = bot._pm_replace_stop_protection(trade, ["stold"], new_stop_price=0.009)
+
+    assert verdict == "triggered_failed"
+    bot.update_trade_state.assert_called_once()
+    bot.emergency_exit.assert_called_once_with(trade, trade.stoploss_or_liquidation)
+    assert "stop_protection_missing" in bot._pm_blocked_order_reasons()
+
+
+def test_uncertain_stop_dispatch_escalates_bot_trade_after_grace(mocker, pm_conf):
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = make_open_trade(pm_conf, order_id="entry1", side="buy", amount=11.0)
+    # This fixture models already-confirmed exposure; remove the synthetic open
+    # entry order so protection management sees no local stop candidate.
+    trade.orders.clear()
+    Trade.commit()
+    bot.config["exchange"]["portfolio_margin_risk"]["uncertain_stop_emergency_exit_seconds"] = 5
+    client_id = "st-uncertain-owned"
+    request = {
+        "algoType": "CONDITIONAL",
+        "symbol": "ETHUSDT",
+        "side": "SELL",
+        "type": "STOP_MARKET",
+        "reduceOnly": "true",
+        "triggerPrice": 0.009,
+        "clientAlgoId": client_id,
+        "quantity": 11.0,
+    }
+    bot.exchange._pm_enqueue(
+        client_id,
+        {
+            "kind": "conditional",
+            "pair": trade.pair,
+            "side": trade.exit_side,
+            "type": "STOP_MARKET",
+            "amount": trade.amount,
+            "stop_price": 0.009,
+            "reduce_only": True,
+            "origin_trade_id": trade.id,
+        },
+        payload=request,
+    )
+    bot.exchange._pm_dispatch_marker_set(client_id)
+    intent = PMOrderIntent.get_by_client_id(client_id)
+    intent.state = "UNKNOWN"
+    outbox = PMOutbox.get_by_client_id(client_id)
+    outbox.dispatch_started_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=10)
+    Trade.commit()
+    bot.emergency_exit = MagicMock()
+
+    handled = bot._pm_handle_uncertain_stop_dispatch(trade)
+
+    assert handled is True
+    bot.emergency_exit.assert_called_once_with(trade, trade.stoploss_or_liquidation)
+    assert PMOrderIntent.get_by_client_id(client_id).state == "UNKNOWN"
+    assert PMOutbox.get_by_client_id(client_id).dispatch_started_at is not None
+
+
+def test_uncertain_stop_before_grace_blocks_without_new_exit(mocker, pm_conf):
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = make_open_trade(pm_conf, order_id="entry2", side="buy", amount=11.0)
+    trade.orders.clear()
+    Trade.commit()
+    bot.config["exchange"]["portfolio_margin_risk"]["uncertain_stop_emergency_exit_seconds"] = 30
+    client_id = "st-uncertain-young"
+    bot.exchange._pm_enqueue(
+        client_id,
+        {
+            "kind": "conditional",
+            "pair": trade.pair,
+            "side": trade.exit_side,
+            "type": "STOP_MARKET",
+            "amount": trade.amount,
+            "stop_price": 0.009,
+            "reduce_only": True,
+            "origin_trade_id": trade.id,
+        },
+        payload={"symbol": "ETHUSDT", "clientAlgoId": client_id},
+    )
+    bot.exchange._pm_dispatch_marker_set(client_id)
+    PMOrderIntent.get_by_client_id(client_id).state = "UNKNOWN"
+    Trade.commit()
+    bot.emergency_exit = MagicMock()
+
+    assert bot._pm_handle_uncertain_stop_dispatch(trade) is True
+    bot.emergency_exit.assert_not_called()
+    assert "stop_protection_missing" in bot._pm_blocked_order_reasons()
+
+
+
+@pytest.mark.parametrize("child", [None, {"id": "real-pending"}])
+def test_retire_triggered_child_unconfirmed_never_completes(mocker, pm_conf, child):
+    bot, trade = switch_bot(mocker, pm_conf)
+    old = trade.open_sl_orders[0]
+    bot.exchange.cancel_stoploss_order_with_result = MagicMock(
+        side_effect=InvalidOrderException("not found")
+    )
+    info = {"reduceOnly": True}
+    if child is not None:
+        info["actual_order"] = child
+    check = conditional(str(old.order_id), status="open", info=info)
+    check["status_stop"] = "triggered"
+    check["filled"] = 4.0
+    bot.exchange.fetch_stoploss_order = MagicMock(return_value=check)
+    bot.update_trade_state = MagicMock()
+
+    assert bot._pm_retire_stop_ids(trade, [str(old.order_id)]) is False
+    assert old.ft_is_open
+    assert "stop_triggered_exit_pending" in bot._pm_blocked_order_reasons()
+    assert bot.update_trade_state.call_count == (0 if child is None else 1)
+
+
+@pytest.mark.parametrize("bad_symbol", [None, "BTC/USDT:USDT"])
+@pytest.mark.parametrize("path", ["scheduled", "stop_handler"])
+def test_wrong_identity_terminal_stop_never_updates_trade(mocker, pm_conf, bad_symbol, path):
+    bot, trade = switch_bot(mocker, pm_conf)
+    bot.strategy.order_types["stoploss_on_exchange"] = True
+    bad = conditional("stold", status="canceled", pair=bad_symbol)
+    bot.exchange.fetch_open_conditional_orders = MagicMock(return_value=[])
+    bot.exchange.fetch_stoploss_order = MagicMock(return_value=bad)
+    bot.update_trade_state = MagicMock()
+    bot.emergency_exit = MagicMock()
+    mocker.patch.object(Trade, "get_open_trades", return_value=[trade])
+    if path == "scheduled":
+        assert bot._pm_verify_stop_protection()
+    else:
+        assert bot.handle_stoploss_on_exchange(trade) is False
+    bot.update_trade_state.assert_not_called()
+    bot.emergency_exit.assert_not_called()
+    assert trade.open_sl_orders[0].ft_is_open
+
+
+@pytest.mark.parametrize("quantity", [float("nan"), float("inf"), -1.0])
+def test_nonfinite_protection_quantity_never_proves_coverage(mocker, pm_conf, quantity):
+    bot, trade = switch_bot(mocker, pm_conf)
+    check = conditional("stold", amount=quantity, info={"reduceOnly": True})
+    verdict, _ = bot._pm_validate_protection_order(trade, "stold", check)
+    assert verdict == "invalid"

@@ -7,9 +7,9 @@ restored from the CURRENT pre-release production backup.
 
 1. ``pm_order_intents`` and ``pm_outbox`` exist,
 2. the pre-send ``origin_trade_id`` evidence column is absent before migration,
-3. ``migrate_pm_tables`` adds it to BOTH tables without disturbing existing ACK/link evidence,
-4. legacy ``PENDING`` rows are migrated to ``PREPARED``,
-5. a second run is a no-op (idempotent).
+3. the FINAL application ``init_db`` creates ``pm_notification_outbox`` and adds ownership + send-before-POST evidence without disturbing ACK/link evidence,
+4. legacy ``PENDING`` rows are migrated to ``PREPARED`` and old dispatch attempts become MAY_HAVE_BEEN_SENT,
+5. a second application startup is a no-op (idempotent).
 
 Usage (NEVER point this at the production database - use a restored copy):
 
@@ -26,7 +26,7 @@ import sys
 
 from sqlalchemy import create_engine, inspect, text
 
-from freqtrade.persistence.migrations import migrate_pm_tables
+from freqtrade.persistence import PMNotificationOutbox, init_db
 
 
 def main() -> int:
@@ -62,8 +62,8 @@ def main() -> int:
     if not existing_ack_fields <= intent_before:
         print("restore is older than the current production schema; use the latest backup")
         return 2
-    if "origin_trade_id" in intent_before or "origin_trade_id" in outbox_before:
-        print("restore already has origin_trade_id - cannot rehearse this release migration")
+    if "dispatch_started_at" in outbox_before:
+        print("restore already has dispatch_started_at - cannot rehearse this release migration")
         return 2
 
     # Legacy rows: insert a PENDING row as the old build would have written it.
@@ -76,8 +76,17 @@ def main() -> int:
                 "false, now())"
             )
         )
+        conn.execute(
+            text(
+                "INSERT INTO pm_outbox "
+                "(client_id, operation, payload, state, dispatch_attempts, created_at) "
+                "VALUES ('legacy-pending', 'order', '{}', 'PENDING', 1, now())"
+            )
+        )
 
-    migrate_pm_tables(engine)
+    # Mirror the real final-image startup order: metadata.create_all() creates
+    # new tables, then PM ALTER migration upgrades existing tables.
+    init_db(db_url)
     intent_after = columns("pm_order_intents")
     outbox_after = columns("pm_outbox")
     if "origin_trade_id" not in intent_after:
@@ -85,6 +94,18 @@ def main() -> int:
         return 1
     if "origin_trade_id" not in outbox_after:
         print("FAIL: pm_outbox.origin_trade_id missing after migration")
+        return 1
+    if "dispatch_started_at" not in outbox_after:
+        print("FAIL: pm_outbox.dispatch_started_at missing after migration")
+        return 1
+    tables_after = set(inspect(engine).get_table_names())
+    if "pm_notification_outbox" not in tables_after:
+        print("FAIL: pm_notification_outbox was not created by final application startup")
+        return 1
+    notification_columns = columns("pm_notification_outbox")
+    required_notification = {"incident_id", "dedupe_key", "state", "priority", "attempts", "next_attempt_at", "sent_at"}
+    if not required_notification <= notification_columns:
+        print(f"FAIL: pm_notification_outbox missing columns {sorted(required_notification - notification_columns)}")
         return 1
 
     # Existing timestamp evidence must remain PostgreSQL-native TIMESTAMP.
@@ -104,9 +125,15 @@ def main() -> int:
         if row is None or row[0] != "PREPARED":
             print(f"FAIL: legacy PENDING row was not migrated to PREPARED (got {row!r})")
             return 1
+        marker = conn.execute(
+            text("SELECT dispatch_started_at FROM pm_outbox WHERE client_id='legacy-pending'")
+        ).scalar()
+        if marker is None:
+            print("FAIL: legacy dispatch_attempts>0 row was not marked MAY_HAVE_BEEN_SENT")
+            return 1
 
-    # Idempotency: a second run must not raise or change anything.
-    migrate_pm_tables(engine)
+    # Idempotency: a second FINAL application startup must not raise or change anything.
+    init_db(db_url)
     with engine.connect() as conn:
         count = conn.execute(
             text("SELECT COUNT(*) FROM pm_order_intents WHERE client_id = 'legacy-pending'")
@@ -116,8 +143,8 @@ def main() -> int:
             return 1
 
     print(
-        "MIGRATION REHEARSAL OK: origin_trade_id added to intent+outbox, "
-        "existing evidence preserved, PENDING->PREPARED migrated, idempotent."
+        "MIGRATION REHEARSAL OK: notification outbox created, origin_trade_id + dispatch_started_at migrated, "
+        "legacy send evidence preserved, PENDING->PREPARED migrated, second startup idempotent."
     )
     return 0
 

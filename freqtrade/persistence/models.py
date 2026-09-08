@@ -21,6 +21,7 @@ from freqtrade.persistence.migrations import check_migrate, migrate_pm_tables
 from freqtrade.persistence.pairlock import PairLock
 from freqtrade.persistence.pm_order_intent import PMOrderIntent
 from freqtrade.persistence.pm_outbox import PMOutbox
+from freqtrade.persistence.pm_notification_outbox import PMNotificationOutbox
 from freqtrade.persistence.pm_candle_watermark import PMCandleWatermark
 from freqtrade.persistence.pm_signal_ledger import PMSignalLedger
 from freqtrade.persistence.pm_stream_journal import PMStreamJournal
@@ -95,6 +96,25 @@ def init_db(db_url: str) -> None:
     _KeyValueStoreModel.session = Trade.session
     PMOrderIntent.session = Trade.session
     PMOutbox.session = Trade.session
+    # Critical notification delivery is isolated from both the business ORM
+    # transaction AND, on PostgreSQL, the business connection pool.  Telegram
+    # backlog/lock waits therefore cannot consume the pool used for Trade/Order
+    # commits. A total database outage is still shared by definition; callers
+    # treat notification persistence as best-effort and never roll back trading.
+    notification_engine = engine
+    if not db_url.startswith("sqlite://"):
+        notification_engine = create_engine(
+            db_url,
+            future=True,
+            pool_pre_ping=True,
+            pool_size=2,
+            max_overflow=0,
+            pool_timeout=1,
+        )
+    PMNotificationOutbox.session = scoped_session(
+        sessionmaker(bind=notification_engine, autoflush=False),
+        scopefunc=get_request_or_thread_id,
+    )
     PMCandleWatermark.session = Trade.session
     PMSignalLedger.session = Trade.session
     PMStreamJournal.session = Trade.session

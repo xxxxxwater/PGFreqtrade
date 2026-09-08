@@ -32,7 +32,7 @@ from freqtrade.enums import (
 from freqtrade.exceptions import OperationalException
 from freqtrade.freqtradebot import FreqtradeBot
 from freqtrade.loggers import setup_logging
-from freqtrade.persistence import PairLocks, Trade
+from freqtrade.persistence import PMNotificationOutbox, PMOrderIntent, PairLocks, Trade
 from freqtrade.persistence.models import Order
 from freqtrade.rpc import RPC
 from freqtrade.rpc.rpc import RPCException
@@ -2400,7 +2400,7 @@ def test_send_msg_enter_cancel_notification(
     )
 
 
-def test_send_msg_protection_notification(default_conf, mocker, time_machine) -> None:
+async def test_send_msg_protection_notification(default_conf, mocker, time_machine) -> None:
     default_conf["telegram"]["notification_settings"]["protection_trigger"] = "on"
 
     telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
@@ -2411,9 +2411,14 @@ def test_send_msg_protection_notification(default_conf, mocker, time_machine) ->
     }
     msg.update(lock.to_json())
     telegram.send_msg(msg)
+    # Explicitly drive the durable consumer; no sleeps/timing races.
+    await telegram._drain_critical_notifications_once()
+    assert msg_mock.call_count == 1
     assert (
-        msg_mock.call_args[0][0] == "*Protection* triggered due to randreason. "
-        "`ETH/BTC` will be locked until `2021-09-01 05:10:00`."
+        msg_mock.call_args[0][0].startswith("*Protection* triggered due to randreason. ")
+        and "`ETH/BTC` will be locked until `2021-09-01 05:10:00`."
+        in msg_mock.call_args[0][0]
+        and "Incident:" in msg_mock.call_args[0][0]
     )
 
     msg_mock.reset_mock()
@@ -2425,10 +2430,13 @@ def test_send_msg_protection_notification(default_conf, mocker, time_machine) ->
     lock = PairLocks.lock_pair("*", dt_now() + timedelta(minutes=100), "randreason")
     msg.update(lock.to_json())
     telegram.send_msg(msg)
-    assert (
-        msg_mock.call_args[0][0] == "*Protection* triggered due to randreason. "
+    await telegram._drain_critical_notifications_once()
+    assert msg_mock.call_count == 1
+    assert msg_mock.call_args[0][0].startswith(
+        "*Protection* triggered due to randreason. "
         "*All pairs* will be locked until `2021-09-01 06:45:00`."
     )
+    assert "Incident:" in msg_mock.call_args[0][0]
 
 
 @pytest.mark.parametrize(
@@ -2746,7 +2754,10 @@ def test_send_msg_status_notification(default_conf, mocker) -> None:
 async def test_warning_notification(default_conf, mocker) -> None:
     telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
     telegram.send_msg({"type": RPCMessageType.WARNING, "status": "message"})
-    assert msg_mock.call_args[0][0] == "\N{WARNING SIGN} *Warning:* `message`"
+    await telegram._drain_critical_notifications_once()
+    assert msg_mock.call_count == 1
+    assert msg_mock.call_args[0][0].startswith("\N{WARNING SIGN} *Warning:* `message`")
+    assert "Incident:" in msg_mock.call_args[0][0]
 
 
 def test_startup_notification(default_conf, mocker) -> None:
@@ -3199,3 +3210,231 @@ async def test_pm_close_executes_with_confirm(default_conf_usdt, mocker, update)
 
     close_mock.assert_called_once()
     assert close_mock.call_args[0][0] == "all"
+
+async def test_critical_notification_persists_and_dedupes(default_conf, mocker, init_persistence) -> None:
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    msg = {"type": RPCMessageType.WARNING, "status": "PM SAFE_HOLD: protection missing"}
+    rendered = telegram.compose_message(msg)
+
+    row_id_1 = telegram._queue_critical_notification(msg, rendered, False)
+    row_id_2 = telegram._queue_critical_notification(msg, rendered, False)
+
+    assert row_id_1 is not None
+    assert row_id_1 == row_id_2
+    row = PMNotificationOutbox.session.get(PMNotificationOutbox, row_id_1)
+    assert row.state == "PENDING"
+    assert row.attempts == 0
+    payload = __import__("json").loads(row.message)
+    assert "Incident:" in payload["text"]
+    PMNotificationOutbox.session.remove()
+
+
+async def test_critical_notification_failure_stays_pending_with_backoff(
+    default_conf, mocker, init_persistence
+) -> None:
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    msg = {"type": RPCMessageType.WARNING, "status": "PM FAIL-CLOSED: database unavailable"}
+    row_id = telegram._queue_critical_notification(msg, telegram.compose_message(msg), False)
+    telegram._last_send_error = "NetworkError: down"
+    telegram._send_msg = AsyncMock(return_value=False)
+
+    await telegram._deliver_critical_notification(row_id)
+
+    row = PMNotificationOutbox.session.get(PMNotificationOutbox, row_id)
+    assert row.state == "PENDING"
+    assert row.attempts == 1
+    assert row.next_attempt_at is not None
+    assert "NetworkError" in (row.last_error or "")
+    PMNotificationOutbox.session.remove()
+
+
+async def test_critical_notification_retry_success_marks_sent_and_reports_recovery(
+    default_conf, mocker, init_persistence
+) -> None:
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    msg = {"type": RPCMessageType.WARNING, "status": "PM FAIL-CLOSED: unresolved intent"}
+    row_id = telegram._queue_critical_notification(msg, telegram.compose_message(msg), False)
+    row = PMNotificationOutbox.session.get(PMNotificationOutbox, row_id)
+    row.attempts = 1
+    PMNotificationOutbox.session.commit()
+    PMNotificationOutbox.session.remove()
+    telegram._send_msg = AsyncMock(side_effect=[True, True])
+
+    await telegram._deliver_critical_notification(row_id)
+
+    row = PMNotificationOutbox.session.get(PMNotificationOutbox, row_id)
+    assert row.state == "SENT"
+    assert row.sent_at is not None
+    assert row.attempts == 2
+    assert telegram._send_msg.call_count == 2
+    assert "delivery recovered" in telegram._send_msg.call_args_list[1].args[0]
+    PMNotificationOutbox.session.remove()
+
+async def test_critical_notification_db_failure_does_not_raise_or_spawn_send_task(
+    default_conf, mocker, init_persistence
+) -> None:
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    commit_mock = mocker.patch.object(
+        PMNotificationOutbox.session, "commit", side_effect=RuntimeError("notification db down")
+    )
+
+    telegram.send_msg({"type": RPCMessageType.WARNING, "status": "PM FAIL-CLOSED: test"})
+
+    assert msg_mock.call_count == 0
+    assert len(telegram._critical_fallback_queue) == 1
+    assert telegram._critical_fallback_queue.maxlen == 100
+    mocker.stop(commit_mock)
+    await telegram._drain_critical_notifications_once()
+    assert msg_mock.call_count == 1
+
+
+async def test_telegram_accept_then_sent_commit_crash_retries_same_incident_only(
+    default_conf, mocker, init_persistence
+) -> None:
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, ftbot, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    trade_call = mocker.patch.object(ftbot, "execute_trade_exit", MagicMock())
+    msg = {"type": RPCMessageType.WARNING, "status": "PM FAIL-CLOSED: durable incident"}
+    row_id = telegram._queue_critical_notification(msg, telegram.compose_message(msg), False)
+    telegram._send_msg = AsyncMock(return_value=True)
+
+    commit_mock = mocker.patch.object(
+        PMNotificationOutbox.session, "commit", side_effect=RuntimeError("crash before SENT commit")
+    )
+    await telegram._deliver_critical_notification(row_id)
+    mocker.stop(commit_mock)
+
+    row = PMNotificationOutbox.session.get(PMNotificationOutbox, row_id)
+    assert row.state == "PENDING"
+    PMNotificationOutbox.session.remove()
+    first_text = telegram._send_msg.call_args_list[0].args[0]
+
+    await telegram._deliver_critical_notification(row_id)
+    row = PMNotificationOutbox.session.get(PMNotificationOutbox, row_id)
+    assert row.state == "SENT"
+    assert telegram._send_msg.call_count == 2
+    assert telegram._send_msg.call_args_list[1].args[0] == first_text
+    assert "Incident:" in first_text
+    trade_call.assert_not_called()
+    PMNotificationOutbox.session.remove()
+
+
+async def test_critical_action_notification_is_suppressed_when_trade_closed_before_send(
+    default_conf, mocker, init_persistence, fee
+) -> None:
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    create_mock_trades(fee)
+    trade = Trade.get_open_trades()[0]
+    msg = {
+        "type": RPCMessageType.WARNING,
+        "status": f"PM SAFE_HOLD: Trade #{trade.id} requires operator attention",
+        "incident_id": f"trade-action-{trade.id}",
+        "trade_id": trade.id,
+        "pair": trade.pair,
+        "requires_open_trade": True,
+    }
+    row_id = telegram._queue_critical_notification(msg, telegram.compose_message(msg), False)
+    trade.is_open = False
+    Trade.commit()
+    telegram._send_msg = AsyncMock(return_value=True)
+
+    await telegram._drain_critical_notifications_once()
+
+    row = PMNotificationOutbox.session.get(PMNotificationOutbox, row_id)
+    assert row.state == "STALE"
+    telegram._send_msg.assert_not_called()
+    PMNotificationOutbox.session.remove()
+
+
+async def test_notification_dedupe_keeps_distinct_trade_incidents(
+    default_conf, mocker, init_persistence
+) -> None:
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    base = "PM SAFE_HOLD: stop protection unavailable"
+    msg1 = {"type": RPCMessageType.WARNING, "status": base, "trade_id": 101, "pair": "ETH/USDT:USDT"}
+    msg2 = {"type": RPCMessageType.WARNING, "status": base, "trade_id": 102, "pair": "ETH/USDT:USDT"}
+
+    row1 = telegram._queue_critical_notification(msg1, telegram.compose_message(msg1), False)
+    row2 = telegram._queue_critical_notification(msg2, telegram.compose_message(msg2), False)
+
+    assert row1 != row2
+    a = PMNotificationOutbox.session.get(PMNotificationOutbox, row1)
+    b = PMNotificationOutbox.session.get(PMNotificationOutbox, row2)
+    assert a.incident_id != b.incident_id
+    PMNotificationOutbox.session.remove()
+
+
+async def test_critical_consumer_is_bounded_and_priority_ordered(
+    default_conf, mocker, init_persistence
+) -> None:
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    low = {"type": RPCMessageType.WARNING, "status": "ordinary warning"}
+    high = {"type": RPCMessageType.WARNING, "status": "PM FAIL-CLOSED: protection unavailable"}
+    telegram._queue_critical_notification(low, telegram.compose_message(low), False)
+    telegram._queue_critical_notification(high, telegram.compose_message(high), False)
+    telegram._send_msg = AsyncMock(return_value=True)
+
+    processed = await telegram._drain_critical_notifications_once(limit=1)
+
+    assert processed == 1
+    assert telegram._send_msg.call_count == 1
+    assert "FAIL-CLOSED" in telegram._send_msg.call_args.args[0]
+    assert PMNotificationOutbox.pending_count() == 1
+    PMNotificationOutbox.session.remove()
+
+
+async def test_telegram_retry_after_controls_durable_backoff(
+    default_conf, mocker, init_persistence
+) -> None:
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    msg = {"type": RPCMessageType.WARNING, "status": "PM FAIL-CLOSED: rate limited"}
+    row_id = telegram._queue_critical_notification(msg, telegram.compose_message(msg), False)
+    telegram._last_send_retry_after = 120.0
+    telegram._last_send_error = "RetryAfter: 120"
+    telegram._send_msg = AsyncMock(return_value=False)
+
+    await telegram._deliver_critical_notification(row_id)
+
+    row = PMNotificationOutbox.session.get(PMNotificationOutbox, row_id)
+    assert row.state == "PENDING"
+    assert row.next_attempt_at is not None
+    assert row.last_attempt_at is not None
+    assert (row.next_attempt_at - row.last_attempt_at).total_seconds() >= 120
+    PMNotificationOutbox.session.remove()
+
+
+async def test_business_state_rebuild_backfills_crash_before_notification_enqueue(
+    default_conf, mocker, init_persistence
+) -> None:
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    PMOrderIntent.session.add(
+        PMOrderIntent(
+            client_id="ft-backfill-incident",
+            kind="order",
+            pair="ETH/USDT:USDT",
+            reduce_only=False,
+            state="UNKNOWN",
+            last_error="crash-before-notify",
+        )
+    )
+    PMOrderIntent.session.commit()
+
+    queued = telegram._rebuild_critical_notifications_from_business_state()
+
+    assert queued >= 1
+    row = (
+        PMNotificationOutbox.session.query(PMNotificationOutbox)
+        .filter(PMNotificationOutbox.incident_id == "pm-intent-ft-backfill-incident")
+        .one()
+    )
+    assert row.state == "PENDING"
+    assert "duplicate POST is forbidden" in row.message
+    PMNotificationOutbox.session.remove()

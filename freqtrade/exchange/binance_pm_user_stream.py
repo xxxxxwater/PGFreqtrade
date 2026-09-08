@@ -111,12 +111,27 @@ class BinancePMUserStream:
 
     def stats(self) -> dict[str, Any]:
         with self._state_lock:
+            oldest_queued_event_age_s: float | None = None
+            if self._events:
+                oldest = self._events[0]
+                event_time = oldest.get("E") if isinstance(oldest, dict) else None
+                if event_time is None and isinstance(oldest, dict):
+                    event_time = oldest.get("T")
+                try:
+                    event_ms = float(event_time)
+                    oldest_queued_event_age_s = max(
+                        0.0,
+                        datetime.now(UTC).timestamp() - event_ms / 1000.0,
+                    )
+                except (TypeError, ValueError):
+                    oldest_queued_event_age_s = None
             return {
                 "enabled": True,
                 "running": bool(self._thread and self._thread.is_alive()),
                 "connected": self._connected,
                 "listen_key_set": bool(self._listen_key),
                 "queued_events": len(self._events),
+                "oldest_queued_event_age_s": oldest_queued_event_age_s,
                 "events_received": self._events_received,
                 "events_dropped": self._events_dropped,
                 "reconnects": self._reconnects,

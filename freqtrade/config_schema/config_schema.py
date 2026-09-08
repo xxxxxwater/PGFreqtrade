@@ -1162,6 +1162,17 @@ CONF_SCHEMA = {
                             "minimum": 1,
                             "default": 5,
                         },
+                        "uncertain_stop_emergency_exit_seconds": {
+                            "description": (
+                                "Maximum seconds a BOT-owned open Trade may remain with an "
+                                "UNKNOWN stoploss dispatch outcome before the bot submits a "
+                                "reduce-only emergency exit. Same-id stop recovery remains "
+                                "lookup-only; no second stop POST is generated. Default: 30."
+                            ),
+                            "type": "integer",
+                            "minimum": 5,
+                            "default": 30,
+                        },
                         "heartbeat_risk_cache_seconds": {
                             "description": (
                                 "Minimum seconds to cache Binance Portfolio Margin account "

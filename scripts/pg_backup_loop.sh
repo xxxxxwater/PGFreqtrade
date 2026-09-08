@@ -128,7 +128,7 @@ restore_smoke() {
     # This release adds pm_stream_journal. Pre-upgrade backups must first be
     # restored and migrated in isolation before they can pass this release's
     # seven-table readiness check; do not silently waive the journal check.
-    for TABLE in trades orders pm_order_intents pm_outbox pm_signal_ledger pm_candle_watermarks pm_stream_journal; do
+    for TABLE in trades orders pm_order_intents pm_outbox pm_notification_outbox pm_signal_ledger pm_candle_watermarks pm_stream_journal; do
         TABLE_CHECK=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \
             "SELECT to_regclass('public.$TABLE') IS NOT NULL")
         if [ "$TABLE_CHECK" != "t" ]; then
@@ -141,7 +141,7 @@ restore_smoke() {
     # Schema-level protection evidence must survive restore too.  Table presence
     # alone is insufficient: crash recovery now depends on the pre-send
     # origin_trade_id marker in BOTH the short-lived intent and permanent outbox.
-    for SPEC in "pm_order_intents:origin_trade_id" "pm_outbox:origin_trade_id"; do
+    for SPEC in "pm_order_intents:origin_trade_id" "pm_outbox:origin_trade_id" "pm_outbox:dispatch_started_at"; do
         TABLE=${SPEC%%:*}
         COLUMN=${SPEC##*:}
         COLUMN_CHECK=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \

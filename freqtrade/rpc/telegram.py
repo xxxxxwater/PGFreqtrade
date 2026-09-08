@@ -5,10 +5,12 @@ This module manage Telegram communication
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import uuid
+from collections import deque
 from collections.abc import Callable, Coroutine
 from copy import deepcopy
 from dataclasses import dataclass
@@ -31,7 +33,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import MessageLimit, ParseMode
-from telegram.error import BadRequest, NetworkError, TelegramError
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackContext,
@@ -46,7 +48,7 @@ from freqtrade.constants import DUST_PER_COIN, Config
 from freqtrade.enums import MarketDirection, RPCMessageType, SignalDirection, TradingMode
 from freqtrade.exceptions import OperationalException
 from freqtrade.misc import chunks, plural
-from freqtrade.persistence import Trade
+from freqtrade.persistence import PMNotificationOutbox, PMOrderIntent, PMStreamJournal, Trade
 from freqtrade.rpc import RPC, RPCException, RPCHandler
 from freqtrade.rpc.rpc import set_audit_op_id
 from freqtrade.rpc.rpc_types import RPCEntryMsg, RPCExitMsg, RPCOrderMsg, RPCSendMsg
@@ -177,7 +179,12 @@ class Telegram(RPCHandler):
         self._init_failed = False
         self._send_failures = 0
         self._last_send_error: str | None = None
+        self._last_send_retry_after: float | None = None
         self._last_sent_at: str | None = None
+        # Database-outage fallback is intentionally bounded and in-memory only.
+        # Persistent incidents are reconstructed from business records on restart.
+        self._critical_fallback_queue: deque[dict[str, Any]] = deque(maxlen=100)
+        self._critical_wakeup: asyncio.Event | None = None
         self._init_keyboard()
         self._start_thread()
 
@@ -443,16 +450,27 @@ class Telegram(RPCHandler):
                     logger.warning("Telegram init failed.")
                     return
                 await asyncio.sleep(2)
-        if self._app.updater:
-            await self._app.updater.start_polling(
-                bootstrap_retries=10,
-                timeout=20,
-                drop_pending_updates=True,
-            )
-            while True:
-                await asyncio.sleep(10)
-                if not self._app.updater.running:
-                    break
+        # Compensate business-commit -> notification-enqueue crash windows before
+        # the delivery worker begins. Failure here never prevents Telegram polling.
+        try:
+            self._rebuild_critical_notifications_from_business_state()
+        except Exception as exc:
+            logger.warning("Initial critical-notification rebuild failed: %s", exc)
+        retry_task = asyncio.create_task(self._critical_notification_retry_loop())
+        try:
+            if self._app.updater:
+                await self._app.updater.start_polling(
+                    bootstrap_retries=10,
+                    timeout=20,
+                    drop_pending_updates=True,
+                )
+                while True:
+                    await asyncio.sleep(10)
+                    if not self._app.updater.running:
+                        break
+        finally:
+            retry_task.cancel()
+            await asyncio.gather(retry_task, return_exceptions=True)
 
     async def _cleanup_telegram(self) -> None:
         if self._app.updater:
@@ -710,20 +728,454 @@ class Telegram(RPCHandler):
 
         return noti
 
-    def send_msg(self, msg: RPCSendMsg) -> None:
-        """Send a message to telegram channel"""
-        noti = self._message_loudness(msg)
+    @staticmethod
+    def _is_critical_notification(msg: RPCSendMsg) -> bool:
+        msg_type = msg.get("type")
+        if msg_type in {
+            RPCMessageType.WARNING,
+            RPCMessageType.EXCEPTION,
+            RPCMessageType.PROTECTION_TRIGGER,
+            RPCMessageType.PROTECTION_TRIGGER_GLOBAL,
+        }:
+            return True
+        return bool(msg_type == RPCMessageType.EXIT_FILL and msg.get("is_final_exit"))
 
+    def _notification_business_fingerprint(self, msg: RPCSendMsg) -> str:
+        """Stable PM incident identity from durable business evidence when available."""
+        status = str(msg.get("status") or msg.get("reason") or "")
+        if "PM" not in status and not msg.get("pair") and not msg.get("trade_id"):
+            return ""
+        parts: list[str] = []
+        try:
+            intents = (
+                PMNotificationOutbox.session.query(PMOrderIntent)
+                .filter(PMOrderIntent.state.in_(("PENDING", "PREPARED", "ACKED", "UNKNOWN")))
+                .all()
+            )
+            parts.extend(
+                f"i:{row.client_id}:{row.state}:{row.exchange_order_id or ''}:{row.origin_trade_id or ''}"
+                for row in sorted(intents, key=lambda item: item.client_id)
+            )
+        except Exception:
+            pass
+        try:
+            incidents = (
+                PMNotificationOutbox.session.query(PMStreamJournal)
+                .filter(PMStreamJournal.unresolved.is_(True))
+                .all()
+            )
+            parts.extend(
+                f"j:{row.id}:{row.pair}:{row.exchange_order_id}:{row.client_id or ''}:{row.reason}"
+                for row in sorted(incidents, key=lambda item: int(item.id or 0))
+            )
+        except Exception:
+            pass
+        return "|".join(parts)
+
+    def _notification_incident_id(self, msg: RPCSendMsg, message: str) -> tuple[str, str]:
+        explicit = str(msg.get("incident_id") or "").strip()
+        business = self._notification_business_fingerprint(msg)
+        base = "|".join(
+            [
+                str(msg.get("type")),
+                str(msg.get("pair") or ""),
+                str(msg.get("trade_id") or ""),
+                str(msg.get("status") or msg.get("reason") or message),
+                business,
+            ]
+        )
+        incident_id = explicit or ("tg-" + hashlib.sha256(base.encode("utf-8")).hexdigest()[:16])
+        if msg.get("dedupe_once"):
+            dedupe_basis = incident_id
+        else:
+            # Same incident is persisted at most once per 30-minute reminder window.
+            bucket = int(datetime.now(UTC).timestamp() // 1800)
+            dedupe_basis = f"{incident_id}:{bucket}"
+        dedupe_key = hashlib.sha256(dedupe_basis.encode("utf-8")).hexdigest()
+        return incident_id[:32], dedupe_key
+
+    @staticmethod
+    def _notification_priority(msg: RPCSendMsg) -> int:
+        status = str(msg.get("status") or "").upper()
+        msg_type = msg.get("type")
+        if msg_type == RPCMessageType.EXCEPTION or any(
+            token in status for token in ("FAIL-CLOSED", "SAFE_HOLD", "CRITICAL")
+        ):
+            return 100
+        if msg_type in {RPCMessageType.PROTECTION_TRIGGER, RPCMessageType.PROTECTION_TRIGGER_GLOBAL}:
+            return 90
+        if msg_type == RPCMessageType.EXIT_FILL and msg.get("is_final_exit"):
+            return 80
+        return 50
+
+    def _queue_critical_notification(
+        self,
+        msg: RPCSendMsg,
+        message: str,
+        disable_notification: bool,
+    ) -> int | None:
+        """Persist critical delivery without touching the trading transaction."""
+        incident_id, dedupe_key = self._notification_incident_id(msg, message)
+        body = message
+        if "Incident:" not in body:
+            body += f"\nIncident: `{incident_id}`"
+        payload = {
+            "text": body,
+            "disable_notification": bool(disable_notification),
+            "parse_mode": ParseMode.MARKDOWN,
+            "trade_id": msg.get("trade_id"),
+            "requires_open_trade": bool(msg.get("requires_open_trade", False)),
+            "incident_id": incident_id,
+            "event_type": str(msg.get("type")),
+        }
+        try:
+            existing = PMNotificationOutbox.get_by_dedupe_key(dedupe_key)
+            if existing is not None:
+                return existing.id
+            row = PMNotificationOutbox(
+                incident_id=incident_id,
+                dedupe_key=dedupe_key,
+                channel="telegram",
+                message=json.dumps(payload, default=str),
+                state="PENDING",
+                priority=self._notification_priority(msg),
+            )
+            PMNotificationOutbox.session.add(row)
+            PMNotificationOutbox.session.commit()
+            return row.id
+        except Exception:
+            try:
+                PMNotificationOutbox.session.rollback()
+            except Exception:
+                pass
+            logger.exception(
+                "Could not persist critical Telegram notification; trading state is unchanged."
+            )
+            return None
+        finally:
+            try:
+                PMNotificationOutbox.session.remove()
+            except Exception:
+                pass
+
+    def _critical_payload_stale(self, payload: dict[str, Any]) -> bool:
+        """True only when a queued action warning is provably no longer applicable."""
+        if not payload.get("requires_open_trade"):
+            return False
+        trade_id = payload.get("trade_id")
+        if not trade_id:
+            # Missing validity identity is not proof the message is stale. Keep it
+            # queued rather than sending an unvalidated action prompt.
+            raise RuntimeError("critical notification requires open Trade but has no trade_id")
+        trade = PMNotificationOutbox.session.get(Trade, int(trade_id))
+        return trade is None or not trade.is_open or not trade.has_open_position
+
+    def _rebuild_critical_notifications_from_business_state(self) -> int:
+        """Compensate the crash window between business commit and notification enqueue.
+
+        Durable PM intents/stream incidents and very recent closed Trades are the
+        source of truth. Reconstructed notifications use stable incident ids, so
+        replay can duplicate an operator message but can never replay a trade.
+        """
+        queued = 0
+        try:
+            intents = [
+                {
+                    "client_id": row.client_id,
+                    "state": row.state,
+                    "pair": row.pair,
+                    "origin_trade_id": row.origin_trade_id,
+                    "kind": row.kind,
+                    "last_error": row.last_error,
+                }
+                for row in (
+                    PMNotificationOutbox.session.query(PMOrderIntent)
+                    .filter(PMOrderIntent.state.in_(("PENDING", "PREPARED", "ACKED", "UNKNOWN")))
+                    .all()
+                )
+            ]
+            journals = [
+                {
+                    "id": row.id,
+                    "pair": row.pair,
+                    "exchange_order_id": row.exchange_order_id,
+                    "client_id": row.client_id,
+                    "reason": row.reason,
+                }
+                for row in (
+                    PMNotificationOutbox.session.query(PMStreamJournal)
+                    .filter(PMStreamJournal.unresolved.is_(True))
+                    .all()
+                )
+            ]
+            cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=15)
+            closed = [
+                {
+                    "id": trade.id,
+                    "pair": trade.pair,
+                    "close_date": trade.close_date,
+                    "exit_reason": trade.exit_reason,
+                }
+                for trade in (
+                    PMNotificationOutbox.session.query(Trade)
+                    .filter(Trade.is_open.is_(False), Trade.close_date.isnot(None), Trade.close_date >= cutoff)
+                    .limit(50)
+                    .all()
+                )
+            ]
+        except Exception as exc:
+            try:
+                PMNotificationOutbox.session.rollback()
+            except Exception:
+                pass
+            logger.warning("Could not rebuild critical notifications from business state: %s", exc)
+            return 0
+        finally:
+            try:
+                PMNotificationOutbox.session.remove()
+            except Exception:
+                pass
+
+        for item in intents:
+            status = (
+                f"PM RECOVERY: durable {item['kind']} intent {item['client_id']} "
+                f"for {item['pair']} remains {item['state']}. "
+                "The original client id is preserved and automatic duplicate POST is forbidden."
+            )
+            msg = {
+                "type": RPCMessageType.WARNING,
+                "status": status,
+                "incident_id": f"pm-intent-{item['client_id']}",
+                "pair": item["pair"],
+                "trade_id": item["origin_trade_id"],
+                "requires_open_trade": bool(
+                    item["kind"] == "conditional" and item["origin_trade_id"]
+                ),
+            }
+            rendered = self.compose_message(msg)
+            if rendered and self._queue_critical_notification(msg, rendered, False) is not None:
+                queued += 1
+
+        for item in journals:
+            msg = {
+                "type": RPCMessageType.WARNING,
+                "status": (
+                    f"PM RECOVERY: unresolved user-stream ownership incident "
+                    f"#{item['id']} {item['pair']} order={item['exchange_order_id']} "
+                    f"client={item['client_id'] or 'unknown'} reason={item['reason']}."
+                ),
+                "incident_id": f"pm-stream-{item['id']}",
+                "pair": item["pair"],
+            }
+            rendered = self.compose_message(msg)
+            if rendered and self._queue_critical_notification(msg, rendered, False) is not None:
+                queued += 1
+
+        # A final fill may have committed immediately before the process died and
+        # before Telegram enqueue. Reconstruct a one-time completion notice from
+        # the durable Trade row. It is informational only and never calls trading.
+        exit_fill_setting = (
+            self._config.get("telegram", {})
+            .get("notification_settings", {})
+            .get(str(RPCMessageType.EXIT_FILL), "on")
+        )
+        if exit_fill_setting != "off":
+            for item in closed:
+                close_ts = item["close_date"].isoformat() if item["close_date"] else "unknown"
+                msg = {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM RECOVERY NOTICE: Trade #{item['id']} {item['pair']} is CLOSED "
+                        f"in the durable database at {close_ts}; reason={item['exit_reason'] or 'unknown'}. "
+                        "This completion notice was reconstructed after restart."
+                    ),
+                    "incident_id": f"pm-closed-{item['id']}-{close_ts}",
+                    "trade_id": item["id"],
+                    "pair": item["pair"],
+                    "dedupe_once": True,
+                }
+                rendered = self.compose_message(msg)
+                if rendered and self._queue_critical_notification(msg, rendered, False) is not None:
+                    queued += 1
+        return queued
+
+    async def _deliver_critical_notification(self, row_id: int) -> None:
+        try:
+            row = PMNotificationOutbox.session.get(PMNotificationOutbox, row_id)
+            if row is None or row.state != "PENDING":
+                return
+            payload = json.loads(row.message)
+            if self._critical_payload_stale(payload):
+                row.state = "STALE"
+                row.last_error = "business state no longer satisfies delivery predicate"
+                PMNotificationOutbox.session.commit()
+                logger.info(
+                    "Critical Telegram incident %s suppressed as stale before send.",
+                    row.incident_id,
+                )
+                return
+
+            ok = await self._send_msg(
+                str(payload.get("text") or ""),
+                parse_mode=str(payload.get("parse_mode") or ParseMode.MARKDOWN),
+                disable_notification=bool(payload.get("disable_notification", False)),
+            )
+            now = datetime.now(UTC).replace(tzinfo=None)
+            row.attempts += 1
+            row.last_attempt_at = now
+            if ok:
+                previous_failures = max(0, row.attempts - 1)
+                row.state = "SENT"
+                row.sent_at = now
+                row.next_attempt_at = None
+                row.last_error = None
+                # If this COMMIT fails after Telegram accepted the message the row
+                # remains PENDING after rollback/restart. Re-delivery with the SAME
+                # incident id is allowed; no trading business record is replayed.
+                PMNotificationOutbox.session.commit()
+                if previous_failures:
+                    await self._send_msg(
+                        f"Telegram delivery recovered for incident `{row.incident_id}` "
+                        f"after {previous_failures} failed attempt(s).",
+                        ParseMode.MARKDOWN,
+                    )
+                return
+            delay = min(3600.0, 30.0 * (2 ** min(row.attempts - 1, 7)))
+            if self._last_send_retry_after is not None:
+                delay = max(delay, float(self._last_send_retry_after))
+            row.next_attempt_at = now + timedelta(seconds=delay)
+            row.last_error = self._last_send_error
+            PMNotificationOutbox.session.commit()
+        except Exception as e:
+            try:
+                PMNotificationOutbox.session.rollback()
+            except Exception:
+                pass
+            logger.warning("Critical Telegram outbox delivery failed internally: %s", e)
+        finally:
+            try:
+                PMNotificationOutbox.session.remove()
+            except Exception:
+                pass
+
+    async def _drain_critical_notifications_once(self, limit: int = 20) -> int:
+        """One bounded priority-ordered delivery pass; used by runtime and tests."""
+        processed = 0
+        try:
+            now = datetime.now(UTC).replace(tzinfo=None)
+            due = PMNotificationOutbox.due(now, limit=limit)
+            ids = [row.id for row in due]
+            PMNotificationOutbox.session.remove()
+        except Exception as exc:
+            try:
+                PMNotificationOutbox.session.rollback()
+                PMNotificationOutbox.session.remove()
+            except Exception:
+                pass
+            ids = []
+            logger.warning("Critical Telegram durable queue unavailable: %s", exc)
+
+        for row_id in ids:
+            await self._deliver_critical_notification(row_id)
+            processed += 1
+
+        # When the notification DB/pool was unavailable, a bounded memory queue
+        # preserves best-effort alerts without creating one asyncio task per event.
+        fallback_budget = max(0, min(5, limit - processed))
+        for _ in range(fallback_budget):
+            if not self._critical_fallback_queue:
+                break
+            item = self._critical_fallback_queue.popleft()
+            try:
+                if item.get("requires_open_trade"):
+                    payload = {
+                        "requires_open_trade": True,
+                        "trade_id": item.get("trade_id"),
+                    }
+                    if self._critical_payload_stale(payload):
+                        continue
+                ok = await self._send_msg(
+                    str(item.get("text") or ""),
+                    parse_mode=str(item.get("parse_mode") or ParseMode.MARKDOWN),
+                    disable_notification=bool(item.get("disable_notification", False)),
+                )
+            except Exception:
+                ok = False
+            finally:
+                try:
+                    PMNotificationOutbox.session.remove()
+                except Exception:
+                    pass
+            if not ok:
+                self._critical_fallback_queue.appendleft(item)
+                break
+            processed += 1
+        return processed
+
+    async def _critical_notification_retry_loop(self) -> None:
+        self._critical_wakeup = asyncio.Event()
+        rebuild_tick = 0
+        while True:
+            try:
+                if rebuild_tick % 4 == 0:
+                    self._rebuild_critical_notifications_from_business_state()
+                rebuild_tick += 1
+                await self._drain_critical_notifications_once(limit=20)
+                self._critical_wakeup.clear()
+                try:
+                    await asyncio.wait_for(self._critical_wakeup.wait(), timeout=15.0)
+                except TimeoutError:
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Critical Telegram retry loop error: %s", e)
+                await asyncio.sleep(1)
+
+    def _wake_critical_notification_consumer(self) -> None:
+        wakeup = self._critical_wakeup
+        if wakeup is None or wakeup.is_set():
+            return
+        try:
+            self._loop.call_soon_threadsafe(wakeup.set)
+        except Exception:
+            pass
+
+    def send_msg(self, msg: RPCSendMsg) -> None:
+        """Queue critical Telegram events; regular messages remain best-effort async."""
+        noti = self._message_loudness(msg)
         if noti == "off":
             logger.info(f"Notification '{msg['type']}' not sent.")
-            # Notification disabled
             return
-
         message = self.compose_message(deepcopy(msg))
-        if message:
-            asyncio.run_coroutine_threadsafe(
-                self._send_msg(message, disable_notification=(noti == "silent")), self._loop
-            )
+        if not message:
+            return
+        disable_notification = noti == "silent"
+        if self._is_critical_notification(msg):
+            row_id = self._queue_critical_notification(msg, message, disable_notification)
+            if row_id is None:
+                incident_id, _ = self._notification_incident_id(msg, message)
+                body = message
+                if "Incident:" not in body:
+                    body += f"\nIncident: `{incident_id}`"
+                if len(self._critical_fallback_queue) == self._critical_fallback_queue.maxlen:
+                    logger.critical(
+                        "Critical Telegram fallback queue full; oldest unsent fallback will be evicted."
+                    )
+                self._critical_fallback_queue.append(
+                    {
+                        "text": body,
+                        "disable_notification": disable_notification,
+                        "parse_mode": ParseMode.MARKDOWN,
+                        "trade_id": msg.get("trade_id"),
+                        "requires_open_trade": bool(msg.get("requires_open_trade", False)),
+                    }
+                )
+            self._wake_critical_notification_consumer()
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_msg(message, disable_notification=disable_notification), self._loop
+        )
 
     def _get_exit_emoji(self, msg):
         """
@@ -2445,7 +2897,7 @@ class Telegram(RPCHandler):
         callback_path: str = "",
         reload_able: bool = False,
         query: CallbackQuery | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Send given markdown message
         :param msg: message
@@ -2462,7 +2914,7 @@ class Telegram(RPCHandler):
                 callback_path=callback_path,
                 reload_able=reload_able,
             )
-            return
+            return True
         if reload_able and self._config["telegram"].get("reload", True):
             reply_markup = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("Refresh", callback_data=callback_path)]]
@@ -2496,12 +2948,38 @@ class Telegram(RPCHandler):
                     disable_notification=disable_notification,
                     message_thread_id=self._config["telegram"].get("topic_id"),
                 )
+        except RetryAfter as retry_err:
+            self._send_failures += 1
+            retry_after = getattr(retry_err, "retry_after", 30)
+            if hasattr(retry_after, "total_seconds"):
+                retry_after = retry_after.total_seconds()
+            try:
+                self._last_send_retry_after = max(1.0, float(retry_after))
+            except (TypeError, ValueError):
+                self._last_send_retry_after = 30.0
+            self._last_send_error = (
+                f"{retry_err.__class__.__name__}: {retry_err.message}; "
+                f"retry_after={self._last_send_retry_after}s"
+            )
+            logger.warning(
+                "Telegram rate limited for %.1fs; durable critical messages remain queued.",
+                self._last_send_retry_after,
+            )
+            return False
         except TelegramError as telegram_err:
             self._send_failures += 1
+            self._last_send_retry_after = None
             self._last_send_error = f"{telegram_err.__class__.__name__}: {telegram_err.message}"
-            logger.warning("TelegramError: %s! Giving up on that message.", telegram_err.message)
+            logger.warning(
+                "TelegramError: %s! Current attempt failed; durable critical messages remain queued.",
+                telegram_err.message,
+            )
+            return False
         else:
             self._last_sent_at = datetime.now(UTC).isoformat()
+            self._last_send_error = None
+            self._last_send_retry_after = None
+            return True
 
     @authorized_only
     async def _changemarketdir(self, update: Update, context: CallbackContext) -> None:

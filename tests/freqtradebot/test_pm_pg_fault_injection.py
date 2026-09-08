@@ -205,3 +205,45 @@ def test_advisory_lock_is_exclusive_across_threads(pm_pg):
         pass
     s1.close()
     s2.close()
+
+def test_advisory_lock_survives_business_session_commit(pm_pg):
+    """A business Session commit must not release/change the physical advisory-lock owner."""
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine(PG_URL)
+    Session = sessionmaker(bind=engine)
+    owner_session = Session()
+    contender_session = Session()
+
+    with pm_pipeline_lock(owner_session, timeout_seconds=2):
+        # This is the exact regression: order paths commit the ORM session while
+        # still inside pm_pipeline_lock.
+        owner_session.execute(text("SELECT 1"))
+        owner_session.commit()
+
+        acquired = False
+
+        def contender():
+            nonlocal acquired
+            try:
+                with pm_pipeline_lock(contender_session, timeout_seconds=0.6):
+                    acquired = True
+            except RuntimeError:
+                pass
+
+        thread = threading.Thread(target=contender)
+        thread.start()
+        thread.join()
+        assert acquired is False
+
+        # Nested scope in the owner thread must reuse the same dedicated lock
+        # connection instead of self-deadlocking on a second pooled connection.
+        with pm_pipeline_lock(owner_session, timeout_seconds=0.2):
+            owner_session.commit()
+
+    with pm_pipeline_lock(contender_session, timeout_seconds=1):
+        pass
+    owner_session.close()
+    contender_session.close()
+    engine.dispose()

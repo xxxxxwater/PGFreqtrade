@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 # TIMESTAMP as a type affinity, so this is valid for both supported databases.
 _PM_OUTBOX_NEW_COLUMNS = [
     ("origin_trade_id", "INTEGER"),
+    ("dispatch_started_at", "TIMESTAMP"),
 ]
 
 _PM_INTENT_NEW_COLUMNS = [
@@ -46,6 +47,7 @@ def migrate_pm_tables(engine: Engine) -> None:
     columns = {col["name"] for col in inspector.get_columns("pm_order_intents")}
     missing = [(name, sqltype) for name, sqltype in _PM_INTENT_NEW_COLUMNS if name not in columns]
     outbox_missing: list[tuple[str, str]] = []
+    outbox_columns: set[str] = set()
     if "pm_outbox" in tables:
         outbox_columns = {col["name"] for col in inspector.get_columns("pm_outbox")}
         outbox_missing = [
@@ -61,6 +63,35 @@ def migrate_pm_tables(engine: Engine) -> None:
             connection.execute(
                 text(f'ALTER TABLE pm_outbox ADD COLUMN "{name}" {sqltype}')
             )
+        # Conservatively reconstruct the old send boundary.  Historical builds
+        # did not have dispatch_started_at, so MAY_HAVE_BEEN_SENT evidence can
+        # exist even when dispatch_attempts is zero (for example ACKED/UNKNOWN
+        # intents, an exchange id, raw ACK or acked_at persisted by a different
+        # crash path).  Any such row must become lookup/reconcile-only after an
+        # upgrade; never reinterpret it as pristine and generate a second POST.
+        if "pm_outbox" in tables:
+            connection.execute(
+                text(
+                    "UPDATE pm_outbox AS o "
+                    "SET dispatch_started_at = COALESCE(o.processed_at, o.created_at) "
+                    "WHERE o.dispatch_started_at IS NULL AND ("
+                    "COALESCE(o.dispatch_attempts, 0) > 0 "
+                    "OR o.state IN ('ACKED', 'LINKED') "
+                    "OR o.exchange_order_id IS NOT NULL "
+                    "OR o.raw_response IS NOT NULL "
+                    "OR EXISTS ("
+                    "SELECT 1 FROM pm_order_intents AS i "
+                    "WHERE i.client_id = o.client_id AND ("
+                    "i.state IN ('ACKED', 'UNKNOWN', 'LINKED') "
+                    "OR i.exchange_order_id IS NOT NULL "
+                    "OR i.raw_response IS NOT NULL "
+                    "OR i.acked_at IS NOT NULL"
+                    ")"
+                    ")"
+                    ")"
+                )
+            )
+
         # All known PM schemas have a state column.  Keep this guard so an
         # unrelated/corrupt table produces no unsafe SQL; the normal model
         # initialization will still fail loudly when mandatory columns are

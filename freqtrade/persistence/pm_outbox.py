@@ -52,6 +52,10 @@ class PMOutbox(ModelBase):
     linked_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     linked_trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dispatch_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Durable send-before-POST marker.  Once set, this intent is in a
+    # MAY_HAVE_BEEN_SENT state and automatic code must never POST it again merely
+    # because a same-id lookup currently returns no record.
+    dispatch_started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False, default=dt_now)
     processed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     linked_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -95,6 +99,9 @@ class PMOutbox(ModelBase):
             "linked_order_id": self.linked_order_id,
             "linked_trade_id": self.linked_trade_id,
             "dispatch_attempts": self.dispatch_attempts,
+            "dispatch_started_at": (
+                self.dispatch_started_at.isoformat() if self.dispatch_started_at else None
+            ),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "processed_at": self.processed_at.isoformat() if self.processed_at else None,
             "linked_at": self.linked_at.isoformat() if self.linked_at else None,

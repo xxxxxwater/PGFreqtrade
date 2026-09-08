@@ -221,6 +221,165 @@ class VWAP_V4(IStrategy):
         "hma_50", "btc_close", "down", "pair_1h_fresh",
     ]
 
+    @staticmethod
+    def _pm_diag_bool(value) -> bool:
+        """Observability-only truth conversion: NaN/missing is always a failed predicate."""
+        try:
+            return False if value is None or pd.isna(value) else bool(value)
+        except (TypeError, ValueError):
+            return False
+
+    def pm_no_signal_detail(self, dataframe: DataFrame) -> str | None:
+        """Return the first failed predicate for each entry branch on the latest candle.
+
+        This method is diagnostic only.  It is called AFTER ``populate_entry_trend``
+        and never feeds ``enter_long`` or sizing/order logic.  Keeping one concise
+        failure per branch makes a durable no-signal ledger row explainable without
+        turning routine no-signal candles into log spam.
+        """
+        if dataframe is None or dataframe.empty:
+            return "no_dataframe"
+        last = dataframe.iloc[-1]
+        if self._pm_diag_bool(last.get('enter_long', 0)):
+            return None
+
+        def value(column: str, offset: int = 0):
+            idx = len(dataframe) - 1 - offset
+            if idx < 0 or column not in dataframe.columns:
+                return np.nan
+            return dataframe[column].iat[idx]
+
+        def finite_number(raw) -> float | None:
+            try:
+                number = float(raw)
+                return number if math.isfinite(number) else None
+            except (TypeError, ValueError):
+                return None
+
+        def gt(a, b) -> bool:
+            av, bv = finite_number(a), finite_number(b)
+            return av is not None and bv is not None and av > bv
+
+        def ge(a, b) -> bool:
+            av, bv = finite_number(a), finite_number(b)
+            return av is not None and bv is not None and av >= bv
+
+        def lt(a, b) -> bool:
+            av, bv = finite_number(a), finite_number(b)
+            return av is not None and bv is not None and av < bv
+
+        def le(a, b) -> bool:
+            av, bv = finite_number(a), finite_number(b)
+            return av is not None and bv is not None and av <= bv
+
+        def first_failed(branch: str, checks: list[tuple[str, bool]]) -> str:
+            failed = next((name for name, passed in checks if not passed), "unknown")
+            return f"{branch}:{failed}"
+
+        rolling_low_reclaim = (
+            finite_number(dataframe['low'].rolling(self.trend_reclaim_lookback).min().iat[-1])
+            if 'low' in dataframe.columns
+            else None
+        )
+        rolling_low_retest = (
+            finite_number(dataframe['low'].rolling(self.trend_retest_lookback).min().iat[-1])
+            if 'low' in dataframe.columns
+            else None
+        )
+        close48_max = (
+            finite_number(dataframe['close'].rolling(48).max().iat[-1])
+            if 'close' in dataframe.columns
+            else None
+        )
+        btc24_max = (
+            finite_number(dataframe['btc_close'].rolling(24).max().iat[-1])
+            if 'btc_close' in dataframe.columns
+            else None
+        )
+
+        reclaim = [
+            ('1h_fresh', self._pm_diag_bool(value('pair_1h_fresh'))),
+            ('trend_ok', finite_number(value('pair_trend_ok_1h')) == 1),
+            ('not_extended', finite_number(value('pair_not_overextended_1h')) == 1),
+            ('ema50_slope', gt(value('ema_50'), (finite_number(value('ema_50', 12)) or math.inf) * 0.999)),
+            ('strong_1h', finite_number(value('pair_trend_strong_1h')) == 1),
+            ('ema50_gt_200', gt(value('ema_50'), value('ema_200'))),
+            ('ema5_cross', gt(value('ema_5'), value('ema_10')) and le(value('ema_5', 1), value('ema_10', 1))),
+            ('pullback_low', rolling_low_reclaim is not None and lt(rolling_low_reclaim, (finite_number(value('ema_16')) or -math.inf) * self.trend_reclaim_low_ratio)),
+            ('reclaim_close', gt(value('close'), (finite_number(value('ema_16')) or math.inf) * self.trend_reclaim_close_floor) and lt(value('close'), (finite_number(value('ema_16')) or -math.inf) * self.trend_reclaim_close_ceiling)),
+            ('rsi', ge(value('rsi'), self.trend_reclaim_rsi_min) and le(value('rsi'), self.trend_reclaim_rsi_max)),
+            ('cti', ge(value('cti'), self.trend_reclaim_cti_min) and lt(value('cti'), self.trend_reclaim_cti_max)),
+            ('ewo', gt(value('EWO'), 0)),
+            ('volume', gt(value('volume'), value('volume_mean_24'))),
+        ]
+        retest = [
+            ('1h_fresh', self._pm_diag_bool(value('pair_1h_fresh'))),
+            ('trend_ok', finite_number(value('pair_trend_ok_1h')) == 1),
+            ('not_extended', finite_number(value('pair_not_overextended_1h')) == 1),
+            ('ema50_slope', gt(value('ema_50'), (finite_number(value('ema_50', 12)) or math.inf) * 0.999)),
+            ('strong_1h', finite_number(value('pair_trend_strong_1h')) == 1),
+            ('ema50_gt_200', gt(value('ema_50'), value('ema_200'))),
+            ('retest_cross', gt(value('close'), value('ema_16')) and le(value('close', 1), value('ema_16', 1))),
+            ('pullback_low', rolling_low_retest is not None and lt(rolling_low_retest, (finite_number(value('ema_16')) or -math.inf) * self.trend_retest_low_ratio)),
+            ('close_ceiling', lt(value('close'), (finite_number(value('ema_16')) or -math.inf) * self.trend_retest_close_ceiling)),
+            ('rsi', ge(value('rsi'), self.trend_retest_rsi_min) and le(value('rsi'), self.trend_retest_rsi_max)),
+            ('cti', ge(value('cti'), self.trend_retest_cti_min) and lt(value('cti'), self.trend_retest_cti_max)),
+            ('ewo', gt(value('EWO'), 0)),
+            ('volume', gt(value('volume'), (finite_number(value('volume_mean_24')) or math.inf) * self.trend_retest_volume_ratio)),
+        ]
+        insta = [
+            ('1h_fresh', self._pm_diag_bool(value('pair_1h_fresh'))),
+            ('bb1h', gt(value('bb_width_1h'), 0.131)),
+            ('r14', lt(value('r_14'), -51)),
+            ('r84_1h', lt(value('r_84_1h'), -70)),
+            ('cti', lt(value('cti'), -0.845)),
+            ('cti40_1h', lt(value('cti_40_1h'), -0.735)),
+            ('pair_drawdown', close48_max is not None and ge(close48_max, (finite_number(value('close')) or math.inf) * 1.1)),
+            ('btc_drawdown', btc24_max is not None and ge(btc24_max, (finite_number(value('btc_close')) or math.inf) * 1.03)),
+        ]
+        dip = [
+            ('1h_fresh', self._pm_diag_bool(value('pair_1h_fresh'))),
+            ('rmi', lt(value(f'rmi_length_{self.buy_rmi_length.value}'), self.buy_rmi.value)),
+            ('cci', le(value(f'cci_length_{self.buy_cci_length.value}'), self.buy_cci.value)),
+            ('srsi', lt(value('srsi_fk'), self.buy_srsi_fk.value)),
+            ('bb_delta', gt(value('bb_delta'), self.buy_bb_delta.value)),
+            ('bb_width', gt(value('bb_width'), self.buy_bb_width.value)),
+            ('closedelta', gt(value('closedelta'), (finite_number(value('close')) or math.inf) * self.buy_closedelta.value / 1000)),
+            ('bb_factor', lt(value('close'), (finite_number(value('bb_lowerband3')) or -math.inf) * self.buy_bb_factor.value)),
+            ('roc_1h', lt(value('roc_1h'), self.buy_roc_1h.value)),
+            ('bb_width_1h', lt(value('bb_width_1h'), self.buy_bb_width_1h.value)),
+        ]
+        vwap = [
+            ('below_vwap', lt(value('close'), value('vwap_lowerband'))),
+            ('tcp4', gt(value('tcp_percent_4'), 0.053)),
+            ('cti', lt(value('cti'), -0.8)),
+            ('rsi', lt(value('rsi'), 35)),
+            ('rsi84', lt(value('rsi_84'), 60)),
+            ('rsi112', lt(value('rsi_112'), 60)),
+            ('volume', gt(value('volume'), 0)),
+        ]
+        nfix = [
+            ('ema12', gt(value('ema_200'), (finite_number(value('ema_200', 12)) or math.inf) * 1.01)),
+            ('ema48', gt(value('ema_200'), (finite_number(value('ema_200', 48)) or math.inf) * 1.07)),
+            ('bb40_prev', gt(value('bb_lowerband2_40', 1), 0)),
+            ('bb_delta', gt(value('bb_delta_cluc'), (finite_number(value('close')) or math.inf) * 0.056)),
+            ('closedelta', gt(value('closedelta'), (finite_number(value('close')) or math.inf) * 0.01)),
+            ('tail', lt(value('tail'), (finite_number(value('bb_delta_cluc')) or -math.inf) * 0.5)),
+            ('below_bb40_prev', lt(value('close'), value('bb_lowerband2_40', 1))),
+            ('nonrising', le(value('close'), value('close', 1))),
+            ('ema50_floor', gt(value('close'), (finite_number(value('ema_50')) or math.inf) * 0.912)),
+        ]
+        return ';'.join(
+            [
+                first_failed('reclaim', reclaim),
+                first_failed('retest', retest),
+                first_failed('insta', insta),
+                first_failed('dip', dip),
+                first_failed('vwap', vwap),
+                first_failed('nfix', nfix),
+            ]
+        )
+
     def pm_signal_snapshot(self, pair: str, dataframe: DataFrame) -> dict | None:
         """
         Durable per-candle signal snapshot for the PM decision ledger.
@@ -255,11 +414,17 @@ class VWAP_V4(IStrategy):
         if not volume_ok:
             detail = (detail + "," if detail else "") + "volume_zero"
         tag = last.get("enter_tag")
+        no_signal_detail = (
+            self.pm_no_signal_detail(dataframe)
+            if not self._pm_diag_bool(last.get("enter_long", 0))
+            else None
+        )
         return {
             "factor_hash": digest,
             "data_fresh": fresh_1h and volume_ok,
             "freshness_detail": detail or None,
             "signal_tag": str(tag) if tag is not None and str(tag) != "None" else None,
+            "no_signal_detail": no_signal_detail,
             "candle_open_time": pd.to_datetime(last["date"], utc=True)
             .to_pydatetime()
             .replace(tzinfo=None),

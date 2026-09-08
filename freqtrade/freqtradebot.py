@@ -9,7 +9,7 @@ import traceback
 from hashlib import sha256
 from copy import deepcopy
 from datetime import UTC, datetime, time, timedelta
-from math import isclose
+from math import isclose, isfinite
 from threading import RLock, local
 from time import sleep
 from typing import Any
@@ -703,6 +703,107 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 logger.warning,
             )
         return None
+
+    def _pm_pending_conditional_stop_intent(
+        self, trade: Trade
+    ) -> tuple[PMOrderIntent, PMOutbox | None, bool] | None:
+        """Find an unresolved conditional that may be this Trade's protection.
+
+        Exact ``origin_trade_id`` ownership wins. Legacy rows without ownership
+        are returned only as an *unowned conflict* (bool=False): they still block
+        a new stop client-id and, if protection cannot be verified, eventually
+        force the BOT Trade to reduce risk without pretending the row is owned.
+        """
+        if not self._pm_db_gate_active():
+            return None
+        try:
+            rows = [
+                row
+                for row in PMOrderIntent.get_unresolved_for_pair(trade.pair)
+                if row.kind == "conditional"
+            ]
+        except Exception:
+            return None
+        exact = [row for row in rows if row.origin_trade_id == trade.id]
+        candidates = exact or [row for row in rows if row.origin_trade_id is None]
+        if not candidates:
+            return None
+        row = sorted(candidates, key=lambda item: item.created_at or datetime.min)[0]
+        try:
+            outbox = PMOutbox.get_by_client_id(row.client_id)
+        except Exception:
+            outbox = None
+        return row, outbox, bool(exact)
+
+    @staticmethod
+    def _pm_age_seconds(value: datetime | None) -> float | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return max(0.0, (datetime.now(UTC) - value).total_seconds())
+
+    def _pm_handle_uncertain_stop_dispatch(self, trade: Trade) -> bool:
+        """Keep a BOT position from waiting forever on an UNKNOWN stop POST.
+
+        Returns True when a pending/uncertain conditional owns the protection
+        decision for this iteration, so the caller must NOT generate a new stop
+        client id. A may-have-been-sent stop is always lookup-only. If it cannot
+        be verified within the configured grace, the remaining BOT Trade is
+        reduced via the normal idempotent emergency-exit path.
+        """
+        pending = self._pm_pending_conditional_stop_intent(trade)
+        if pending is None:
+            return False
+        intent, outbox, ownership_exact = pending
+
+        pristine = bool(
+            outbox is not None
+            and outbox.dispatch_started_at is None
+            and int(outbox.dispatch_attempts or 0) == 0
+            and intent.state in {"PENDING", "PREPARED"}
+        )
+        if pristine:
+            # This is the only safe redispatch class: the durable send boundary
+            # was never crossed. Drive recovery with the SAME client id.
+            try:
+                self._pm_recover_pending_intents()
+            except Exception as exc:
+                logger.warning(
+                    "PM stop recovery for Trade #%s %s failed: %s",
+                    trade.id, trade.pair, exc,
+                )
+            return True
+
+        evidence_time = None
+        if outbox is not None:
+            evidence_time = outbox.dispatch_started_at or outbox.processed_at
+        evidence_time = evidence_time or intent.acked_at or intent.created_at
+        age = self._pm_age_seconds(evidence_time) or 0.0
+        threshold = int(
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("uncertain_stop_emergency_exit_seconds", 30)
+        )
+        identity = "owned" if ownership_exact else "legacy-unowned"
+        self._pm_protection_hold(
+            trade,
+            f"{identity} stop intent {intent.client_id} outcome is {intent.state}; "
+            f"age={age:.1f}s",
+        )
+        if age < threshold:
+            return True
+
+        self.log_once(
+            f"PM protection escalation: Trade #{trade.id} {trade.pair} has no "
+            f"verified stop and conditional intent {intent.client_id} has remained "
+            f"uncertain for {age:.1f}s (limit={threshold}s). Submitting an "
+            "idempotent reduce-only emergency exit; the original stop stays "
+            "lookup-only and is never re-POSTed.",
+            logger.critical,
+        )
+        self.emergency_exit(trade, trade.stoploss_or_liquidation)
+        return True
 
     def _pm_reconciliation_incident_signature(self, result: dict[str, Any]) -> tuple:
         """Durable event-level identity for reconciliation warning de-duplication."""
@@ -2227,6 +2328,19 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         return mismatches
 
 
+    def _pm_stop_identity_matches(self, trade: Trade, expected_id: str, check: Any) -> bool:
+        """No lifecycle mutation without independent instrument, id and side evidence."""
+        if not isinstance(check, dict) or not check.get("symbol"):
+            return False
+        try:
+            return bool(
+                str(check.get("id") or "") == str(expected_id)
+                and self._pm_canonical_pair(check["symbol"]) == self._pm_canonical_pair(trade.pair)
+                and str(check.get("side") or "").lower() == trade.exit_side
+            )
+        except OperationalException:
+            return False
+
     def _pm_validate_protection_order(
         self,
         trade: Trade,
@@ -2237,21 +2351,21 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
     ) -> tuple[str, Any]:
         """Strictly validate one conditional protection order against the exchange.
 
-        Returns ("active"|"terminal"|"invalid", order):
+        Returns (verdict, order) where verdict is one of:
 
-        * "active":   working/trigger-pending conditional that really protects
-                      the position (instrument, id, side, positionSide,
-                      reduce-only semantics and quantity all verified).
-        * "terminal": CLOSED/FILLED/triggered - the order already fired. The
-                      caller MUST process the fill (update_trade_state), refresh
-                      the position and recompute the protection requirement
-                      before doing anything else.
-        * "invalid":  rejected / canceled / expired / unknown / missing status /
-                      wrong instrument / wrong side / wrong positionSide /
-                      not reduce-only (when required) / insufficient quantity.
-                      The previous protection must NEVER be retired on this.
+        * ``active``: working trigger-pending conditional that really protects
+          the position.
+        * ``terminal``: the stop/triggered child is fully filled; the caller must
+          process the fill before any other action.
+        * ``triggered_pending``: the conditional fired but the actual child is
+          absent/not-yet-visible or still OPEN/PARTIALLY_FILLED. This is an
+          in-flight risk-reducing exit, not proof the Trade is closed.
+        * ``triggered_failed``: the child is terminal without fully covering the
+          remaining Trade (canceled/rejected/expired/partial terminal). Process
+          any partial fill, then protect/exit the remaining position.
+        * ``invalid``: wrong identity/semantics or a non-triggered terminal stop.
         """
-        if not check:
+        if not self._pm_stop_identity_matches(trade, expected_id, check):
             return "invalid", check
         pair = self._pm_canonical_pair(trade.pair)
         # 1. canonical instrument exact match (never by bare order id)
@@ -2266,16 +2380,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             return "invalid", check
         status = str(check.get("status") or "").lower()
         triggered = str(check.get("status_stop") or "").lower() == "triggered"
-        # 3-8. status: closed/filled/triggered => terminal-unprocessed; only
-        # open/new are active; rejected/canceled/expired/missing => invalid.
-        if status in {"closed", "filled"} or triggered:
-            return "terminal", check
-        if status not in {"open", "new"}:
-            return "invalid", check
-        # 9. correct exit side
+        # 3. correct exit side
         if str(check.get("side") or "").lower() != trade.exit_side:
             return "invalid", check
-        # 10. positionSide semantics (one-way "BOTH" or matching hedge side)
+        # 4. positionSide semantics (one-way "BOTH" or matching hedge side)
         info = check.get("info") if isinstance(check, dict) else {}
         info = info or {}
         position_side = str(info.get("positionSide") or "").upper()
@@ -2283,23 +2391,52 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             expected_sides = {"BOTH", "LONG" if not trade.is_short else "SHORT"}
             if position_side not in expected_sides:
                 return "invalid", check
-        # 11. reduceOnly / closePosition semantics. Our own candidates are always
-        # created with reduceOnly=true by construction; the response only
-        # invalidates them when it explicitly contradicts that. Foreign
-        # conditionals (invariant verification) must PROVE reduce-only.
+        # 5. reduceOnly / closePosition semantics.
         reduce_only = info.get("reduceOnly")
+        if reduce_only is None and isinstance(info.get("actual_order"), dict):
+            reduce_only = (info.get("actual_order") or {}).get("reduceOnly")
+            if reduce_only is None:
+                reduce_only = ((info.get("actual_order") or {}).get("info") or {}).get("reduceOnly")
         if reduce_only is not None and str(reduce_only).lower() not in {"true", "1"}:
             return "invalid", check
         if require_reduce_only and reduce_only is None:
             return "invalid", check
-        # 12. protected quantity must cover the position
+        # 6. requested/child quantity must cover the remaining local exposure.
         quantity = check.get("amount")
         if quantity is None:
             return "invalid", check
         try:
-            if float(quantity) + max(float(trade.amount) * 1e-6, 1e-9) < float(trade.amount):
+            qty = float(quantity)
+            trade_amount = float(trade.amount)
+            tol = max(abs(trade_amount) * 1e-6, 1e-9)
+            if not isfinite(qty) or not isfinite(trade_amount) or qty <= 0:
+                return "invalid", check
+            if qty + tol < trade_amount:
                 return "invalid", check
         except (TypeError, ValueError):
+            return "invalid", check
+
+        if triggered:
+            actual = info.get("actual_order") if isinstance(info, dict) else None
+            # Trigger acknowledgement alone is NOT a fill. If the real child is
+            # not visible yet, keep it as an in-flight exit and keep polling.
+            if not isinstance(actual, dict):
+                return "triggered_pending", check
+            if status in {"open", "new"}:
+                return "triggered_pending", check
+            if status in {"canceled", "cancelled", "rejected", "expired"}:
+                return "triggered_failed", check
+            if status in {"closed", "filled"}:
+                try:
+                    filled = float(check.get("filled") or 0.0)
+                except (TypeError, ValueError):
+                    filled = 0.0
+                return ("terminal" if filled + tol >= trade_amount else "triggered_failed"), check
+            return "triggered_pending", check
+
+        if status in {"closed", "filled"}:
+            return "terminal", check
+        if status not in {"open", "new"}:
             return "invalid", check
         return "active", check
 
@@ -2314,30 +2451,172 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     {
                         "type": RPCMessageType.WARNING,
                         "status": (
-                            f"PM SAFE_HOLD: stop protection for {trade.pair} could not "
-                            f"be verified/replaced ({why}); the previous protection "
-                            "is retained and new exposure is BLOCKED."
+                            f"PM SAFE_HOLD: verified stop protection for Trade #{trade.id} "
+                            f"{trade.pair} could not be established ({why}). New exposure "
+                            "is BLOCKED; recovery and risk-reducing exits remain enabled."
                         ),
+                        "incident_id": f"pm-stop-missing-trade-{trade.id}",
+                        "trade_id": trade.id,
+                        "pair": trade.pair,
+                        "requires_open_trade": True,
                     }
                 )
             except Exception:
                 pass
 
-    def _pm_retire_stop_ids(self, trade: Trade, old_ids: list[str]) -> None:
-        """Cancel ONLY the given conditional ids (never a replacement)."""
+    def _pm_stop_retire_hold(self, trade: Trade, why: str) -> None:
+        """A verified replacement exists, but an OLD stop lifecycle is unresolved.
+
+        This is deliberately distinct from ``stop_protection_missing``: the
+        position still has verified protection, while the old conditional needs
+        recovery so we do not risk a duplicate reduce-only child later.
+        """
+        self._pm_block_orders("stop_retire_unresolved")
+        self.log_once(
+            f"PM stop retirement pending for Trade #{trade.id} {trade.pair}: {why}. "
+            "Verified replacement remains active; new exposure is blocked until "
+            "the old lifecycle is reconciled.",
+            logger.warning,
+        )
+        try:
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM RECOVERY: Trade #{trade.id} {trade.pair} has verified active "
+                        f"replacement protection, but an old stop lifecycle is unresolved ({why}). "
+                        "New exposure is blocked; protection is still present."
+                    ),
+                    "incident_id": f"pm-stop-retire-trade-{trade.id}",
+                    "trade_id": trade.id,
+                    "pair": trade.pair,
+                    "requires_open_trade": True,
+                }
+            )
+        except Exception:
+            pass
+
+    def _pm_triggered_exit_hold(self, trade: Trade, why: str) -> None:
+        """Conditional fired and its actual reduce-only child is still in flight."""
+        self._pm_block_orders("stop_triggered_exit_pending")
+        self.log_once(
+            f"PM triggered stop exit pending for Trade #{trade.id} {trade.pair}: {why}. "
+            "The child order is being reconciled; new exposure is blocked.",
+            logger.warning,
+        )
+        try:
+            self.rpc.send_msg(
+                {
+                    "type": RPCMessageType.WARNING,
+                    "status": (
+                        f"PM EXIT PENDING: Trade #{trade.id} {trade.pair} stop has triggered, "
+                        f"but the actual reduce-only child is not terminal ({why}). "
+                        "Partial fills are being reconciled; no completion is claimed."
+                    ),
+                    "incident_id": f"pm-stop-child-trade-{trade.id}",
+                    "trade_id": trade.id,
+                    "pair": trade.pair,
+                    "requires_open_trade": True,
+                }
+            )
+        except Exception:
+            pass
+
+    def _pm_retire_stop_ids(self, trade: Trade, old_ids: list[str]) -> bool:
+        """Retire only explicitly verified old stop ids.
+
+        A DELETE returning "not found" is NOT a cancellation proof: the strategy
+        may have triggered, become temporarily invisible, or already reached some
+        other terminal state.  In that case query the full conditional lifecycle
+        (including its triggered real child order) and only update the local Order
+        from explicit exchange truth.  Ambiguous absence stays open locally and
+        latches protection SAFE_HOLD for recovery.
+        """
+        all_resolved = True
         for old_id in sorted(set(old_ids)):
             try:
                 co = self.exchange.cancel_stoploss_order_with_result(
                     old_id, trade.pair, trade.amount
                 )
             except InvalidOrderException:
-                # Already gone (triggered/canceled): mark the local row canceled.
-                for sl in trade.open_sl_orders:
-                    if str(sl.order_id) == str(old_id):
-                        sl.ft_is_open = False
-                        sl.status = "canceled"
+                try:
+                    check = self.exchange.fetch_stoploss_order(old_id, trade.pair)
+                except InvalidOrderException:
+                    all_resolved = False
+                    logger.warning(
+                        "PM stop retire %s/%s: cancel returned not-found and a full "
+                        "open/history/trigger-child lookup still could not establish a "
+                        "terminal state. Keeping the local stop pending.",
+                        trade.pair,
+                        old_id,
+                    )
+                    self._pm_stop_retire_hold(
+                        trade, f"old stop {old_id} terminal state is unconfirmed"
+                    )
+                    continue
+                except Exception as e:
+                    all_resolved = False
+                    logger.warning(
+                        "PM stop retire %s/%s: cancel result is ambiguous and lifecycle "
+                        "lookup failed (%s). Keeping the local stop pending.",
+                        trade.pair,
+                        old_id,
+                        e,
+                    )
+                    self._pm_stop_retire_hold(
+                        trade, f"old stop {old_id} lifecycle lookup failed"
+                    )
+                    continue
+
+                status = str((check or {}).get("status") or "").lower()
+                status_stop = str((check or {}).get("status_stop") or "").lower()
+                identity_matches = bool(
+                    check
+                    and str(check.get("id") or "") == str(old_id)
+                    and check.get("symbol")
+                    and self._pm_canonical_pair(check["symbol"])
+                    == self._pm_canonical_pair(trade.pair)
+                    and str(check.get("side") or "").lower() == trade.exit_side
+                )
+                if not identity_matches:
+                    all_resolved = False
+                    self._pm_stop_retire_hold(trade, f"old stop {old_id} identity unverified")
+                    continue
+                if status_stop == "triggered":
+                    actual = (check.get("info") or {}).get("actual_order")
+                    if not isinstance(actual, dict) or not actual.get("id"):
+                        all_resolved = False
+                        self._pm_triggered_exit_hold(trade, f"old stop {old_id} child unavailable")
+                        continue
+                    # Book observed fills, but never call an OPEN child resolved.
+                    self.update_trade_state(trade, old_id, check, stoploss_order=True)
+                    if status not in {
+                        "closed", "filled", "canceled", "cancelled", "expired", "rejected"
+                    }:
+                        all_resolved = False
+                        self._pm_triggered_exit_hold(trade, f"old stop {old_id} child still open")
+                    continue
+                if status in {"closed", "filled", "canceled", "cancelled", "expired", "rejected"}:
+                    self.update_trade_state(trade, old_id, check, stoploss_order=True)
+                    continue
+
+                # Exchange still sees an active/unknown record after DELETE said
+                # not-found.  Do not pretend retirement completed.
+                all_resolved = False
+                logger.warning(
+                    "PM stop retire %s/%s: lifecycle lookup returned non-terminal "
+                    "status=%s status_stop=%s; keeping recovery pending.",
+                    trade.pair,
+                    old_id,
+                    status or "unknown",
+                    status_stop or "none",
+                )
+                self._pm_stop_retire_hold(
+                    trade, f"old stop {old_id} remains non-terminal after cancel ambiguity"
+                )
                 continue
             self.update_trade_state(trade, old_id, co, stoploss_order=True)
+        return all_resolved
 
     def _pm_replace_stop_protection(
         self,
@@ -2392,19 +2671,48 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         if verdict == "invalid":
             self._pm_protection_hold(trade, "replacement failed validation")
             return "kept_old"
+        if verdict == "triggered_pending":
+            # Triggering only created/started the real reduce-only child. Process
+            # any partial fill now, but never call it a completed exit. The OLD
+            # stop is retained and no replacement/duplicate child is submitted.
+            self.update_trade_state(trade, new_id, check, stoploss_order=True)
+            if trade.is_open and trade.has_open_position:
+                self._pm_triggered_exit_hold(
+                    trade, f"replacement {new_id} child is not terminal yet"
+                )
+            return "triggered_pending"
+        if verdict == "triggered_failed":
+            # A triggered child reached a terminal state without fully covering
+            # the Trade. First book any partial fill, then reduce the remaining
+            # BOT-owned exposure through the normal idempotent emergency-exit
+            # path. Never fabricate a filled/canceled stop terminal.
+            self.update_trade_state(trade, new_id, check, stoploss_order=True)
+            if trade.is_open and trade.has_open_position:
+                self._pm_protection_hold(
+                    trade, f"triggered child for {new_id} ended before full fill"
+                )
+                self.emergency_exit(trade, trade.stoploss_or_liquidation)
+            return "triggered_failed"
         if verdict == "terminal":
-            # The replacement already fired: process the fill FIRST, refresh the
-            # trade, and recompute the protection requirement. The old
-            # conditionals are never blindly canceled.
             logger.warning(
-                "PM protection replace: replacement %s for %s is already terminal; "
-                "processing the fill and keeping the old protection.",
+                "PM protection replace: replacement %s for %s is fully terminal; "
+                "processing the fill before any further protection action.",
                 new_id,
                 trade.pair,
             )
             self.update_trade_state(trade, new_id, check, stoploss_order=True)
+            if trade.is_open and trade.has_open_position:
+                self._pm_protection_hold(
+                    trade, f"terminal stop {new_id} left residual exposure"
+                )
+                self.emergency_exit(trade, trade.stoploss_or_liquidation)
             return "terminal"
-        self._pm_retire_stop_ids(trade, [o for o in old_ids if o != new_id])
+        retired = self._pm_retire_stop_ids(trade, [o for o in old_ids if o != new_id])
+        if not retired:
+            # NEW protection is verified and stays active, but at least one OLD
+            # stop has an unconfirmed terminal/cancel state.  Keep the gate closed
+            # until recovery resolves that lifecycle instead of reporting success.
+            return "kept_old"
         return "active"
 
     def _pm_switch_trailing_stoploss(
@@ -2443,15 +2751,16 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         return verdict
 
     def _pm_verify_stop_protection(self) -> list[dict[str, Any]]:
-        """Trades with confirmed exposure whose stop protection cannot be
-        STRICTLY verified on the exchange (conditional orders).
+        """Return BOT Trades whose remaining exposure lacks verified protection.
 
-        Verification is independent of open entry/DCA/exit orders: confirmed
-        local exposure requires protection no matter what else is working.
-        Each local conditional is checked by canonical instrument + id, then
-        validated for status/side/positionSide/reduce-only/quantity.
+        A verified replacement plus an unresolved OLD stop is tracked separately
+        as ``stop_retire_unresolved``. A triggered child that is still working or
+        partially filled is tracked as ``stop_triggered_exit_pending``. Neither is
+        mislabeled as missing protection.
         """
         offenders: list[dict[str, Any]] = []
+        retire_pending: list[dict[str, Any]] = []
+        triggered_pending: list[dict[str, Any]] = []
         if not (
             self.trading_mode == TradingMode.FUTURES
             and not self.config.get("dry_run", True)
@@ -2470,33 +2779,111 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             except OperationalException:
                 pair = str(raw_pair or "")
             by_key[(pair, str(order.get("id") or order.get("clientAlgoId") or ""))] = order
+
         for trade in Trade.get_open_trades():
             if not trade.is_open or not trade.has_open_position:
                 continue
             pair = self._pm_canonical_pair(trade.pair)
             local_ids = {str(sl.order_id) for sl in trade.open_sl_orders}
             verified: set[str] = set()
+            pending_exit_ids: set[str] = set()
+            unresolved_old_ids: set[str] = set()
             problems: list[str] = []
-            for sl in trade.open_sl_orders:
-                o = by_key.get((pair, str(sl.order_id)))
-                verdict, _ = self._pm_validate_protection_order(
-                    trade, str(sl.order_id), o, require_reduce_only=True
+
+            for sl in list(trade.open_sl_orders):
+                sid = str(sl.order_id)
+                order = by_key.get((pair, sid))
+                if order is None:
+                    try:
+                        # Open-list absence does not establish a terminal state.
+                        # Resolve open -> history -> actual child before deciding.
+                        order = self.exchange.fetch_stoploss_order(sid, trade.pair)
+                    except InvalidOrderException:
+                        unresolved_old_ids.add(sid)
+                        problems.append(f"{sid}:absent_open_and_history")
+                        continue
+                    except Exception as exc:
+                        unresolved_old_ids.add(sid)
+                        problems.append(f"{sid}:lookup_{exc.__class__.__name__}")
+                        continue
+
+                if not self._pm_stop_identity_matches(trade, sid, order):
+                    unresolved_old_ids.add(sid)
+                    problems.append(f"{sid}:identity_unverified")
+                    continue
+                verdict, checked = self._pm_validate_protection_order(
+                    trade, sid, order, require_reduce_only=True
                 )
+                status = str((checked or {}).get("status") or "").lower()
                 if verdict == "active":
-                    verified.add(str(sl.order_id))
-                else:
-                    problems.append(f"{sl.order_id}:{verdict}")
-            if not local_ids:
-                problems.append("no local stop protection")
-            if local_ids - verified or not local_ids:
-                offenders.append(
+                    verified.add(sid)
+                    continue
+                if verdict == "triggered_pending":
+                    # Book any partial child fill but keep the Trade open until
+                    # actual terminal exchange evidence arrives.
+                    self.update_trade_state(
+                        trade, sid, checked, stoploss_order=True, send_msg=False
+                    )
+                    if trade.is_open and trade.has_open_position:
+                        pending_exit_ids.add(sid)
+                        problems.append(f"{sid}:triggered_pending")
+                    continue
+                if verdict in {"terminal", "triggered_failed"}:
+                    self.update_trade_state(
+                        trade, sid, checked, stoploss_order=True, send_msg=False
+                    )
+                    if trade.is_open and trade.has_open_position:
+                        problems.append(f"{sid}:{verdict}_residual")
+                    continue
+                if status in {"canceled", "cancelled", "expired", "rejected"}:
+                    # Explicit terminal truth is safe to commit locally.
+                    self.update_trade_state(
+                        trade, sid, checked, stoploss_order=True, send_msg=False
+                    )
+                    continue
+                unresolved_old_ids.add(sid)
+                problems.append(f"{sid}:{verdict}")
+
+            if not trade.is_open or not trade.has_open_position:
+                continue
+            if verified:
+                unresolved = sorted((local_ids - verified) | unresolved_old_ids)
+                if unresolved:
+                    retire_pending.append(
+                        {
+                            "trade_id": trade.id,
+                            "pair": trade.pair,
+                            "old_ids": unresolved,
+                            "verified_ids": sorted(verified),
+                        }
+                    )
+                continue
+            if pending_exit_ids:
+                triggered_pending.append(
                     {
                         "trade_id": trade.id,
                         "pair": trade.pair,
-                        "local_ids": sorted(local_ids),
-                        "problems": problems,
+                        "ids": sorted(pending_exit_ids),
                     }
                 )
+                continue
+            offenders.append(
+                {
+                    "trade_id": trade.id,
+                    "pair": trade.pair,
+                    "local_ids": sorted(local_ids),
+                    "problems": problems or ["no verified stop protection"],
+                }
+            )
+
+        if retire_pending:
+            self._pm_block_orders("stop_retire_unresolved")
+        else:
+            self._pm_unblock_orders("stop_retire_unresolved")
+        if triggered_pending:
+            self._pm_block_orders("stop_triggered_exit_pending")
+        else:
+            self._pm_unblock_orders("stop_triggered_exit_pending")
         return offenders
 
     def _pm_origin_trade_kwargs(self, trade: Trade | None) -> dict[str, int]:
@@ -2647,6 +3034,97 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             "(clientId=%s, originTrade=%s) into Trade #%s %s; local lifecycle "
             "reconciliation will now finish it.",
             exchange_id, client_id, persisted.origin_trade_id, trade.id, trade.pair
+        )
+        return trade, order_obj
+
+    def _pm_adopt_orphan_conditional_order(
+        self, intent: dict[str, Any], exchange_order: CcxtOrder | dict[str, Any]
+    ) -> tuple[Trade, Order] | None:
+        """Adopt a BOT-owned stoploss that ACKed before its local Order commit.
+
+        Ownership is never inferred from pair/size alone: the persisted
+        ``origin_trade_id`` must name the exact Trade and the exchange response
+        must independently prove clientAlgoId, pair, side, reduce-only semantics
+        and protected quantity.
+        """
+        client_id = str(intent.get("client_id") or "")
+        if not client_id:
+            return None
+        persisted = PMOrderIntent.get_by_client_id(client_id)
+        if (
+            persisted is None
+            or persisted.state != "ACKED"
+            or persisted.kind != "conditional"
+            or not bool(persisted.reduce_only)
+            or persisted.origin_trade_id is None
+            or int(persisted.origin_trade_id) < 1
+        ):
+            return None
+        exchange_id = str(exchange_order.get("id") or "")
+        exchange_client_id = str(
+            exchange_order.get("clientAlgoId")
+            or (exchange_order.get("info") or {}).get("clientAlgoId")
+            or ""
+        )
+        exchange_symbol = str(exchange_order.get("symbol") or "")
+        exchange_side = str(exchange_order.get("side") or "").lower()
+        if not all((exchange_id, exchange_client_id, exchange_symbol, exchange_side)):
+            return None
+        if exchange_id != client_id or exchange_client_id != client_id:
+            return None
+        if persisted.exchange_order_id and str(persisted.exchange_order_id) != exchange_id:
+            return None
+        try:
+            pair = self._pm_canonical_pair(str(persisted.pair or ""))
+            if self._pm_canonical_pair(exchange_symbol) != pair:
+                return None
+        except OperationalException:
+            return None
+        if str(persisted.side or "").lower() != exchange_side:
+            return None
+        info = exchange_order.get("info") if isinstance(exchange_order, dict) else {}
+        info = info if isinstance(info, dict) else {}
+        reduce_only = exchange_order.get("reduceOnly")
+        if reduce_only is None:
+            reduce_only = info.get("reduceOnly")
+        if str(reduce_only).lower() not in {"true", "1"}:
+            return None
+        trade = Trade.session.get(Trade, int(persisted.origin_trade_id))
+        if trade is None or not trade.is_open or not trade.has_open_position:
+            return None
+        if self._pm_canonical_pair(trade.pair) != pair or trade.exit_side != exchange_side:
+            return None
+        try:
+            exchange_amount = float(exchange_order.get("amount"))
+            expected_amount = float(persisted.amount)
+            tol = max(abs(float(trade.amount)) * 1e-6, 1e-9)
+        except (TypeError, ValueError):
+            return None
+        if not isclose(exchange_amount, expected_amount, rel_tol=1e-6, abs_tol=tol):
+            return None
+        if not isclose(exchange_amount, float(trade.amount), rel_tol=1e-6, abs_tol=tol):
+            return None
+        if persisted.stop_price is not None and exchange_order.get("stopPrice") is not None:
+            try:
+                if not isclose(
+                    float(exchange_order.get("stopPrice")),
+                    float(persisted.stop_price),
+                    rel_tol=1e-8,
+                    abs_tol=max(abs(float(persisted.stop_price)) * 1e-8, 1e-9),
+                ):
+                    return None
+            except (TypeError, ValueError):
+                return None
+        if Order.order_by_id(client_id) is not None:
+            return None
+        order_obj = Order.parse_from_ccxt_object(
+            exchange_order, trade.pair, "stoploss", trade.amount, persisted.stop_price
+        )
+        trade.orders.append(order_obj)
+        logger.warning(
+            "PM recovery adopted fully-evidenced conditional orphan %s "
+            "(originTrade=%s) into Trade #%s %s.",
+            client_id, persisted.origin_trade_id, trade.id, trade.pair,
         )
         return trade, order_obj
 
@@ -2861,6 +3339,8 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             getattr(self.strategy, "strategy_version", None)
             or self.strategy.get_strategy_name()
         )
+        if decision == "no_signal" and reason in (None, "no_entry_signal"):
+            reason = str(snapshot.get("no_signal_detail") or "no_entry_signal")
         row = PMSignalLedger.record_once(
             pair=pair,
             timeframe=timeframe,
@@ -3026,9 +3506,15 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             )
             local = self._pm_find_local_order(exchange_id, client_id, intent["pair"])
             adopted: tuple[Trade, Order] | None = None
+            adopted_kind: str | None = None
             if local is None and result.get("order") is not None:
                 try:
-                    adopted = self._pm_adopt_orphan_reduce_only_order(intent, result["order"])
+                    if str(intent.get("kind") or "") == "conditional":
+                        adopted = self._pm_adopt_orphan_conditional_order(intent, result["order"])
+                        adopted_kind = "conditional" if adopted is not None else None
+                    else:
+                        adopted = self._pm_adopt_orphan_reduce_only_order(intent, result["order"])
+                        adopted_kind = "order" if adopted is not None else None
                 except Exception as e:
                     Trade.session.rollback()
                     logger.warning(
@@ -3053,7 +3539,23 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     if adopted is not None:
                         trade, adopted_order = adopted
                         status = str((result.get("order") or {}).get("status") or "").lower()
-                        if status in constants.NON_OPEN_EXCHANGE_STATES or status == "filled":
+                        status_stop = str(
+                            (result.get("order") or {}).get("status_stop") or ""
+                        ).lower()
+                        if adopted_kind == "conditional":
+                            # Even an OPEN triggered child may contain partial-fill
+                            # evidence. Process it through the normal stop lifecycle
+                            # without operator notifications during recovery.
+                            self.update_trade_state(
+                                trade,
+                                adopted_order.order_id,
+                                action_order=result["order"],
+                                stoploss_order=True,
+                                send_msg=False,
+                            )
+                            if status_stop == "triggered" and trade.is_open:
+                                self._pm_block_orders("stop_triggered_exit_pending")
+                        elif status in constants.NON_OPEN_EXCHANGE_STATES or status == "filled":
                             self.update_trade_state(
                                 trade,
                                 adopted_order.order_id,
@@ -5026,6 +5528,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 order_types=self.strategy.order_types,
                 side=trade.exit_side,
                 leverage=trade.leverage,
+                **self._pm_origin_trade_kwargs(trade),
             )
 
             order_obj = Order.parse_from_ccxt_object(
@@ -5075,12 +5578,52 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             except InvalidOrderException as exception:
                 logger.warning("Unable to fetch stoploss order: %s", exception)
 
+            pm_stop_verdict: str | None = None
             if stoploss_order:
+                if (
+                    getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+                    and not self._pm_stop_identity_matches(trade, str(slo.order_id), stoploss_order)
+                ):
+                    self._pm_protection_hold(trade, f"stop {slo.order_id} identity unverified")
+                    return False
                 stoploss_orders.append(stoploss_order)
+                if getattr(self.exchange, "_is_portfolio_margin", lambda: False)():
+                    pm_stop_verdict, _ = self._pm_validate_protection_order(
+                        trade, str(slo.order_id), stoploss_order
+                    )
                 self.update_trade_state(trade, slo.order_id, stoploss_order, stoploss_order=True)
 
-            # We check if stoploss order is fulfilled
-            if stoploss_order and stoploss_order["status"] in ("closed", "triggered"):
+            if stoploss_order and pm_stop_verdict == "triggered_pending":
+                if trade.is_open and trade.has_open_position:
+                    self._pm_triggered_exit_hold(
+                        trade, f"stop {slo.order_id} actual child is still working/partial"
+                    )
+                continue
+            if stoploss_order and pm_stop_verdict == "triggered_failed":
+                if trade.is_open and trade.has_open_position:
+                    self._pm_protection_hold(
+                        trade, f"triggered child for {slo.order_id} ended with residual exposure"
+                    )
+                    self.emergency_exit(trade, trade.stoploss_or_liquidation)
+                return False
+            if stoploss_order and pm_stop_verdict == "terminal":
+                if not trade.is_open or not trade.has_open_position:
+                    trade.exit_reason = ExitType.STOPLOSS_ON_EXCHANGE.value
+                    self._notify_exit(trade, "stoploss", True)
+                    self.handle_protections(trade.pair, trade.trade_direction)
+                    self._pm_unblock_orders("stop_triggered_exit_pending")
+                    return True
+                self._pm_protection_hold(
+                    trade, f"terminal stop {slo.order_id} left residual exposure"
+                )
+                self.emergency_exit(trade, trade.stoploss_or_liquidation)
+                return False
+
+            if (
+                stoploss_order
+                and pm_stop_verdict is None
+                and stoploss_order["status"] in ("closed", "triggered")
+            ):
                 trade.exit_reason = ExitType.STOPLOSS_ON_EXCHANGE.value
                 self._notify_exit(trade, "stoploss", True)
                 self.handle_protections(trade.pair, trade.trade_direction)
@@ -5099,6 +5642,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             stop_price = trade.stoploss_or_liquidation
 
             if getattr(self.exchange, "_is_portfolio_margin", lambda: False)():
+                # A persisted conditional crash-window incident owns this
+                # protection decision. Never bypass it with a fresh clientAlgoId.
+                if self._pm_handle_uncertain_stop_dispatch(trade):
+                    return False
                 # Unified safe creation: create -> persist candidate -> fetch
                 # exchange truth -> validate (no old conditional to retire).
                 self._pm_replace_stop_protection(trade, [], new_stop_price=stop_price)

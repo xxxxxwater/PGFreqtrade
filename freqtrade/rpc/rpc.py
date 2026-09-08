@@ -41,7 +41,12 @@ from freqtrade.enums import (
     TradingMode,
 )
 from freqtrade.exceptions import ExchangeError, PricingError
-from freqtrade.exchange import Exchange, timeframe_to_minutes, timeframe_to_msecs
+from freqtrade.exchange import (
+    Exchange,
+    timeframe_to_minutes,
+    timeframe_to_msecs,
+    timeframe_to_prev_date,
+)
 from freqtrade.exchange.exchange_utils import price_to_precision
 from freqtrade.ft_types import AnnotationType
 from freqtrade.loggers import bufferHandler
@@ -1262,8 +1267,11 @@ class RPC:
         }
         outbox_stats: dict[str, Any] = {}
         signal_ledger_rows: int | None = None
+        signal_coverage: dict[str, Any] = {}
         governor_stats: dict[str, Any] | None = None
         watermark_gaps: dict[str, Any] = {}
+        active_whitelist = list(getattr(self._freqtrade, "active_pair_whitelist", []) or [])
+        timeframe = str(getattr(self._freqtrade.strategy, "timeframe", self._config.get("timeframe", "")))
         try:
             from freqtrade.persistence import PMCandleWatermark, PMOutbox, PMSignalLedger
 
@@ -1274,6 +1282,54 @@ class RPC:
                 for state in ("PENDING", "ACKED", "LINKED", "RECONCILED", "REJECTED", "DEAD")
             }
             signal_ledger_rows = PMSignalLedger.session.query(PMSignalLedger).count()
+            if active_whitelist and timeframe:
+                tf_ms = timeframe_to_msecs(timeframe)
+                current_open = timeframe_to_prev_date(timeframe, datetime.now(UTC))
+                expected_candle = (current_open - timedelta(milliseconds=tf_ms)).replace(tzinfo=None)
+                coverage_rows = (
+                    PMSignalLedger.session.query(PMSignalLedger)
+                    .filter(
+                        PMSignalLedger.pair.in_(active_whitelist),
+                        PMSignalLedger.timeframe == timeframe,
+                        PMSignalLedger.candle_open_time == expected_candle,
+                        PMSignalLedger.decision_scope == "entry",
+                    )
+                    .all()
+                )
+                by_pair = {row.pair: row for row in coverage_rows}
+                decision_counts: dict[str, int] = {}
+                for row in coverage_rows:
+                    decision_counts[row.decision] = decision_counts.get(row.decision, 0) + 1
+                latest_decision = (
+                    PMSignalLedger.session.query(func.max(PMSignalLedger.candle_open_time))
+                    .filter(
+                        PMSignalLedger.pair.in_(active_whitelist),
+                        PMSignalLedger.timeframe == timeframe,
+                        PMSignalLedger.decision_scope == "entry",
+                    )
+                    .scalar()
+                )
+                signal_coverage = {
+                    "timeframe": timeframe,
+                    "expected_candle_open_time": expected_candle.isoformat(),
+                    "whitelist_count": len(active_whitelist),
+                    "decided_count": len(by_pair),
+                    "coverage_ratio": len(by_pair) / len(active_whitelist),
+                    "missing_pairs": [pair for pair in active_whitelist if pair not in by_pair],
+                    "decision_counts": decision_counts,
+                    "latest_decision_candle_open_time": (
+                        latest_decision.isoformat() if latest_decision is not None else None
+                    ),
+                    "per_pair": [
+                        {
+                            "pair": pair,
+                            "decision": by_pair[pair].decision if pair in by_pair else "missing",
+                            "reason": by_pair[pair].decision_reason if pair in by_pair else None,
+                            "data_fresh": by_pair[pair].data_fresh if pair in by_pair else None,
+                        }
+                        for pair in active_whitelist
+                    ],
+                }
             active_gaps = (
                 PMCandleWatermark.session.query(PMCandleWatermark)
                 .filter(PMCandleWatermark.gap_expected_open_time.isnot(None))
@@ -1302,6 +1358,30 @@ class RPC:
         if governor is not None and hasattr(governor, "stats"):
             governor_stats = governor.stats()
 
+        market_data = (
+            self._freqtrade.exchange.get_market_data_health(active_whitelist, timeframe)
+            if hasattr(self._freqtrade.exchange, "get_market_data_health")
+            else {}
+        )
+        papi_reads = (
+            self._freqtrade.exchange.get_pm_read_freshness_stats()
+            if hasattr(self._freqtrade.exchange, "get_pm_read_freshness_stats")
+            else {}
+        )
+        blocked_reasons = getattr(
+            self._freqtrade, "_pm_blocked_order_reasons", lambda: []
+        )()
+        foreign_conflicts = sorted(
+            (
+                set(getattr(self._freqtrade, "_pm_foreign_position_pairs", set()))
+                | set(getattr(self._freqtrade, "_pm_foreign_order_pairs", set()))
+            )
+            & set(active_whitelist)
+        )
+        last_reconcile = getattr(self._freqtrade, "_pm_last_reconcile_result", None) or {}
+        last_reconcile_at = getattr(self._freqtrade, "_pm_last_success_reconcile_time", None)
+        open_bot_trades = Trade.get_open_trades()
+
         return {
             "account_status": risk.get("account_status") or "unknown",
             "uni_mmr": risk.get("uni_mmr"),
@@ -1312,9 +1392,32 @@ class RPC:
                 self._freqtrade, "_pm_get_user_stream_state", lambda: "UNKNOWN"
             )(),
             "user_stream": stream,
-            "orders_blocked_reasons": getattr(
-                self._freqtrade, "_pm_blocked_order_reasons", lambda: []
-            )(),
+            "run_state": self._freqtrade.state.name,
+            "orders_blocked_reasons": blocked_reasons,
+            "entry_permission": {
+                "global_allowed": not blocked_reasons,
+                "global_block_reasons": blocked_reasons,
+                "pair_local_foreign_conflicts": foreign_conflicts,
+                "allowed_whitelist_pairs": [
+                    pair
+                    for pair in active_whitelist
+                    if not blocked_reasons and pair not in foreign_conflicts
+                ],
+            },
+            "exit_capability": {
+                "automatic_risk_reducing": True,
+                "manual_force_exit_allowed": self._freqtrade.state != State.STOPPED,
+            },
+            "protection": {
+                "open_bot_trades": len(open_bot_trades),
+                "unprotected_positions": last_reconcile.get("unprotected_positions", []),
+                "last_success_reconcile_at": (
+                    last_reconcile_at.isoformat() if last_reconcile_at is not None else None
+                ),
+            },
+            "market_data": market_data,
+            "papi_reads": papi_reads,
+            "signal_coverage": signal_coverage,
             "balances": non_zero_balances,
             "positions": [
                 position

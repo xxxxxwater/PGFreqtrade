@@ -227,6 +227,10 @@ class Exchange:
 
         # Holds last candle refreshed time of each pair
         self._pairs_last_refresh_time: dict[PairWithTimeframe, int] = {}
+        # Live OHLCV delivery observability.  This is deliberately separate from
+        # private/user-stream health: a healthy account stream proves nothing
+        # about the market-data path feeding strategy decisions.
+        self._ohlcv_source_stats: dict[PairWithTimeframe, dict[str, Any]] = {}
         # Timestamp of last markets refresh
         self._last_markets_refresh: int = 0
 
@@ -1546,6 +1550,8 @@ class Exchange:
         order_types: dict,
         side: BuySell,
         leverage: float,
+        *,
+        origin_trade_id: int | None = None,
     ) -> CcxtOrder:
         """
         creates a stoploss order.
@@ -2700,10 +2706,13 @@ class Exchange:
                 self._ws_candles_cover_refresh(pair, timeframe, candle_type, result[3], candle_ts)
                 and last_refresh >= candle_ts - timeframe_to_msecs(timeframe) // 2
             ):
+                self._record_ohlcv_delivery(pair, timeframe, candle_type, "ws", result[3])
                 return result
         except (TemporaryError, KeyError, RuntimeError):
             logger.warning("WS snapshot invalidated for %s, %s; fetching REST.", pair, timeframe)
-        return await self._async_get_candle_history(pair, timeframe, candle_type)
+        result = await self._async_get_candle_history(pair, timeframe, candle_type)
+        self._record_ohlcv_delivery(pair, timeframe, candle_type, "rest_fallback", result[3])
+        return result
 
     def _can_use_websocket(
         self, exchange_ws: ExchangeWS | None, pair: str, timeframe: str, candle_type: CandleType
@@ -2951,6 +2960,94 @@ class Exchange:
                 self._expiring_candle_cache[(c[1], since_ms)][c] = val
         return candles
 
+    def _record_ohlcv_delivery(
+        self,
+        pair: str,
+        timeframe: str,
+        candle_type: CandleType,
+        source: str,
+        candles: list[list],
+    ) -> None:
+        """Remember the actual live market-data delivery path and closed-candle head."""
+        if candle_type not in (CandleType.SPOT, CandleType.FUTURES):
+            return
+        key = (pair, timeframe, candle_type)
+        current_open_ms = dt_ts(timeframe_to_prev_date(timeframe))
+        closed_ms = [
+            int(row[0])
+            for row in (candles or [])
+            if row and row[0] is not None and int(row[0]) < current_open_ms
+        ]
+        prior = self._ohlcv_source_stats.get(key, {})
+        self._ohlcv_source_stats[key] = {
+            "source": source,
+            "last_delivery_at": datetime.now(UTC).isoformat(),
+            "last_delivery_ms": dt_ts(),
+            "latest_closed_candle_ms": max(closed_ms) if closed_ms else None,
+            "fallback_count": int(prior.get("fallback_count", 0))
+            + int(source == "rest_fallback"),
+        }
+
+    def get_market_data_health(
+        self,
+        pairs: list[str] | None = None,
+        timeframe: str | None = None,
+    ) -> dict[str, Any]:
+        """Read-only market-data freshness, independent from the PM user stream."""
+        now_ms = dt_ts()
+        wanted = set(pairs or [])
+        rows: list[dict[str, Any]] = []
+        for (pair, tf, candle_type), stat in sorted(
+            self._ohlcv_source_stats.items(), key=lambda item: (item[0][0], item[0][1])
+        ):
+            if wanted and pair not in wanted:
+                continue
+            if timeframe is not None and tf != timeframe:
+                continue
+            if candle_type not in (CandleType.SPOT, CandleType.FUTURES):
+                continue
+            tf_ms = timeframe_to_msecs(tf)
+            current_open_ms = dt_ts(timeframe_to_prev_date(tf))
+            expected_closed_open_ms = current_open_ms - tf_ms
+            latest_closed_ms = stat.get("latest_closed_candle_ms")
+            closed_lag_s = None
+            missing_closed_candles = None
+            if latest_closed_ms is not None:
+                closed_lag_s = max(0.0, (now_ms - (int(latest_closed_ms) + tf_ms)) / 1000)
+                missing_closed_candles = max(
+                    0, int((expected_closed_open_ms - int(latest_closed_ms)) // tf_ms)
+                )
+            ws_refresh_ms = 0
+            if self._exchange_ws is not None:
+                ws_refresh_ms = int(
+                    self._exchange_ws.klines_last_refresh.get((pair, tf, candle_type), 0) or 0
+                )
+            rows.append(
+                {
+                    "pair": pair,
+                    "timeframe": tf,
+                    "source": stat.get("source"),
+                    "last_delivery_at": stat.get("last_delivery_at"),
+                    "latest_closed_candle_ms": latest_closed_ms,
+                    "closed_candle_lag_s": closed_lag_s,
+                    "missing_closed_candles": missing_closed_candles,
+                    "ws_refresh_age_s": (
+                        max(0.0, (now_ms - ws_refresh_ms) / 1000) if ws_refresh_ms else None
+                    ),
+                    "fallback_count": int(stat.get("fallback_count", 0)),
+                }
+            )
+        return {
+            "pairs": rows,
+            "tracked": len(rows),
+            "stale_or_missing": sum(
+                1
+                for row in rows
+                if row["latest_closed_candle_ms"] is None
+                or (row["missing_closed_candles"] or 0) > 0
+            ),
+        }
+
     def _now_is_time_to_refresh(self, pair: str, timeframe: str, candle_type: CandleType) -> bool:
         # Timeframe in seconds
         interval_in_sec = timeframe_to_msecs(timeframe)
@@ -3012,6 +3109,7 @@ class Exchange:
                 logger.exception("Error loading %s. Result was %s.", pair, data)
                 return pair, timeframe, candle_type, [], self._ohlcv_partial_candle
             logger.debug("Done fetching pair %s, %s interval %s...", pair, candle_type, timeframe)
+            self._record_ohlcv_delivery(pair, timeframe, candle_type, "rest", data)
             return (
                 pair,
                 timeframe,

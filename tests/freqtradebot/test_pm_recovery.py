@@ -1028,3 +1028,70 @@ def test_pm_emergency_close_skips_already_flat_trades(mocker, pm_conf, init_pers
     # No failure alert (everything closed/skipped).
     for call in bot.rpc.send_msg.call_args_list:
         assert "could NOT" not in call[0][0]["status"]
+
+
+def test_conditional_ack_orphan_adopts_by_origin_trade_id(mocker, pm_conf):
+    """ACK -> crash before local stop Order commit recovers onto the exact Trade."""
+    from freqtrade.persistence import PMOrderIntent
+
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = make_open_trade(pm_conf, order_id="entry-owned", side="buy", amount=11.0)
+    trade.orders.clear()
+    Trade.commit()
+    client_id = "st-owned-crash"
+    request = {
+        "algoType": "CONDITIONAL",
+        "symbol": "ETHUSDT",
+        "side": "SELL",
+        "type": "STOP_MARKET",
+        "reduceOnly": "true",
+        "triggerPrice": 0.009,
+        "clientAlgoId": client_id,
+        "quantity": 11.0,
+    }
+    bot.exchange._pm_enqueue(
+        client_id,
+        {
+            "kind": "conditional",
+            "pair": trade.pair,
+            "side": trade.exit_side,
+            "type": "STOP_MARKET",
+            "amount": trade.amount,
+            "stop_price": 0.009,
+            "reduce_only": True,
+            "origin_trade_id": trade.id,
+        },
+        payload=request,
+    )
+    exchange_order = {
+        "id": client_id,
+        "clientAlgoId": client_id,
+        "symbol": trade.pair,
+        "type": "stoploss",
+        "timeInForce": None,
+        "side": trade.exit_side,
+        "price": None,
+        "average": None,
+        "stopPrice": 0.009,
+        "amount": 11.0,
+        "filled": 0.0,
+        "remaining": 11.0,
+        "cost": 0.0,
+        "status": "open",
+        "fee": None,
+        "trades": [],
+        "info": {"clientAlgoId": client_id, "reduceOnly": True},
+    }
+    bot.exchange._pm_ack(client_id, exchange_order, client_id)
+    bot.exchange.fetch_stoploss_order = MagicMock(return_value=exchange_order)
+    bot.update_trade_state = MagicMock(return_value=False)
+
+    report = bot._pm_recover_pending_intents()
+
+    assert report["linked"] == 1
+    Trade.session.refresh(trade)
+    assert {str(order.order_id) for order in trade.open_sl_orders} == {client_id}
+    intent = PMOrderIntent.get_by_client_id(client_id)
+    assert intent is not None and intent.state == "LINKED"
+    bot.update_trade_state.assert_called_once()
+    assert bot.update_trade_state.call_args.kwargs["stoploss_order"] is True

@@ -41,6 +41,7 @@ from freqtrade.exceptions import (
     InvalidOrderException,
     OperationalException,
     PricingError,
+    StopWouldImmediatelyTrigger,
 )
 from freqtrade.exchange import (
     ROUND_DOWN,
@@ -5544,6 +5545,17 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             logger.warning(f"Unable to place stoploss order {e}.")
             # Try to figure out what went wrong
             self.handle_insufficient_funds(trade)
+
+        except StopWouldImmediatelyTrigger as e:
+            # The exchange rejected the new conditional, not the protective exit.
+            # Retain existing stops until the regular exit lifecycle confirms fills.
+            # Do not retry with a looser trigger or claim a stop order has FILLED.
+            logger.warning(
+                "PM stop trigger crossed for Trade #%s %s; requesting an idempotent "
+                "protective emergency exit, retaining old protection until confirmed "
+                "fills. %s", trade.id, trade.pair, e,
+            )
+            self.emergency_exit(trade, stop_price)
 
         except InvalidOrderException as e:
             logger.error(f"Unable to place a stoploss order on exchange. {e}")

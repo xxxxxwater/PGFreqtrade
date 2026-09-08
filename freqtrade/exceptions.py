@@ -48,6 +48,14 @@ class InvalidOrderException(ExchangeError):
     """
 
 
+class StopWouldImmediatelyTrigger(InvalidOrderException):
+    """Exchange definitively rejected a stop because its trigger is already crossed.
+
+    This is not a fill, nor evidence that any previous protection is canceled.
+    Keep the normal idempotent protective-exit path; never loosen the stop.
+    """
+
+
 class RetryableOrderError(InvalidOrderException):
     """
     This is returned when the order is not found.

@@ -26,6 +26,7 @@ from freqtrade.exceptions import (
     InsufficientFundsError,
     InvalidOrderException,
     OperationalException,
+    StopWouldImmediatelyTrigger,
     TemporaryError,
 )
 from freqtrade.exchange import Exchange
@@ -3371,6 +3372,15 @@ class Binance(Exchange):
                 f"stop-price {stop_price_norm}. Message: {e}"
             ) from e
         except (ccxt.InvalidOrder, ccxt.BadRequest, ccxt.OperationRejected) as e:
+            # Only an explicit Binance code in a definitive rejection qualifies.
+            # A timeout containing similar prose must retain UNKNOWN semantics.
+            if re.search(r'"code"\s*:\s*-2021\s*[,}]', str(e)):
+                outcome = "trigger_crossed"
+                raise StopWouldImmediatelyTrigger(
+                    f"Binance PM stop rejected (-2021): pair={pair} side={side} "
+                    f"trigger_price={stop_price_norm} working_type={working_type} "
+                    f"client_id={client_strategy_id}. No conditional fill is implied."
+                ) from e
             raise InvalidOrderException(
                 f"Could not create {strategy_type} {side} PM stoploss order on market {pair}. "
                 f"Tried to {side} amount {amount} at rate {limit_rate} with "

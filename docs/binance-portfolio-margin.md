@@ -836,3 +836,23 @@ Stop after each step if anything deviates; reconcile via `/pm_recover`.
 
 Until steps 1-9 complete successfully on the real account, this branch stays
 `READ_ONLY_READY` (never `CANARY_READY` or `LIVE_READY`).
+
+### Immediate-trigger stop rejection (-2021)
+
+An explicit Binance -2021 response to a STOP/STOP_MARKET creation is a
+definitive rejection of that candidate, not a conditional fill, network timeout,
+or evidence that the old stop is canceled. The PM adapter classifies this as
+`StopWouldImmediatelyTrigger` and logs `outcome=trigger_crossed` with the
+normalized trigger price, working type and candidate client ID.
+
+The bot continues to use the existing idempotent emergency-exit workflow,
+retaining old protection until fills are confirmed. It neither lowers/widens
+the strategy stop nor silently retries a rejected trigger. Existing protection
+gates and exit reason remain unchanged. This is a classification/diagnostic
+fix, not a promise to prevent legitimate -2021 responses in a moving market.
+
+SOPH Trade 6 (2026-09-08): the rejected sell trigger was 0.008237; the later
+exit quote was 0.008162. This is consistent with a crossed trailing stop, but
+the later quote cannot establish the exact working-type price at rejection.
+No change to VWAP_V4 stop calculation or price-source selection is justified
+solely by that later quote.

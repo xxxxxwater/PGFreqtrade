@@ -111,6 +111,8 @@ class Binance(Exchange):
         "monitor_interval_minutes",
         "order_recovery_interval_minutes",
         "uncertain_stop_emergency_exit_seconds",
+        "market_analysis_budget_seconds",
+        "market_data_max_candle_age_seconds",
         "reconciliation_warning_reminder_minutes",
         "heartbeat_risk_cache_seconds",
         "max_leverage",
@@ -150,6 +152,8 @@ class Binance(Exchange):
         "monitor_interval_minutes",
         "order_recovery_interval_minutes",
         "uncertain_stop_emergency_exit_seconds",
+        "market_analysis_budget_seconds",
+        "market_data_max_candle_age_seconds",
         "heartbeat_risk_cache_seconds",
         "emergency_close_retries",
     }

@@ -183,6 +183,24 @@ def test_pm_risk_config_rejects_unknown_keys():
         )
 
 
+def test_pm_risk_config_accepts_market_data_budget_keys():
+    exchange = Binance.__new__(Binance)
+    exchange._pm_user_stream = None
+    exchange._pm_user_stream_lock = RLock()
+    set_minimal_exchange_cleanup_attrs(exchange)
+
+    exchange._validate_pm_risk_config(
+        {
+            "exchange": {
+                "portfolio_margin_risk": {
+                    "market_analysis_budget_seconds": 12,
+                    "market_data_max_candle_age_seconds": 660,
+                }
+            }
+        }
+    )
+
+
 class _MarketsApi:
     def __init__(self) -> None:
         self.has = {"fetchCurrencies": True}

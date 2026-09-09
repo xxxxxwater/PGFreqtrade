@@ -1,17 +1,15 @@
 """
 PM signal decision ledger model.
 
-One row per (pair, timeframe, candle_open_time, decision_scope): the strategy
-version, factor hash, data freshness, signal tag and the decision taken for
-that closed candle.  ``entry`` is the default scope and is write-once: the
-first decision for a candle wins, so a factor set is evaluated AT MOST once per
-closed, contiguous candle.  Protective ``exit`` data-failure decisions use a
-separate scope and therefore cannot overwrite the entry audit decision for the
-same candle.
+One row per (pair, timeframe, candle_open_time, decision_scope) stores the
+immutable factor/signal snapshot.  The legacy ``decision`` columns preserve the
+first observed decision for compatibility, but are NOT the execution lifecycle.
+Every later blocked/submitted/result transition is appended to
+``PMSignalDecisionEvent`` under a stable decision id.
 
-The exchange client id of any submitted order is backfilled onto the row after
-the order is placed, making the ledger the join key between signals, decisions
-and exchange orders.
+This deliberately allows factor recomputation after restart while keeping
+trading side effects independently idempotent through the PM intent/outbox
+pipeline.  It does not claim exactly-once factor computation.
 """
 
 from datetime import datetime
@@ -93,8 +91,9 @@ class PMSignalLedger(ModelBase):
         order_client_id: str | None = None,
     ) -> "PMSignalLedger":
         """
-        Insert the first decision row for a candle and decision scope. On a
-        duplicate the row is left untouched and the existing row is returned.
+        Insert the immutable snapshot row for a candle/scope.  The decision
+        fields capture only the first observed lifecycle state for backwards
+        compatibility.  Later transitions belong in PMSignalDecisionEvent.
         """
         existing = cls.get_by_candle(pair, timeframe, candle_open_time, decision_scope)
         if existing is not None:

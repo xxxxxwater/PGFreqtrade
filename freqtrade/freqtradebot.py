@@ -707,7 +707,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
 
     def _pm_pending_conditional_stop_intent(
         self, trade: Trade
-    ) -> tuple[PMOrderIntent, PMOutbox | None, bool] | None:
+    ) -> tuple[str, PMOrderIntent | None, PMOutbox | None, bool]:
         """Find an unresolved conditional that may be this Trade's protection.
 
         Exact ``origin_trade_id`` ownership wins. Legacy rows without ownership
@@ -716,25 +716,30 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         force the BOT Trade to reduce risk without pretending the row is owned.
         """
         if not self._pm_db_gate_active():
-            return None
+            return "none", None, None, False
         try:
             rows = [
                 row
                 for row in PMOrderIntent.get_unresolved_for_pair(trade.pair)
                 if row.kind == "conditional"
             ]
-        except Exception:
-            return None
+        except Exception as exc:
+            self.log_once(
+                f"PM conditional-stop intent store unreadable for {trade.pair}: {exc}",
+                logger.warning,
+            )
+            self._pm_block_orders("intent_store_unavailable")
+            return "unknown", None, None, False
         exact = [row for row in rows if row.origin_trade_id == trade.id]
         candidates = exact or [row for row in rows if row.origin_trade_id is None]
         if not candidates:
-            return None
+            return "none", None, None, False
         row = sorted(candidates, key=lambda item: item.created_at or datetime.min)[0]
         try:
             outbox = PMOutbox.get_by_client_id(row.client_id)
         except Exception:
             outbox = None
-        return row, outbox, bool(exact)
+        return "found", row, outbox, bool(exact)
 
     @staticmethod
     def _pm_age_seconds(value: datetime | None) -> float | None:
@@ -753,10 +758,16 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         be verified within the configured grace, the remaining BOT Trade is
         reduced via the normal idempotent emergency-exit path.
         """
-        pending = self._pm_pending_conditional_stop_intent(trade)
-        if pending is None:
+        pending_state, intent, outbox, ownership_exact = (
+            self._pm_pending_conditional_stop_intent(trade)
+        )
+        if pending_state == "none":
             return False
-        intent, outbox, ownership_exact = pending
+        if pending_state == "unknown" or intent is None:
+            self._pm_protection_hold(
+                trade, "conditional-stop intent store is UNKNOWN/unreadable"
+            )
+            return True
 
         pristine = bool(
             outbox is not None
@@ -2735,10 +2746,14 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         verified replacement exists on the exchange (unified primitive)."""
         old_ids = [str(sl.order_id) for sl in trade.open_sl_orders]
         if not old_ids:
-            # Nothing to keep alive: the first protection is created by the
-            # regular loop (handle_stoploss_on_exchange) through the same safe
-            # create -> verify primitive.
-            return "not_required"
+            if not self.strategy.order_types.get("stoploss_on_exchange"):
+                return "not_required"
+            # A partially-filled first entry can create real exposure before the
+            # regular stoploss loop runs.  Create+verify the first protection
+            # immediately through the same primitive instead of leaving a gap.
+            return self._pm_replace_stop_protection(
+                trade, [], new_stop_price=trade.stoploss_or_liquidation
+            )
         verdict = self._pm_replace_stop_protection(
             trade, old_ids, new_stop_price=trade.stoploss_or_liquidation
         )
@@ -3158,6 +3173,21 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             return None, f"snapshot_unavailable: {e.__class__.__name__}"
         if snapshot is None:
             return None, "no_closed_candle_data"
+        # Optional live wall-clock bound for the strategy candle.  This catches
+        # a refresh/analysis path that stopped advancing even if its last row is
+        # internally well-formed.  The live config sets this to > 2x the 5m
+        # candle spacing so a normal currently-forming candle is not rejected.
+        max_age_s = float(
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("market_data_max_candle_age_seconds", 0)
+            or 0
+        )
+        if max_age_s > 0 and snapshot.get("candle_open_time") is not None:
+            candle_ts = pd.to_datetime(snapshot["candle_open_time"], utc=True).to_pydatetime()
+            candle_age_s = max(0.0, (datetime.now(UTC) - candle_ts).total_seconds())
+            if candle_age_s > max_age_s:
+                return snapshot, f"market_data_stale: candle_age={candle_age_s:.1f}s"
         # Durable gap latch: a previously persisted data discontinuity keeps
         # blocking until the bot has seen a complete contiguous recovery (the
         # missing candle is backfilled). Never expires implicitly.
@@ -3187,6 +3217,14 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         if not snapshot.get("data_fresh"):
             return snapshot, f"data_unhealthy: {snapshot.get('freshness_detail') or 'unknown'}"
         return snapshot, None
+
+    def _pm_exposure_data_block_reason(self, pair: str) -> str | None:
+        """Unified data-safety gate for every exposure-increasing entry path."""
+        cycle_reason = getattr(self, "_pm_cycle_exposure_block_reason", None)
+        if cycle_reason:
+            return str(cycle_reason)
+        _snapshot, block_reason = self._pm_ledger_snapshot(pair)
+        return block_reason
 
     @staticmethod
     def _pm_utc_naive(value: datetime | None) -> datetime | None:
@@ -3250,10 +3288,12 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         decision_scope: str = "entry",
     ) -> bool:
         """
-        Write-once decision row for the current closed candle of ``pair``.
+        Record the immutable factor snapshot plus an append-only decision event
+        for the current closed candle of ``pair``.
 
-        The first decision for a candle wins (factors are evaluated at most once
-        per closed, contiguous candle). Entry-scope rows additionally advance
+        Factor computation may repeat after restart.  The snapshot row remains
+        immutable while blocked/submitted/result transitions append under one
+        stable decision id. Entry-scope snapshot creation additionally advances
         the durable :class:`PMCandleWatermark` cursor in the SAME transaction;
         a data discontinuity latches the watermark instead, so the pair stays
         fail-closed until the missing candle is backfilled. Returns True when a
@@ -3270,8 +3310,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 decision_scope=decision_scope,
             )
         except Exception:
-            # The ledger/watermark is an audit + exactly-once cursor, NOT the
-            # order-consistency source of truth (intent/outbox is). A ledger
+            # The ledger/watermark is an audit/progress cursor, NOT an
+            # exactly-once execution primitive (intent/outbox owns side-effect
+            # idempotency). A ledger
             # failure must never break an order that was already placed, nor
             # an entry flow; the order path itself stays fail-closed.
             logger.exception("PM signal ledger write failed for %s (%s).", pair, decision)
@@ -3289,7 +3330,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         snapshot, block_reason = self._pm_ledger_snapshot(pair)
         if snapshot is None:
             return False
+        if decision_scope in {"entry", "dca", "replace"}:
+            block_reason = getattr(self, "_pm_cycle_exposure_block_reason", None) or block_reason
         from freqtrade.persistence.pm_candle_watermark import PMCandleWatermark
+        from freqtrade.persistence.pm_signal_decision_event import PMSignalDecisionEvent
         from freqtrade.persistence.pm_signal_ledger import PMSignalLedger
 
         timeframe = self.config["timeframe"]
@@ -3342,6 +3386,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         )
         if decision == "no_signal" and reason in (None, "no_entry_signal"):
             reason = str(snapshot.get("no_signal_detail") or "no_entry_signal")
+        existing_snapshot = PMSignalLedger.get_by_candle(
+            pair, timeframe, candle_open, decision_scope
+        )
         row = PMSignalLedger.record_once(
             pair=pair,
             timeframe=timeframe,
@@ -3356,20 +3403,43 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             order_client_id=order_client_id,
             decision_scope=decision_scope,
         )
+        # ``autoflush`` is disabled for the trading session. Flush the immutable
+        # snapshot now so the append-only event has a real join id and the optional
+        # client-id backfill can query the row in this same transaction.
+        Trade.session.flush()
+        if order_client_id:
+            PMSignalLedger.set_order_client_id(
+                pair, timeframe, candle_open, order_client_id, decision_scope
+            )
+        _event, event_created = PMSignalDecisionEvent.append_event(
+            signal_ledger_id=row.id,
+            pair=pair,
+            timeframe=timeframe,
+            candle_open_time=candle_open,
+            decision_scope=decision_scope,
+            strategy_version=row.strategy_version,
+            factor_hash=row.factor_hash,
+            decision=decision,
+            decision_reason=reason,
+            order_client_id=order_client_id,
+        )
         if (
             decision_scope == "entry"
             and watermark is not None
             and not gap_latched_now
-            and row.decision == decision
+            and existing_snapshot is None
         ):
             watermark.mark_entry_decision(candle_open, recovered_gap=recovered_gap)
         Trade.session.commit()
-        if decision_scope == "entry" and row.decision != decision and decision == "entry_submitted":
-            logger.warning(
-                f"PM signal ledger: candle {candle_open} for {pair} already has decision "
-                f"'{row.decision}' - skipping duplicate decision '{decision}'."
-            )
-        return row.decision == decision
+        return event_created
+
+    def _pm_record_entry_block_for_pairs(self, pairs: list[str], reason: str) -> None:
+        if not self._pm_ledger_enabled():
+            return
+        open_pairs = {trade.pair for trade in Trade.get_open_trades()}
+        for pair in dict.fromkeys(pairs):
+            if pair not in open_pairs:
+                self._pm_record_signal_decision(pair, "blocked", reason=reason)
 
     def _pm_rebuild_actual_order_map(self) -> None:
         """
@@ -4211,9 +4281,17 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         :return: True if one or more trades has been created or closed, False otherwise
         """
 
-        # Check whether markets have to be reloaded and reload them when it's needed
-        self.exchange.reload_markets()
+        # Protective/recovery control-plane work runs BEFORE potentially slow
+        # market refresh and factor analysis.  This keeps a scheduled stop repair,
+        # user-stream reconciliation or account-risk action from sitting behind a
+        # slow pairlist/REST request.
+        self._pm_cycle_exposure_block_reason = None
         self._pm_consume_user_stream_events()
+        self._pm_maintenance_schedule.run_pending()
+        self._schedule.run_pending()
+
+        market_cycle_started = _time.monotonic()
+        self.exchange.reload_markets()
 
         self.update_trades_without_assigned_fees()
 
@@ -4235,6 +4313,24 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         with self._measure_execution:
             self.strategy.analyze(self.active_pair_whitelist)
 
+        market_cycle_elapsed = _time.monotonic() - market_cycle_started
+        market_budget_s = float(
+            self.config.get("exchange", {})
+            .get("portfolio_margin_risk", {})
+            .get("market_analysis_budget_seconds", 0)
+            or 0
+        )
+        if market_budget_s > 0 and market_cycle_elapsed > market_budget_s:
+            self._pm_cycle_exposure_block_reason = (
+                f"market_analysis_budget_exceeded: {market_cycle_elapsed:.2f}s>"
+                f"{market_budget_s:.2f}s"
+            )
+            self.log_once(
+                "PM exposure increase blocked for this cycle: "
+                + self._pm_cycle_exposure_block_reason,
+                logger.warning,
+            )
+
         with self._exit_lock:
             # Check for exchange cancellations, timeouts and user requested replace
             self.manage_open_orders()
@@ -4253,11 +4349,15 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             with self._exit_lock:
                 self.process_open_trade_positions()
 
-        # Then looking for entry opportunities
-        if self.state == State.RUNNING and self.get_free_open_trades():
-            self.enter_positions()
-        self._schedule.run_pending()
-        self._pm_maintenance_schedule.run_pending()
+        # Then looking for entry opportunities.  A full-slot condition is
+        # itself an auditable per-pair decision for the current candle.
+        if self.state == State.RUNNING:
+            if self.get_free_open_trades():
+                self.enter_positions()
+            else:
+                self._pm_record_entry_block_for_pairs(
+                    self.active_pair_whitelist, "max_open_trades_reached"
+                )
         Trade.commit()
         self.rpc.process_msg_queue(self.dataprovider._msg_queue)
         self.last_process = datetime.now(UTC)
@@ -4574,8 +4674,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                             "This may however lead to further issues."
                         )
                 if prev_trade_amount != trade.amount:
-                    # Cancel stoploss on exchange if the amount changed
-                    trade = self.cancel_stoploss_on_exchange(trade)
+                    if getattr(self.exchange, "_is_portfolio_margin", lambda: False)():
+                        self._pm_resize_stop_protection(trade)
+                    else:
+                        trade = self.cancel_stoploss_on_exchange(trade)
             Trade.commit()
 
         except ExchangeError:
@@ -4596,11 +4698,12 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         trades_created = 0
 
         if self._pm_blocked_order_reasons():
+            reason = "; ".join(self._pm_blocked_order_reasons())
             self.log_once(
-                "Not creating new trades. PM orders blocked: "
-                + ", ".join(self._pm_blocked_order_reasons()),
+                "Not creating new trades. PM orders blocked: " + reason,
                 logger.info,
             )
+            self._pm_record_entry_block_for_pairs(self.active_pair_whitelist, reason)
             return trades_created
 
         whitelist = deepcopy(self.active_pair_whitelist)
@@ -4633,6 +4736,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 )
             else:
                 self.log_once("Global pairlock active. Not creating new trades.", logger.info)
+            self._pm_record_entry_block_for_pairs(whitelist, "global_pairlock")
             return trades_created
         # Create entity and execute trade for each pair from whitelist
         for pair in whitelist:
@@ -4665,6 +4769,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         # but it is still used here to prevent opening too many trades within one iteration
         if not self.get_free_open_trades():
             logger.debug(f"Can't open a new trade for {pair}: max number of trades is reached.")
+            self._pm_record_signal_decision(
+                pair, decision="blocked", reason="max_open_trades_reached"
+            )
             return False
 
         # running get_signal on historical data fetched
@@ -4702,6 +4809,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                         is_short=(signal == SignalDirection.SHORT),
                     )
                 else:
+                    self._pm_record_signal_decision(
+                        pair, decision="blocked", reason="depth_of_market_rejected"
+                    )
                     return False
 
             return self.execute_entry(
@@ -4885,6 +4995,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         :return: True if an entry order is created, False if it fails.
         :raise: DependencyException or it's subclasses like ExchangeError.
         """
+        decision_scope = (
+            "entry" if mode == "initial" else "dca" if mode == "pos_adjust" else "replace"
+        )
         # Fail-closed PM gate - single unified entry for strategy entries, DCA / position
         # adjustments, Telegram/API force-entry and recovery re-entries. Never increase
         # risk exposure while the PM user stream is unavailable, the startup consistency
@@ -4895,10 +5008,12 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 + ", ".join(self._pm_blocked_order_reasons()),
                 logger.warning,
             )
-            if mode == "initial":
-                self._pm_record_signal_decision(
-                    pair, decision="blocked", reason="; ".join(self._pm_blocked_order_reasons())
-                )
+            self._pm_record_signal_decision(
+                pair,
+                decision="blocked",
+                reason="; ".join(self._pm_blocked_order_reasons()),
+                decision_scope=decision_scope,
+            )
             return False
 
         pair_block_reasons = self._pm_pair_entry_block_reasons(pair)
@@ -4908,10 +5023,12 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 + ", ".join(pair_block_reasons),
                 logger.warning,
             )
-            if mode == "initial":
-                self._pm_record_signal_decision(
-                    pair, decision="blocked", reason="; ".join(pair_block_reasons)
-                )
+            self._pm_record_signal_decision(
+                pair,
+                decision="blocked",
+                reason="; ".join(pair_block_reasons),
+                decision_scope=decision_scope,
+            )
             return False
 
         time_in_force = self.strategy.order_time_in_force["entry"]
@@ -4926,6 +5043,23 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         )
 
         if not stake_amount:
+            self._pm_record_signal_decision(
+                pair, decision="blocked", reason="stake_unavailable", decision_scope=decision_scope
+            )
+            return False
+
+        data_block_reason = self._pm_exposure_data_block_reason(pair)
+        if data_block_reason:
+            self._pm_record_signal_decision(
+                pair,
+                decision="blocked_data",
+                reason=data_block_reason,
+                decision_scope=decision_scope,
+            )
+            logger.warning(
+                f"Refusing PM exposure increase for {pair} ({mode}): data not usable "
+                f"({data_block_reason}). Reduction/protection paths remain enabled."
+            )
             return False
 
         msg = (
@@ -4957,25 +5091,16 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             side=trade_side,
         ):
             logger.info(f"User denied entry for {pair}.")
+            self._pm_record_signal_decision(
+                pair,
+                decision="blocked",
+                reason="confirm_trade_entry_denied",
+                decision_scope=decision_scope,
+            )
             return False
 
         if trade and self.handle_similar_open_order(trade, enter_limit_requested, amount, side):
             return False
-
-        # PM unified data-failure policy: a signal evaluated on unhealthy or
-        # non-contiguous data must never reach the exchange (fail-closed). The
-        # decision is recorded in the signal ledger for audit.
-        if mode == "initial":
-            _snapshot, _block_reason = self._pm_ledger_snapshot(pair)
-            if _block_reason:
-                self._pm_record_signal_decision(
-                    pair, decision="blocked_data", reason=_block_reason
-                )
-                logger.warning(
-                    f"Refusing PM entry for {pair}: data not usable ({_block_reason}); "
-                    "unified fail-closed policy."
-                )
-                return False
 
         order = self.exchange.create_order(
             pair=pair,
@@ -4996,15 +5121,14 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         order_status = order.get("status")
         logger.info(f"Order {order_id} was created for {pair} and status is {order_status}.")
 
-        # PM signal decision ledger: record the submitted decision for this
-        # closed candle (write-once) with the exchange client id.
-        if mode == "initial":
-            self._pm_record_signal_decision(
-                pair,
-                decision="entry_submitted",
-                reason=f"order_id={order_id}",
-                order_client_id=str(order.get("clientOrderId") or ""),
-            )
+        # Append the submitted lifecycle event under the stable decision id.
+        self._pm_record_signal_decision(
+            pair,
+            decision="entry_submitted",
+            reason=f"order_id={order_id}",
+            order_client_id=str(order.get("clientOrderId") or ""),
+            decision_scope=decision_scope,
+        )
 
         # we assume the order is executed at the price requested
         enter_limit_filled_price = enter_limit_requested
@@ -5113,8 +5237,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
 
         if pos_adjust:
             if order_status == "closed":
-                logger.info(f"DCA order closed, trade should be up to date: {trade}")
-                trade = self.cancel_stoploss_on_exchange(trade)
+                logger.info(
+                    f"DCA order closed; full fill lifecycle will resize protection safely: {trade}"
+                )
             else:
                 logger.info(f"DCA order {order_status}, will wait for resolution: {trade}")
 
@@ -5140,7 +5265,16 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         if allow_nonblocking and not self.exchange.get_option("stoploss_blocks_assets", True):
             logger.info(f"Skipping cancelling stoploss on exchange for {trade}.")
             return trade
-        # First cancelling stoploss on exchange ...
+        # PM cancellation is evidence-driven.  A DELETE/not-found response is
+        # never itself terminal proof; resolve the full conditional lifecycle
+        # (including a triggered real child) before changing local state.
+        if getattr(self.exchange, "_is_portfolio_margin", lambda: False)():
+            self._pm_retire_stop_ids(
+                trade, [str(oslo.order_id) for oslo in trade.open_sl_orders]
+            )
+            return trade
+
+        # Non-PM legacy behavior.
         for oslo in trade.open_sl_orders:
             try:
                 logger.info(f"Cancelling stoploss on exchange for {trade} order: {oslo.order_id}")
@@ -5149,11 +5283,6 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 )
                 self.update_trade_state(trade, oslo.order_id, co, stoploss_order=True)
             except InvalidOrderException:
-                # The exchange definitively no longer has this conditional
-                # (already triggered/canceled, e.g. auto-removed when the
-                # position went flat). Mark it canceled locally so the trade
-                # state stays consistent and redelivered stream events stop
-                # retrying the cancel forever.
                 logger.warning(
                     f"Stoploss order {oslo.order_id} for pair {trade.pair} no longer "
                     "exists on the exchange; marking it canceled locally."
@@ -6331,8 +6460,11 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
 
         limit = self.get_valid_price(custom_exit_price, proposed_limit_rate)
 
-        # First cancelling stoploss on exchange ...
-        trade = self.cancel_stoploss_on_exchange(trade, allow_nonblocking=True)
+        # PM reduce-only exits may safely coexist with conditional protection.
+        # Keep the stop until the exit is terminal; cancel-after-fill is handled
+        # by the normal trade lifecycle.  Non-PM retains the legacy behavior.
+        if not getattr(self.exchange, "_is_portfolio_margin", lambda: False)():
+            trade = self.cancel_stoploss_on_exchange(trade, allow_nonblocking=True)
 
         amount = self._safe_exit_amount(trade, trade.pair, sub_trade_amt or trade.amount)
         time_in_force = self.strategy.order_time_in_force["exit"]
@@ -6587,12 +6719,57 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
 
         trade.update_trade(order_obj, not send_msg)
 
+        if (
+            getattr(self.exchange, "_is_portfolio_margin", lambda: False)()
+            and order_obj.ft_order_side == trade.entry_side
+            and order_obj.ft_is_open
+            and order_obj.safe_filled > 0
+        ):
+            self._pm_apply_partial_entry_fill(trade, order_obj)
+
         trade = self._update_trade_after_fill(trade, order_obj, send_msg)
         Trade.commit()
 
         self.order_close_notify(trade, order_obj, stoploss_order, send_msg)
 
         return False
+
+    def _pm_apply_partial_entry_fill(self, trade: Trade, order: Order) -> None:
+        """Book an OPEN partial entry fill and ensure stop quantity covers it.
+
+        Core Freqtrade intentionally excludes open orders from trade recalculation.
+        For PM this would leave a partially-filled DCA as real exchange exposure
+        that the local Trade (and therefore its stop quantity) does not yet see.
+        Temporarily include this one order in recalculation while preserving its
+        OPEN lifecycle, then replace protection only when local coverage is short.
+        """
+        if (
+            not order.ft_is_open
+            or order.ft_order_side != trade.entry_side
+            or order.safe_filled <= 0
+        ):
+            return
+        was_open = order.ft_is_open
+        order.ft_is_open = False
+        try:
+            trade.recalc_trade_from_orders()
+        finally:
+            order.ft_is_open = was_open
+        Trade.commit()
+
+        tolerance = max(abs(float(trade.amount)) * 1e-6, 1e-9)
+        locally_covered = any(
+            float(stop.safe_amount) + tolerance >= float(trade.amount)
+            for stop in trade.open_sl_orders
+        )
+        if not locally_covered:
+            logger.warning(
+                "PM partial entry fill changed exposure for %s to %.8f; "
+                "resizing stop protection before waiting for order terminal state.",
+                trade.pair,
+                trade.amount,
+            )
+            self._pm_resize_stop_protection(trade)
 
     def _update_trade_after_fill(self, trade: Trade, order: Order, send_msg: bool) -> Trade:
         if order.status in constants.NON_OPEN_EXCHANGE_STATES:

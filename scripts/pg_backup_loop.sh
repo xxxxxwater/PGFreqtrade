@@ -7,7 +7,7 @@
 #     valid backup).
 #   - Every final backup gets a SHA-256 checksum; restore verifies it.
 #   - A periodic restore smoke test restores the newest backup into a scratch
-#     database and verifies all seven trading/PM pipeline tables exist.
+#     database and verifies every trading/PM pipeline table required by this release.
 #   - Backup health (last OK / last failure) is exposed in BACKUP_HEALTH.
 #
 # Env vars: PG_HOST, PG_USER, PG_DB, BACKUP_DIR, KEEP, BACKUP_INTERVAL_SECS,
@@ -21,6 +21,8 @@ BACKUP_DIR="${BACKUP_DIR:-/backups}"
 # it gives a practical recovery window.  Set KEEP explicitly via compose.
 KEEP="${KEEP:-48}"
 SLEEP="${BACKUP_INTERVAL_SECS:-3600}"
+RETRY_INITIAL="${BACKUP_RETRY_INITIAL_SECS:-5}"
+RETRY_MAX="${BACKUP_RETRY_MAX_SECS:-60}"
 RESTORE_SMOKE_EVERY_SECS="${RESTORE_SMOKE_EVERY_SECS:-86400}"
 LAST_SMOKE_FILE="${BACKUP_DIR}/.last_restore_smoke"
 HEALTH_FILE="${BACKUP_DIR}/BACKUP_HEALTH"
@@ -128,7 +130,7 @@ restore_smoke() {
     # This release adds pm_stream_journal. Pre-upgrade backups must first be
     # restored and migrated in isolation before they can pass this release's
     # seven-table readiness check; do not silently waive the journal check.
-    for TABLE in trades orders pm_order_intents pm_outbox pm_notification_outbox pm_signal_ledger pm_candle_watermarks pm_stream_journal; do
+    for TABLE in trades orders pm_order_intents pm_outbox pm_notification_outbox pm_signal_ledger pm_signal_decision_events pm_candle_watermarks pm_stream_journal; do
         TABLE_CHECK=$(psql -w -h "$PG_HOST" -U "$PG_USER" -d "$SCRATCH" -tAc \
             "SELECT to_regclass('public.$TABLE') IS NOT NULL")
         if [ "$TABLE_CHECK" != "t" ]; then
@@ -176,8 +178,21 @@ restore_smoke() {
     return 0
 }
 
+RETRY_DELAY="$RETRY_INITIAL"
 while true; do
-    backup_once
-    restore_smoke
-    sleep "$SLEEP"
+    if backup_once; then
+        RETRY_DELAY="$RETRY_INITIAL"
+        restore_smoke
+        sleep "$SLEEP"
+        continue
+    fi
+
+    # Startup/database/network failures are retried quickly instead of turning
+    # one transient failure into a one-hour backup blind spot.
+    echo "backup retry scheduled in ${RETRY_DELAY}s" >&2
+    sleep "$RETRY_DELAY"
+    RETRY_DELAY=$((RETRY_DELAY * 2))
+    if [ "$RETRY_DELAY" -gt "$RETRY_MAX" ]; then
+        RETRY_DELAY="$RETRY_MAX"
+    fi
 done

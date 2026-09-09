@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from freqtrade.persistence import PMSignalLedger, init_db
+from freqtrade.persistence import PMSignalDecisionEvent, PMSignalLedger, init_db
 
 
 @pytest.fixture(autouse=True)
@@ -130,3 +130,62 @@ def test_strategy_snapshot_shape():
 
     # empty dataframe -> None (fail-closed)
     assert strategy.pm_signal_snapshot("ETH/USDT:USDT", pd.DataFrame()) is None
+
+
+def test_decision_events_append_blocked_then_submitted_with_stable_id():
+    snapshot = PMSignalLedger.record_once(
+        pair="ETH/USDT:USDT",
+        timeframe="5m",
+        candle_open_time=candle(),
+        strategy_version="VWAP_V4-1",
+        factor_hash="f" * 64,
+        data_fresh=True,
+        decision="blocked",
+        decision_reason="global_pairlock",
+    )
+    PMSignalLedger.session.flush()
+    first, created_first = PMSignalDecisionEvent.append_event(
+        signal_ledger_id=snapshot.id,
+        pair=snapshot.pair,
+        timeframe=snapshot.timeframe,
+        candle_open_time=snapshot.candle_open_time,
+        decision_scope=snapshot.decision_scope,
+        strategy_version=snapshot.strategy_version,
+        factor_hash=snapshot.factor_hash,
+        decision="blocked",
+        decision_reason="global_pairlock",
+    )
+    second, created_second = PMSignalDecisionEvent.append_event(
+        signal_ledger_id=snapshot.id,
+        pair=snapshot.pair,
+        timeframe=snapshot.timeframe,
+        candle_open_time=snapshot.candle_open_time,
+        decision_scope=snapshot.decision_scope,
+        strategy_version=snapshot.strategy_version,
+        factor_hash=snapshot.factor_hash,
+        decision="entry_submitted",
+        decision_reason="order_id=123",
+        order_client_id="ft-123",
+    )
+    duplicate, created_duplicate = PMSignalDecisionEvent.append_event(
+        signal_ledger_id=snapshot.id,
+        pair=snapshot.pair,
+        timeframe=snapshot.timeframe,
+        candle_open_time=snapshot.candle_open_time,
+        decision_scope=snapshot.decision_scope,
+        strategy_version=snapshot.strategy_version,
+        factor_hash=snapshot.factor_hash,
+        decision="entry_submitted",
+        decision_reason="order_id=123",
+        order_client_id="ft-123",
+    )
+    PMSignalLedger.session.commit()
+
+    assert created_first is True
+    assert created_second is True
+    assert created_duplicate is False
+    assert first.decision_id == second.decision_id == duplicate.decision_id
+    assert [e.decision for e in PMSignalDecisionEvent.recent_for_decision(first.decision_id)] == [
+        "blocked",
+        "entry_submitted",
+    ]

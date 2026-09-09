@@ -14,7 +14,12 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from freqtrade.persistence import PMCandleWatermark, PMSignalLedger, init_db
+from freqtrade.persistence import (
+    PMCandleWatermark,
+    PMSignalDecisionEvent,
+    PMSignalLedger,
+    init_db,
+)
 from tests.conftest import get_patched_freqtradebot
 
 
@@ -73,16 +78,31 @@ def test_first_decision_advances_cursor_same_transaction(mocker, default_conf_us
 
 def test_duplicate_candle_write_once_does_not_redecide(mocker, default_conf_usdt):
     c0 = BASE
-    bot = _make_bot(mocker, default_conf_usdt, lambda p, d: _payload(c0), _df(-5, 0))
+    current_hash = {"value": "h" * 64}
+    bot = _make_bot(
+        mocker,
+        default_conf_usdt,
+        lambda p, d: {**_payload(c0), "factor_hash": current_hash["value"]},
+        _df(-5, 0),
+    )
 
     assert bot._pm_record_signal_decision(PAIR, "no_signal", reason="no_entry_signal")
-    # A later signal for the same candle must not overwrite the first decision.
-    assert not bot._pm_record_signal_decision(
+    # Model a post-restart/recovery recomputation of the same candle whose
+    # factor payload changed. The immutable snapshot remains the decision-id
+    # anchor; only the execution lifecycle appends.
+    current_hash["value"] = "f" * 64
+    assert bot._pm_record_signal_decision(
         PAIR, "entry_submitted", reason="late", order_client_id="ft-late"
     )
     row = PMSignalLedger.get_by_candle(PAIR, TF, c0)
     assert row.decision == "no_signal"
-    assert row.order_client_id is None
+    assert row.factor_hash == "h" * 64
+    assert row.order_client_id == "ft-late"
+    events = PMSignalDecisionEvent.session.query(PMSignalDecisionEvent).order_by(
+        PMSignalDecisionEvent.id
+    ).all()
+    assert [event.decision for event in events] == ["no_signal", "entry_submitted"]
+    assert len({event.decision_id for event in events}) == 1
     assert _watermark().last_decision_candle_open_time == c0
 
 

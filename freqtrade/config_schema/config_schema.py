@@ -1173,6 +1173,23 @@ CONF_SCHEMA = {
                             "minimum": 5,
                             "default": 30,
                         },
+                        "market_analysis_budget_seconds": {
+                            "description": (
+                                "Maximum wall-clock seconds allowed for the market refresh plus "
+                                "strategy-analysis phase before exposure increases are blocked "
+                                "for the current loop."
+                            ),
+                            "type": "integer",
+                            "minimum": 1,
+                        },
+                        "market_data_max_candle_age_seconds": {
+                            "description": (
+                                "Maximum wall-clock age of the strategy candle accepted for "
+                                "exposure-increasing PM entry, DCA, and replace paths."
+                            ),
+                            "type": "integer",
+                            "minimum": 1,
+                        },
                         "heartbeat_risk_cache_seconds": {
                             "description": (
                                 "Minimum seconds to cache Binance Portfolio Margin account "

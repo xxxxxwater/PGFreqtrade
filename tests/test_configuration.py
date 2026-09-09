@@ -1106,6 +1106,15 @@ def test_load_config_binance_pm_risk_rejects_unknown_key(all_conf) -> None:
         validate_config_schema(all_conf)
 
 
+def test_load_config_binance_pm_market_data_budget_keys(all_conf) -> None:
+    all_conf["exchange"]["portfolio_margin_risk"] = {
+        "market_analysis_budget_seconds": 12,
+        "market_data_max_candle_age_seconds": 660,
+    }
+
+    validate_config_schema(all_conf)
+
+
 @pytest.mark.parametrize(
     "keys",
     [

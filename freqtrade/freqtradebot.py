@@ -349,6 +349,8 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self._pm_create_listen_key()
 
     def _pm_init_user_stream_state(self) -> None:
+        if not hasattr(self, "_pm_store_health_lock"):
+            self._pm_store_health_lock = RLock()
         if not hasattr(self, "_pm_user_stream_restarts"):
             self._pm_user_stream_restarts: list[datetime] = []
         if not hasattr(self, "_pm_last_listen_key_rebuild_at"):
@@ -429,18 +431,29 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
     def _pm_block_orders(self, reason: str) -> None:
         """Block new non-reduce-only PM orders for a given reason (fail-closed)."""
         self._pm_init_user_stream_state()
-        if reason not in self._pm_orders_blocked_reasons:
-            self._pm_orders_blocked_reasons.append(reason)
-            logger.warning("PM new-order gate set: reason=%s.", reason)
+        with self._pm_store_health_lock:
+            if reason not in self._pm_orders_blocked_reasons:
+                self._pm_orders_blocked_reasons.append(reason)
+                logger.warning("PM new-order gate set: reason=%s.", reason)
 
     def _pm_unblock_orders(self, reason: str) -> None:
         """Remove a previously set order-blocking reason."""
         self._pm_init_user_stream_state()
-        if reason in self._pm_orders_blocked_reasons:
-            self._pm_orders_blocked_reasons.remove(reason)
-            logger.info("PM new-order gate cleared: reason=%s.", reason)
+        with self._pm_store_health_lock:
+            if reason in self._pm_orders_blocked_reasons:
+                self._pm_orders_blocked_reasons.remove(reason)
+                logger.info("PM new-order gate cleared: reason=%s.", reason)
 
     def _pm_blocked_order_reasons(self) -> list[str]:
+        if not self._pm_db_gate_active():
+            return list(getattr(self, "_pm_orders_blocked_reasons", []))
+        self._pm_init_user_stream_state()
+        # Serialize failed-read latch creation with evidence-based release.
+        # Reentrant because the read path removes only its own infrastructure gate.
+        with self._pm_store_health_lock:
+            return self._pm_read_order_block_reasons()
+
+    def _pm_read_order_block_reasons(self) -> list[str]:
         """
         Reasons that currently block opening new PM orders (empty list = allowed).
 
@@ -452,10 +465,18 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         if self._pm_db_gate_active():
             self._pm_init_user_stream_state()
             try:
-                if PMStreamJournal.get_unresolved():
+                journal_unresolved = PMStreamJournal.get_unresolved()
+                intents_unresolved = PMOrderIntent.has_unresolved()
+                # Readability and business inconsistency are separate facts.
+                # Successful authoritative reads clear ONLY the infrastructure
+                # latch, even when real unresolved work remains. Never /start
+                # or clear ownership/protection/operator state here.
+                self._pm_unblock_orders("intent_store_unavailable")
+                reasons = [r for r in reasons if r != "intent_store_unavailable"]
+                if journal_unresolved:
                     if "unmatched_stream_order" not in reasons:
                         reasons.append("unmatched_stream_order")
-                if PMOrderIntent.has_unresolved():
+                if intents_unresolved:
                     if "unresolved_intent" not in reasons:
                         reasons.append("unresolved_intent")
                     if not self._pm_unresolved_alert_sent:
@@ -723,6 +744,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 for row in PMOrderIntent.get_unresolved_for_pair(trade.pair)
                 if row.kind == "conditional"
             ]
+            # A successful authoritative intent read is direct evidence that the
+            # store is readable again. Clear only the infrastructure-read latch;
+            # unresolved/ownership/protection gates remain independent.
+            self._pm_unblock_orders("intent_store_unavailable")
         except Exception as exc:
             self.log_once(
                 f"PM conditional-stop intent store unreadable for {trade.pair}: {exc}",
@@ -3521,6 +3546,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 report["outbox"] = {"errors": [f"{e.__class__.__name__}: {e}"]}
         try:
             intents = self.exchange.list_pm_pending_intents()
+            # Successful authoritative recovery-store read clears only the
+            # transient infrastructure latch. Any real unresolved intents are
+            # still enforced by the durable gate on the next decision check.
+            self._pm_unblock_orders("intent_store_unavailable")
         except Exception as e:
             # Fail-closed: an unreadable intent store must never be treated as empty.
             logger.warning(f"Could not read PM pending order intents: {e}")
@@ -4274,6 +4303,87 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         finally:
             self._pm_operator_state_scope.preserve_stopped = previous_guard
 
+    def _pm_service_protection_before_market(self) -> None:
+        """Service BOT orders/protection without waiting for a new factor batch.
+
+        Serialized by the existing exit lock; no new trading thread and no
+        FOREIGN adoption. Exchange-native stops stay authoritative during any
+        individual blocking call. This is not a hard real-time timeout.
+        """
+        if not self._pm_db_gate_active():
+            return
+        with self._exit_lock:
+            self.manage_open_orders()
+            Trade.commit()
+            if self.strategy.order_types.get("stoploss_on_exchange"):
+                for trade in Trade.get_open_trades():
+                    if not trade.is_open or not trade.has_open_position:
+                        continue
+                    try:
+                        self.handle_stoploss_on_exchange(trade)
+                        Trade.commit()
+                    except DependencyException as exc:
+                        Trade.session.rollback()
+                        self._pm_protection_hold(
+                            trade, f"pre-market protection check failed: {type(exc).__name__}"
+                        )
+
+    def _pm_refresh_market_with_budget(self, budget_s: float) -> None:
+        """Cooperative stage deadline: stop optional work, not a running HTTP call.
+
+        Data remains unavailable for increased exposure until the entire batch
+        completes. A budget overrun yields directly to existing order/exit
+        processing; it never starts an asynchronous submission worker.
+        """
+        started = _time.monotonic()
+        self._pm_cycle_exposure_block_reason = "market_refresh_in_progress"
+
+        def over_budget(stage: str) -> bool:
+            elapsed = _time.monotonic() - started
+            if elapsed <= budget_s:
+                return False
+            self._pm_cycle_exposure_block_reason = (
+                f"market_analysis_budget_exceeded: {elapsed:.2f}s>{budget_s:.2f}s"
+                f" stage={stage}"
+            )
+            self.log_once(
+                "PM exposure increase blocked for this cycle: "
+                + self._pm_cycle_exposure_block_reason, logger.warning,
+            )
+            return True
+
+        try:
+            self.exchange.reload_markets()
+            if over_budget("markets"):
+                return
+            self.update_trades_without_assigned_fees()
+            if over_budget("fees"):
+                return
+            self.active_pair_whitelist = self._refresh_active_whitelist(Trade.get_open_trades())
+            if over_budget("whitelist"):
+                return
+            self.dataprovider.refresh(
+                self.pairlists.create_pair_list(self.active_pair_whitelist),
+                self.strategy.gather_informative_pairs(),
+            )
+            if over_budget("candles"):
+                return
+            strategy_safe_wrapper(self.strategy.bot_loop_start, supress_error=True)(
+                current_time=datetime.now(UTC)
+            )
+            if over_budget("bot_loop_start"):
+                return
+            with self._measure_execution:
+                for pair in self.active_pair_whitelist:
+                    self.strategy.analyze([pair])
+                    if over_budget("analyze"):
+                        return
+        except Exception:
+            # Never leave a stale "ready" flag after an interrupted batch.
+            self._pm_cycle_exposure_block_reason = "market_refresh_failed"
+            raise
+        self._pm_cycle_exposure_block_reason = None
+
     def process(self) -> None:
         """
         Queries the persistence layer for open trades and handles them,
@@ -4290,46 +4400,59 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         self._pm_maintenance_schedule.run_pending()
         self._schedule.run_pending()
 
-        market_cycle_started = _time.monotonic()
-        self.exchange.reload_markets()
-
-        self.update_trades_without_assigned_fees()
-
-        # Query trades from persistence layer
-        trades: list[Trade] = Trade.get_open_trades()
-
-        self.active_pair_whitelist = self._refresh_active_whitelist(trades)
-
-        # Refreshing candles
-        self.dataprovider.refresh(
-            self.pairlists.create_pair_list(self.active_pair_whitelist),
-            self.strategy.gather_informative_pairs(),
+        self._pm_service_protection_before_market()
+        budget_s = float(
+            self.config.get("exchange", {}).get("portfolio_margin_risk", {})
+            .get("market_analysis_budget_seconds", 0) or 0
         )
+        if self._pm_db_gate_active() and budget_s > 0:
+            try:
+                self._pm_refresh_market_with_budget(budget_s)
+            except Exception:
+                # A failed market phase must not skip outstanding stop repair.
+                self._pm_service_protection_before_market()
+                raise
+        else:
+            market_cycle_started = _time.monotonic()
+            self.exchange.reload_markets()
 
-        strategy_safe_wrapper(self.strategy.bot_loop_start, supress_error=True)(
-            current_time=datetime.now(UTC)
-        )
+            self.update_trades_without_assigned_fees()
 
-        with self._measure_execution:
-            self.strategy.analyze(self.active_pair_whitelist)
+            # Query trades from persistence layer
+            trades: list[Trade] = Trade.get_open_trades()
 
-        market_cycle_elapsed = _time.monotonic() - market_cycle_started
-        market_budget_s = float(
-            self.config.get("exchange", {})
-            .get("portfolio_margin_risk", {})
-            .get("market_analysis_budget_seconds", 0)
-            or 0
-        )
-        if market_budget_s > 0 and market_cycle_elapsed > market_budget_s:
-            self._pm_cycle_exposure_block_reason = (
-                f"market_analysis_budget_exceeded: {market_cycle_elapsed:.2f}s>"
-                f"{market_budget_s:.2f}s"
+            self.active_pair_whitelist = self._refresh_active_whitelist(trades)
+
+            # Refreshing candles
+            self.dataprovider.refresh(
+                self.pairlists.create_pair_list(self.active_pair_whitelist),
+                self.strategy.gather_informative_pairs(),
             )
-            self.log_once(
-                "PM exposure increase blocked for this cycle: "
-                + self._pm_cycle_exposure_block_reason,
-                logger.warning,
+
+            strategy_safe_wrapper(self.strategy.bot_loop_start, supress_error=True)(
+                current_time=datetime.now(UTC)
             )
+
+            with self._measure_execution:
+                self.strategy.analyze(self.active_pair_whitelist)
+
+            market_cycle_elapsed = _time.monotonic() - market_cycle_started
+            market_budget_s = float(
+                self.config.get("exchange", {})
+                .get("portfolio_margin_risk", {})
+                .get("market_analysis_budget_seconds", 0)
+                or 0
+            )
+            if market_budget_s > 0 and market_cycle_elapsed > market_budget_s:
+                self._pm_cycle_exposure_block_reason = (
+                    f"market_analysis_budget_exceeded: {market_cycle_elapsed:.2f}s>"
+                    f"{market_budget_s:.2f}s"
+                )
+                self.log_once(
+                    "PM exposure increase blocked for this cycle: "
+                    + self._pm_cycle_exposure_block_reason,
+                    logger.warning,
+                )
 
         with self._exit_lock:
             # Check for exchange cancellations, timeouts and user requested replace

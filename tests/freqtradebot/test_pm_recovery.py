@@ -712,8 +712,12 @@ def test_pm_recover_pending_intents_store_error_pauses(mocker, pm_conf):
 
     assert report["store_error"] is not None
     assert bot.state == State.PAUSED
+    assert "intent_store_unavailable" in bot._pm_orders_blocked_reasons
+    # The failed recovery call does not force a permanent infrastructure latch:
+    # subsequent healthy authoritative reads release it, not operator PAUSED.
     reasons = bot._pm_blocked_order_reasons()
-    assert "intent_store_unavailable" in reasons
+    assert "intent_store_unavailable" not in reasons
+    assert bot.state == State.PAUSED
 
 
 def test_unresolved_intent_blocks_entry_dca_and_stoploss(mocker, pm_conf):

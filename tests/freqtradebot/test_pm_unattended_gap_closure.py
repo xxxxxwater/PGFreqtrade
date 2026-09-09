@@ -181,6 +181,10 @@ def test_pending_stop_store_failure_is_explicit_unknown(mocker, pm_conf):
 
     assert state == "unknown"
     assert intent is None and outbox is None and owned is False
+    # The failed read creates the infrastructure latch immediately. A subsequent
+    # successful authoritative read may clear it (covered by continuity tests).
+    assert "intent_store_unavailable" in bot._pm_orders_blocked_reasons
+    mocker.patch.object(PMOrderIntent, "has_unresolved", side_effect=RuntimeError("db down"))
     assert "intent_store_unavailable" in bot._pm_blocked_order_reasons()
 
 
@@ -301,3 +305,60 @@ def test_sync_closed_dca_never_calls_legacy_stop_cancel(mocker, pm_conf):
 
     bot._pm_resize_stop_protection.assert_called_once_with(trade)
     bot.cancel_stoploss_on_exchange.assert_not_called()
+
+
+def test_pending_stop_store_recovery_empty_clears_read_latch(mocker, pm_conf):
+    """A successful pair-level intent read clears a prior DB-read failure latch."""
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = make_open_trade(pm_conf, order_id="entry-recover-empty", side="buy", amount=11.0)
+    query = mocker.patch.object(
+        PMOrderIntent,
+        "get_unresolved_for_pair",
+        side_effect=[RuntimeError("db down"), []],
+    )
+
+    first = bot._pm_pending_conditional_stop_intent(trade)
+    assert first[0] == "unknown"
+    assert "intent_store_unavailable" in bot._pm_orders_blocked_reasons
+
+    second = bot._pm_pending_conditional_stop_intent(trade)
+    assert second == ("none", None, None, False)
+    assert "intent_store_unavailable" not in bot._pm_orders_blocked_reasons
+    assert query.call_count == 2
+
+
+def test_pending_stop_store_recovery_with_unresolved_keeps_business_gate(mocker, pm_conf):
+    """Read recovery clears only the infrastructure latch; unresolved stays fail-closed."""
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = make_open_trade(pm_conf, order_id="entry-recover-found", side="buy", amount=11.0)
+    unresolved = PMOrderIntent(
+        client_id="ft-stop-recover-found",
+        kind="conditional",
+        pair=trade.pair,
+        side=trade.exit_side,
+        order_type="stop_market",
+        amount=trade.amount,
+        reduce_only=True,
+        state="UNKNOWN",
+        origin_trade_id=trade.id,
+    )
+    PMOrderIntent.session.add(unresolved)
+    PMOrderIntent.session.commit()
+    query = mocker.patch.object(
+        PMOrderIntent,
+        "get_unresolved_for_pair",
+        side_effect=[RuntimeError("db down"), [unresolved]],
+    )
+
+    first = bot._pm_pending_conditional_stop_intent(trade)
+    assert first[0] == "unknown"
+    assert "intent_store_unavailable" in bot._pm_orders_blocked_reasons
+
+    state, intent, outbox, owned = bot._pm_pending_conditional_stop_intent(trade)
+    assert state == "found"
+    assert intent is unresolved
+    assert outbox is None
+    assert owned is True
+    assert "intent_store_unavailable" not in bot._pm_orders_blocked_reasons
+    assert "unresolved_intent" in bot._pm_blocked_order_reasons()
+    assert query.call_count == 2

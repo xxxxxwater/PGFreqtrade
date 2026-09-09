@@ -160,11 +160,11 @@ class VWAP_V4(IStrategy):
     # `entry_stake_amount` is an upper bound for the *first* entry, not the
     # total position.  The helpers below reserve capital for all five DCA
     # orders before allowing a new position.
-    # 2x PM leverage: a 25,000 USDT collateral stake opens a 50,000 USDT
+    # 2x PM leverage: a 40,000 USDT collateral stake opens an 80,000 USDT
     # notional initial position.  Reserve the complete five-order DCA ladder
     # (multiplier 7.71561) before permitting a new trade.
-    entry_stake_amount = 25000.0
-    max_position_stake = 192890.25
+    entry_stake_amount = 40000.0
+    max_position_stake = 308624.40
     pm_target_leverage = 2.0
     max_entry_position_adjustment = 5
     protections = [

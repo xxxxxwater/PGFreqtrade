@@ -1,0 +1,6 @@
+ARG BASE_IMAGE=pmbinancejp-native:pm-unattended-1489907
+FROM ${BASE_IMAGE}
+ARG RELEASE_COMMIT
+LABEL org.opencontainers.image.revision=${RELEASE_COMMIT}
+# Framework-only overlay. Dependencies, strategy and runtime secrets are unchanged.
+COPY --chown=1000:1000 freqtrade/ /freqtrade/freqtrade/

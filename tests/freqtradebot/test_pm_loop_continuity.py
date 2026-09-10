@@ -5,6 +5,7 @@ from threading import RLock
 import pytest
 
 from freqtrade.enums import State
+from freqtrade.exceptions import TemporaryError
 from freqtrade.persistence import PMOrderIntent, Trade
 from freqtrade.persistence.pm_stream_journal import PMStreamJournal
 from tests.freqtradebot.test_pm_unattended_gap_closure import pm_conf, pm_db
@@ -123,3 +124,32 @@ def test_process_services_protection_before_slow_market_and_still_exits(mocker, 
     bot.process()
     assert events == ["protection", "market", "exit"]
     assert bot._pm_cycle_exposure_block_reason == "market_analysis_budget_exceeded"
+
+
+def test_process_transient_market_failure_still_runs_exits_and_skips_new_entry_scan(mocker, pm_conf):
+    bot = market_bot(mocker, pm_conf)
+    bot.config["exchange"]["portfolio_margin_risk"]["market_analysis_budget_seconds"] = 12
+    bot.strategy.position_adjustment_enable = True
+    events = []
+    bot._pm_consume_user_stream_events = MagicMock()
+    bot._pm_maintenance_schedule.run_pending = MagicMock()
+    bot._schedule.run_pending = MagicMock()
+    bot._pm_service_protection_before_market = MagicMock(
+        side_effect=lambda: events.append("protection")
+    )
+    bot._refresh_active_whitelist.side_effect = TemporaryError("symbolConfig network disconnect")
+    bot.manage_open_orders = MagicMock()
+    bot.exit_positions = MagicMock(side_effect=lambda trades: events.append("exit"))
+    bot.process_open_trade_positions = MagicMock(side_effect=lambda: events.append("dca"))
+    bot.enter_positions = MagicMock(side_effect=lambda: events.append("entry"))
+    bot._pm_record_entry_block_for_pairs = MagicMock()
+    bot.rpc.process_msg_queue = MagicMock()
+
+    bot.process()
+
+    assert events == ["protection", "protection", "exit", "dca"]
+    assert bot._pm_cycle_exposure_block_reason == "market_refresh_failed"
+    bot.enter_positions.assert_not_called()
+    bot._pm_record_entry_block_for_pairs.assert_called_once_with(
+        bot.active_pair_whitelist, "market_refresh_failed"
+    )

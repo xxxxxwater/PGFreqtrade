@@ -25,6 +25,15 @@ class DependencyException(FreqtradeException):
     """
 
 
+class PMRiskLimitExceeded(DependencyException):
+    """A deterministic Portfolio Margin exposure limit rejected one order.
+
+    This is an order-level policy decision, not a process-fatal operational
+    failure. Callers must refuse the exposure increase while keeping the
+    trader and risk-reducing paths running.
+    """
+
+
 class PricingError(DependencyException):
     """
     Subclass of DependencyException.

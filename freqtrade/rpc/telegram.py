@@ -772,6 +772,21 @@ class Telegram(RPCHandler):
             pass
         return "|".join(parts)
 
+    @staticmethod
+    def _compact_notification_incident_id(identity: str) -> str:
+        """Fit a stable incident identity into the durable 32-character column.
+
+        Never raw-truncate a business identity: that can discard the only part
+        distinguishing two close times or long client ids. Keep a readable
+        prefix and bind the full identity into a 64-bit SHA-256 suffix.
+        """
+        identity = str(identity or "").strip()
+        if len(identity) <= 32:
+            return identity
+        prefix = identity[:15].rstrip("-_.:") or "incident"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        return f"{prefix}-{digest}"[:32]
+
     def _notification_incident_id(self, msg: RPCSendMsg, message: str) -> tuple[str, str]:
         explicit = str(msg.get("incident_id") or "").strip()
         business = self._notification_business_fingerprint(msg)
@@ -784,15 +799,18 @@ class Telegram(RPCHandler):
                 business,
             ]
         )
-        incident_id = explicit or ("tg-" + hashlib.sha256(base.encode("utf-8")).hexdigest()[:16])
+        full_identity = explicit or ("tg-" + hashlib.sha256(base.encode("utf-8")).hexdigest()[:16])
+        incident_id = self._compact_notification_incident_id(full_identity)
         if msg.get("dedupe_once"):
-            dedupe_basis = incident_id
+            # Deduplication remains bound to the full, untruncated business
+            # identity even though the display/storage incident id is compact.
+            dedupe_basis = full_identity
         else:
             # Same incident is persisted at most once per 30-minute reminder window.
             bucket = int(datetime.now(UTC).timestamp() // 1800)
-            dedupe_basis = f"{incident_id}:{bucket}"
+            dedupe_basis = f"{full_identity}:{bucket}"
         dedupe_key = hashlib.sha256(dedupe_basis.encode("utf-8")).hexdigest()
-        return incident_id[:32], dedupe_key
+        return incident_id, dedupe_key
 
     @staticmethod
     def _notification_priority(msg: RPCSendMsg) -> int:
@@ -987,7 +1005,7 @@ class Telegram(RPCHandler):
                     "status": (
                         f"PM RECOVERY NOTICE: Trade #{item['id']} {item['pair']} is CLOSED "
                         f"in the durable database at {close_ts}; reason={item['exit_reason'] or 'unknown'}. "
-                        "This completion notice was reconstructed after restart."
+                        "This completion notice was reconstructed from durable business state."
                     ),
                     "incident_id": f"pm-closed-{item['id']}-{close_ts}",
                     "trade_id": item["id"],

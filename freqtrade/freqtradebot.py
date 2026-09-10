@@ -17,6 +17,7 @@ from typing import Any
 from schedule import Scheduler
 from sqlalchemy import func, select
 
+import ccxt
 import pandas as pd
 from pandas import DataFrame
 
@@ -40,8 +41,10 @@ from freqtrade.exceptions import (
     InsufficientFundsError,
     InvalidOrderException,
     OperationalException,
+    PMRiskLimitExceeded,
     PricingError,
     StopWouldImmediatelyTrigger,
+    TemporaryError,
 )
 from freqtrade.exchange import (
     ROUND_DOWN,
@@ -1982,6 +1985,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             "transitions": [],
             "mismatches": [],
             "errors": [],
+            "stop_verification_pending": [],
         }
         try:
             if (
@@ -2088,6 +2092,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         # the regular loop recreates it (auto-heal).
         try:
             result["unprotected_positions"] = self._pm_verify_stop_protection()
+            result["stop_verification_pending"] = list(
+                getattr(self, "_pm_last_stop_verification_pending", [])
+            )
             protection_verifiable = True
         except Exception as e:
             result["unprotected_positions"] = []
@@ -2116,6 +2123,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             not result["errors"]
             and not result["position_mismatches"]
             and not result["unprotected_positions"]
+            and not result["stop_verification_pending"]
         ):
             self._pm_init_user_stream_state()
             self._pm_last_success_reconcile_time = datetime.now(UTC)
@@ -2477,6 +2485,68 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             return "invalid", check
         return "active", check
 
+    def _pm_stop_verification_grace_seconds(self) -> float:
+        """Short exchange-consistency grace after a conditional ACK (non-blocking)."""
+        return 30.0
+
+    def _pm_stop_ack_within_verification_grace(self, trade: Trade, stop_id: str) -> bool:
+        """Grace needs exact durable ownership and a covering request, not just ACK."""
+        try:
+            row = PMOutbox.get_by_client_id(str(stop_id))
+            if (
+                row is None or row.operation != "conditional"
+                or row.state not in {"ACKED", "LINKED", "RECONCILED"}
+                or row.origin_trade_id != trade.id
+                or not row.exchange_order_id or not row.raw_response
+            ):
+                return False
+            request = json.loads(row.payload)
+            ack = json.loads(row.raw_response)
+            if not isinstance(request, dict) or not isinstance(ack, dict):
+                return False
+            # ACK storage can be a raw Binance response or the parsed CCXT shape.
+            ack_info = ack.get("info") if isinstance(ack.get("info"), dict) else ack
+            if (
+                str(request.get("clientAlgoId") or "") != str(stop_id)
+                or str(ack_info.get("clientAlgoId") or ack.get("clientAlgoId") or "")
+                != str(stop_id)
+                or self._pm_canonical_pair(request.get("symbol"))
+                != self._pm_canonical_pair(trade.pair)
+                or str(request.get("side") or "").lower() != trade.exit_side
+                or str(request.get("reduceOnly") or "").lower() != "true"
+            ):
+                return False
+            amount = float(request.get("quantity") or 0)
+            if not isfinite(amount) or amount < trade.amount * (1 - 1e-8):
+                return False
+            # Reconciliation must not restart the grace clock. Use the earliest
+            # durable send/ACK timestamp, never a later LINK/RECONCILED timestamp.
+            times = [
+                value.replace(tzinfo=UTC) if value.tzinfo is None else value
+                for value in (row.created_at, row.dispatch_started_at, row.processed_at)
+                if value is not None
+            ]
+            if not times:
+                return False
+            age_s = (datetime.now(UTC) - min(times)).total_seconds()
+            return 0 <= age_s <= self._pm_stop_verification_grace_seconds()
+        except Exception:
+            # Bad identity/shape or unreadable evidence cannot suppress SAFE_HOLD.
+            return False
+    def _pm_stop_verification_pending_hold(self, trade: Trade, stop_id: str, why: str) -> None:
+        """Block new exposure while a freshly ACKed stop is not yet query-visible."""
+        self._pm_block_orders("stop_verification_pending")
+        logger.warning(
+            "PM stop verification pending for Trade #%s %s conditional=%s: %s. "
+            "A durable ACK exists, but ACK is not protection verification; old protection "
+            "is retained and new exposure is blocked during the %.0fs consistency grace.",
+            trade.id,
+            trade.pair,
+            stop_id,
+            why,
+            self._pm_stop_verification_grace_seconds(),
+        )
+
     def _pm_protection_hold(self, trade: Trade, why: str) -> None:
         """Hold risk increase while protection is unverified; keep exits open."""
         self._pm_init_user_stream_state()
@@ -2655,6 +2725,46 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self.update_trade_state(trade, old_id, co, stoploss_order=True)
         return all_resolved
 
+    def _pm_existing_stop_lifecycles_known(self, trade: Trade) -> bool:
+        """Never create another candidate while a durable local stop is unverified.
+
+        This is NOT a coverage verdict: a known active but undersized old stop
+        may be resized after DCA. Unknown identity/lifecycle must first reconcile.
+        Local Order rows survive restart; no in-memory-only pending flag.
+        """
+        for sl in list(trade.open_sl_orders):
+            sid = str(sl.order_id)
+            try:
+                check = self.exchange.fetch_stoploss_order(sid, trade.pair)
+            except Exception as exc:
+                reason = (
+                    "not visible in lookup/history; terminal state NOT established"
+                    if isinstance(exc, InvalidOrderException)
+                    else f"lookup unavailable ({type(exc).__name__})"
+                )
+                if isinstance(exc, InvalidOrderException) and (
+                    self._pm_stop_ack_within_verification_grace(trade, sid)
+                ):
+                    self._pm_stop_verification_pending_hold(trade, sid, reason)
+                else:
+                    self._pm_protection_hold(trade, f"existing stop {sid}: {reason}")
+                return False
+            if not self._pm_stop_identity_matches(trade, sid, check):
+                self._pm_protection_hold(trade, f"existing stop {sid}: identity unverified")
+                return False
+            # Let the ordinary stop/child lifecycle book terminal and partial
+            # fills first. Do not cancel/recreate across an in-flight exit.
+            if (
+                str(check.get("status") or "").lower() != "open"
+                or str(check.get("status_stop") or "").lower() == "triggered"
+            ):
+                self._pm_protection_hold(
+                    trade, f"existing stop {sid}: lifecycle needs reconciliation"
+                )
+                return False
+        return True
+
+
     def _pm_replace_stop_protection(
         self,
         trade: Trade,
@@ -2679,6 +2789,8 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         stop_price = (
             new_stop_price if new_stop_price is not None else trade.stoploss_or_liquidation
         )
+        if not self._pm_existing_stop_lifecycles_known(trade):
+            return "kept_old"
         old_ids_before = {str(sl.order_id) for sl in trade.open_sl_orders}
         if not self.create_stoploss_order(trade=trade, stop_price=stop_price):
             if trade.is_open and trade.has_open_position:
@@ -2695,6 +2807,20 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         new_id = next(iter(new_ids))
         try:
             check = self.exchange.fetch_stoploss_order(new_id, trade.pair)
+        except InvalidOrderException as e:
+            if self._pm_stop_ack_within_verification_grace(trade, new_id):
+                self._pm_stop_verification_pending_hold(
+                    trade, new_id, "freshly ACKed conditional is not query-visible yet"
+                )
+                return "verification_pending"
+            logger.warning(
+                "PM protection replace: new conditional %s is absent beyond verification grace "
+                "(%s); keeping the old protection.",
+                new_id,
+                e,
+            )
+            self._pm_protection_hold(trade, "replacement absent beyond verification grace")
+            return "kept_old"
         except Exception as e:
             logger.warning(
                 "PM protection replace: could not verify new conditional %s (%s); "
@@ -2802,6 +2928,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         offenders: list[dict[str, Any]] = []
         retire_pending: list[dict[str, Any]] = []
         triggered_pending: list[dict[str, Any]] = []
+        verification_pending: list[dict[str, Any]] = []
         if not (
             self.trading_mode == TradingMode.FUTURES
             and not self.config.get("dry_run", True)
@@ -2828,6 +2955,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             local_ids = {str(sl.order_id) for sl in trade.open_sl_orders}
             verified: set[str] = set()
             pending_exit_ids: set[str] = set()
+            pending_verify_ids: set[str] = set()
             unresolved_old_ids: set[str] = set()
             problems: list[str] = []
 
@@ -2840,6 +2968,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                         # Resolve open -> history -> actual child before deciding.
                         order = self.exchange.fetch_stoploss_order(sid, trade.pair)
                     except InvalidOrderException:
+                        if self._pm_stop_ack_within_verification_grace(trade, sid):
+                            pending_verify_ids.add(sid)
+                            problems.append(f"{sid}:verification_pending")
+                            continue
                         unresolved_old_ids.add(sid)
                         problems.append(f"{sid}:absent_open_and_history")
                         continue
@@ -2888,7 +3020,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             if not trade.is_open or not trade.has_open_position:
                 continue
             if verified:
-                unresolved = sorted((local_ids - verified) | unresolved_old_ids)
+                unresolved = sorted(
+                    (local_ids - verified - pending_verify_ids) | unresolved_old_ids
+                )
                 if unresolved:
                     retire_pending.append(
                         {
@@ -2898,6 +3032,25 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                             "verified_ids": sorted(verified),
                         }
                     )
+                if pending_verify_ids:
+                    verification_pending.append(
+                        {
+                            "trade_id": trade.id,
+                            "pair": trade.pair,
+                            "ids": sorted(pending_verify_ids),
+                            "verified_ids": sorted(verified),
+                        }
+                    )
+                continue
+            if pending_verify_ids:
+                verification_pending.append(
+                    {
+                        "trade_id": trade.id,
+                        "pair": trade.pair,
+                        "ids": sorted(pending_verify_ids),
+                        "verified_ids": [],
+                    }
+                )
                 continue
             if pending_exit_ids:
                 triggered_pending.append(
@@ -2925,6 +3078,11 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self._pm_block_orders("stop_triggered_exit_pending")
         else:
             self._pm_unblock_orders("stop_triggered_exit_pending")
+        self._pm_last_stop_verification_pending = verification_pending
+        if verification_pending:
+            self._pm_block_orders("stop_verification_pending")
+        else:
+            self._pm_unblock_orders("stop_verification_pending")
         return offenders
 
     def _pm_origin_trade_kwargs(self, trade: Trade | None) -> dict[str, int]:
@@ -3248,6 +3406,17 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         cycle_reason = getattr(self, "_pm_cycle_exposure_block_reason", None)
         if cycle_reason:
             return str(cycle_reason)
+        symbol_health_fn = getattr(self.exchange, "get_pm_symbol_config_health", None)
+        if callable(symbol_health_fn):
+            try:
+                symbol_health = symbol_health_fn() or {}
+            except Exception as exc:
+                return f"pm_symbol_config_health_unavailable: {exc.__class__.__name__}"
+            if symbol_health.get("degraded"):
+                age = symbol_health.get("last_good_age_s")
+                age_text = f"{float(age):.1f}s" if age is not None else "unknown"
+                error = str(symbol_health.get("last_error") or "unknown")[:160]
+                return f"pm_symbol_config_degraded: last_good_age={age_text} error={error}"
         _snapshot, block_reason = self._pm_ledger_snapshot(pair)
         return block_reason
 
@@ -4337,6 +4506,10 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         """
         started = _time.monotonic()
         self._pm_cycle_exposure_block_reason = "market_refresh_in_progress"
+        if started < getattr(self, "_pm_market_retry_after", 0):
+            self._pm_cycle_exposure_block_reason = "market_refresh_retry_pending"
+            return
+        stage = "markets"
 
         def over_budget(stage: str) -> bool:
             elapsed = _time.monotonic() - started
@@ -4356,18 +4529,22 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self.exchange.reload_markets()
             if over_budget("markets"):
                 return
+            stage = "fees"
             self.update_trades_without_assigned_fees()
             if over_budget("fees"):
                 return
+            stage = "whitelist"
             self.active_pair_whitelist = self._refresh_active_whitelist(Trade.get_open_trades())
             if over_budget("whitelist"):
                 return
+            stage = "candles"
             self.dataprovider.refresh(
                 self.pairlists.create_pair_list(self.active_pair_whitelist),
                 self.strategy.gather_informative_pairs(),
             )
             if over_budget("candles"):
                 return
+            stage = "strategy"
             strategy_safe_wrapper(self.strategy.bot_loop_start, supress_error=True)(
                 current_time=datetime.now(UTC)
             )
@@ -4378,10 +4555,34 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     self.strategy.analyze([pair])
                     if over_budget("analyze"):
                         return
+        except (TemporaryError, ccxt.NetworkError) as exc:
+            self._pm_cycle_exposure_block_reason = "market_refresh_failed"
+            if stage == "strategy":
+                raise
+            # Only the read-only market phase yields. No POST is retried here,
+            # no stale permission list is accepted, and no worker-wide sleep
+            # delays order reconciliation, protection or exits.
+            failures = min(getattr(self, "_pm_market_read_failures", 0) + 1, 5)
+            self._pm_market_read_failures = failures
+            delay = min(3 * 2 ** (failures - 1), 30)
+            self._pm_market_retry_after = _time.monotonic() + delay
+            logger.warning(
+                "PM market read unavailable: stage=%s error=%s; increasing exposure "
+                "BLOCKED, retry in %ss; order/protection/exit processing continues.",
+                stage, type(exc).__name__, delay,
+            )
+            return
         except Exception:
-            # Never leave a stale "ready" flag after an interrupted batch.
+            # Programming, database and permanent account errors are NOT hidden.
             self._pm_cycle_exposure_block_reason = "market_refresh_failed"
             raise
+        if getattr(self, "_pm_market_read_failures", 0):
+            logger.info(
+                "PM market refresh recovered after a complete fresh analysis batch; "
+                "market-read hold cleared, other risk/ownership gates unchanged."
+            )
+        self._pm_market_read_failures = 0
+        self._pm_market_retry_after = 0
         self._pm_cycle_exposure_block_reason = None
 
     def process(self) -> None:
@@ -4395,7 +4596,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         # market refresh and factor analysis.  This keeps a scheduled stop repair,
         # user-stream reconciliation or account-risk action from sitting behind a
         # slow pairlist/REST request.
-        self._pm_cycle_exposure_block_reason = None
+        self._pm_cycle_exposure_block_reason = (
+            "market_refresh_in_progress" if self._pm_db_gate_active() else None
+        )
         self._pm_consume_user_stream_events()
         self._pm_maintenance_schedule.run_pending()
         self._schedule.run_pending()
@@ -4405,11 +4608,14 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self.config.get("exchange", {}).get("portfolio_margin_risk", {})
             .get("market_analysis_budget_seconds", 0) or 0
         )
-        if self._pm_db_gate_active() and budget_s > 0:
+        if self._pm_db_gate_active():
             try:
-                self._pm_refresh_market_with_budget(budget_s)
+                self._pm_refresh_market_with_budget(budget_s if budget_s > 0 else float("inf"))
+                if self._pm_cycle_exposure_block_reason == "market_refresh_failed":
+                    self._pm_service_protection_before_market()
             except Exception:
-                # A failed market phase must not skip outstanding stop repair.
+                # Unexpected/programming/invariant failures remain visible and
+                # fatal; service protection once more before propagating them.
                 self._pm_service_protection_before_market()
                 raise
         else:
@@ -4475,7 +4681,11 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         # Then looking for entry opportunities.  A full-slot condition is
         # itself an auditable per-pair decision for the current candle.
         if self.state == State.RUNNING:
-            if self.get_free_open_trades():
+            if self._pm_cycle_exposure_block_reason:
+                self._pm_record_entry_block_for_pairs(
+                    self.active_pair_whitelist, self._pm_cycle_exposure_block_reason
+                )
+            elif self.get_free_open_trades():
                 self.enter_positions()
             else:
                 self._pm_record_entry_block_for_pairs(
@@ -5213,7 +5423,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             entry_tag=enter_tag,
             side=trade_side,
         ):
-            logger.info(f"User denied entry for {pair}.")
+            logger.info(f"Strategy confirm_trade_entry rejected initial entry for {pair}.")
             self._pm_record_signal_decision(
                 pair,
                 decision="blocked",
@@ -5225,19 +5435,32 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         if trade and self.handle_similar_open_order(trade, enter_limit_requested, amount, side):
             return False
 
-        order = self.exchange.create_order(
-            pair=pair,
-            ordertype=order_type,
-            side=side,
-            amount=amount,
-            rate=enter_limit_requested,
-            reduceOnly=False,
-            time_in_force=time_in_force,
-            leverage=leverage,
-            initial_order=trade is None,
-            entry_mode=mode,
-            **self._pm_origin_trade_kwargs(trade),
-        )
+        try:
+            order = self.exchange.create_order(
+                pair=pair,
+                ordertype=order_type,
+                side=side,
+                amount=amount,
+                rate=enter_limit_requested,
+                reduceOnly=False,
+                time_in_force=time_in_force,
+                leverage=leverage,
+                initial_order=trade is None,
+                entry_mode=mode,
+                **self._pm_origin_trade_kwargs(trade),
+            )
+        except PMRiskLimitExceeded as exc:
+            # A deterministic exposure cap is a single-order rejection, not a
+            # process-fatal OperationalException. Keep the trader RUNNING and
+            # preserve exits/protection while recording the blocked decision.
+            logger.warning("PM risk cap blocked %s entry for %s: %s", mode, pair, exc)
+            self._pm_record_signal_decision(
+                pair,
+                decision="blocked",
+                reason="pm_risk_limit_exceeded",
+                decision_scope=decision_scope,
+            )
+            return False
         order_obj = Order.parse_from_ccxt_object(order, pair, side, amount, enter_limit_requested)
         order_obj.ft_order_tag = enter_tag
         order_id = order["id"]

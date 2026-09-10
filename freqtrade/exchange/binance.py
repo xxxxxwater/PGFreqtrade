@@ -25,6 +25,7 @@ from freqtrade.exceptions import (
     DDosProtection,
     InsufficientFundsError,
     InvalidOrderException,
+    PMRiskLimitExceeded,
     OperationalException,
     StopWouldImmediatelyTrigger,
     TemporaryError,
@@ -215,6 +216,14 @@ class Binance(Exchange):
         self._pm_um_symbol_config_cache: FtTTLCache = FtTTLCache(
             maxsize=1, ttl=pm_symbol_config_cache_seconds
         )
+        # Keep the last account-verified UM symbol set outside the expiring TTL
+        # cache. A transient symbolConfig network failure must not kill the main
+        # loop or make us invent account permissions. The LKG universe may keep
+        # market analysis / existing-position management alive, while a separate
+        # health flag blocks all exposure increases until PAPI recovers.
+        self._pm_um_symbol_config_last_good: frozenset[str] | None = None
+        self._pm_um_symbol_config_last_good_at: datetime | None = None
+        self._pm_um_symbol_config_last_error: str | None = None
         pm_stoploss_capability_cache_seconds = max(
             1, int(exchange_conf.get("portfolio_margin_stoploss_capability_cache_seconds", 300))
         )
@@ -591,16 +600,41 @@ class Binance(Exchange):
     def _pm_symbol_for_pair(self, pair: str) -> str:
         return self.markets[self.pm_canonical_pair(pair)]["id"]
 
+    def get_pm_symbol_config_health(self) -> dict[str, Any]:
+        """Account-level whitelist health, independent from market-data health."""
+        last_good = getattr(self, "_pm_um_symbol_config_last_good", None)
+        last_good_at = getattr(self, "_pm_um_symbol_config_last_good_at", None)
+        last_error = getattr(self, "_pm_um_symbol_config_last_error", None)
+        age_s = None
+        if last_good_at is not None:
+            try:
+                age_s = max(0.0, (datetime.now(UTC) - last_good_at).total_seconds())
+            except TypeError:
+                age_s = max(
+                    0.0,
+                    (datetime.now(UTC).replace(tzinfo=None) - last_good_at).total_seconds(),
+                )
+        return {
+            "enabled": self._is_portfolio_margin(),
+            "has_last_good": bool(last_good),
+            "last_good_age_s": age_s,
+            "degraded": bool(last_error),
+            "last_error": last_error,
+        }
+
     def get_pm_tradable_pairs(self) -> set[str]:
         """Return UM markets explicitly enabled for this PM account.
 
         Public USDⓈ-M market metadata alone is insufficient when Binance offers
-        account-gated contracts (for example TradFi perpetuals).  PAPI's
-        ``/um/symbolConfig`` is the account-side source of truth: each returned
-        symbol has a margin mode, configured leverage, and maximum notional.
-        A pairlist can therefore admit every underlying asset class without
-        guessing from its name, while excluding a public contract this PM
-        account cannot execute.
+        account-gated contracts (for example TradFi perpetuals). PAPI's
+        ``/um/symbolConfig`` is the account-side source of truth.
+
+        Runtime availability rule: after at least one successful account-level
+        snapshot, a transient PAPI/network failure reuses that last-known-good
+        set only for universe continuity. ``get_pm_symbol_config_health()`` is
+        marked degraded, and FreqtradeBot blocks *new exposure* until a fresh
+        account snapshot succeeds. Existing protection/exits therefore keep
+        running instead of the whole process dying on a single GET failure.
         """
         if not self._is_portfolio_margin():
             return set()
@@ -608,7 +642,32 @@ class Binance(Exchange):
         if cached is not None:
             return set(cached)
 
-        raw_configs = self._papi_request("um/symbolConfig", "GET")
+        try:
+            raw_configs = self._papi_request("um/symbolConfig", "GET")
+        except (ccxt.NetworkError, TemporaryError) as exc:
+            fallback = getattr(self, "_pm_um_symbol_config_last_good", None)
+            # CCXT exception text may include signed URLs. Health/status logs
+            # need an error category, never API signatures or query parameters.
+            self._pm_um_symbol_config_last_error = exc.__class__.__name__
+            if fallback:
+                # Re-cache the LKG set for one normal TTL interval to prevent a
+                # failing endpoint from being hammered every bot iteration.
+                self._pm_um_symbol_config_cache["pairs"] = fallback
+                logger.warning(
+                    "Binance PM um/symbolConfig refresh failed (%s); using last-known-good "
+                    "account whitelist (%s pairs) for continuity. New exposure remains "
+                    "blocked until a fresh symbolConfig snapshot succeeds.",
+                    exc.__class__.__name__,
+                    len(fallback),
+                )
+                return set(fallback)
+            # No verified account universe has ever existed. This is retryable,
+            # but cannot safely be converted into an inferred/public whitelist.
+            raise TemporaryError(
+                "Binance PM um/symbolConfig is temporarily unavailable and no "
+                "last-known-good account whitelist exists."
+            ) from None
+
         if not isinstance(raw_configs, list):
             raise OperationalException(
                 "Binance PM um/symbolConfig returned an invalid response; "
@@ -635,9 +694,6 @@ class Binance(Exchange):
             try:
                 pairs.add(self.pm_canonical_pair(symbol_id))
             except OperationalException:
-                # A public/spot alias is not evidence this contract is loaded.
-                # Excluding it from the whitelist is safe; account positions and
-                # orders use the strict resolver and cannot be silently dropped.
                 logger.debug("PM whitelist excludes unmapped UM instrument %s", symbol_id)
         if not pairs:
             raise OperationalException(
@@ -645,7 +701,19 @@ class Binance(Exchange):
                 "markets; refusing to build a tradable whitelist. Complete any required "
                 "TradFi-perps agreement and verify the PM API key/account permissions."
             )
-        self._pm_um_symbol_config_cache["pairs"] = frozenset(pairs)
+
+        previous_error = getattr(self, "_pm_um_symbol_config_last_error", None)
+        frozen = frozenset(pairs)
+        self._pm_um_symbol_config_cache["pairs"] = frozen
+        self._pm_um_symbol_config_last_good = frozen
+        self._pm_um_symbol_config_last_good_at = datetime.now(UTC)
+        self._pm_um_symbol_config_last_error = None
+        if previous_error:
+            logger.info(
+                "Binance PM um/symbolConfig recovered; "
+                "fresh account whitelist verified (%s pairs).",
+                len(frozen),
+            )
         return pairs
 
     @staticmethod
@@ -2339,7 +2407,7 @@ class Binance(Exchange):
             projected_total = current_total + new_notional
 
             if projected_total > float(max_total_notional):
-                raise OperationalException(
+                raise PMRiskLimitExceeded(
                     f"Projected total notional {projected_total:.2f} exceeds "
                     f"max_total_notional {max_total_notional}; "
                     f"current={current_total:.2f} (incl. reserved open orders/intents), "
@@ -2367,7 +2435,7 @@ class Binance(Exchange):
                 new_notional = amount * price
                 projected_pair = current_pair_notional + new_notional
                 if projected_pair > float(pair_cap):
-                    raise OperationalException(
+                    raise PMRiskLimitExceeded(
                         f"Projected {pair} notional {projected_pair:.2f} exceeds "
                         f"per-pair max {pair_cap} "
                         f"(current={current_pair_notional:.2f} incl. reserved, "
@@ -3467,8 +3535,9 @@ class Binance(Exchange):
 
         Fail-closed: transient failures propagate (TemporaryError) so the caller
         aborts the iteration instead of assuming the stoploss is gone and placing a
-        duplicate one. InvalidOrderException is raised ONLY when the exchange
-        definitively reports the strategy no longer exists.
+        duplicate one. InvalidOrderException means the requested ID was not
+        found in the queried open/history responses, NOT proof of cancellation
+        or non-acceptance. Callers must retain unresolved durable ownership.
         """
         if not self._is_portfolio_margin() or self._config["dry_run"]:
             return super().fetch_stoploss_order(order_id, pair, params)
@@ -3476,12 +3545,36 @@ class Binance(Exchange):
         # Unlike regular UM order lookup, it is not symbol-scoped.
         request: dict[str, Any] = self._pm_conditional_lookup_params(order_id)
         request.update(params or {})
+
+        def parse_lookup(raw: dict) -> CcxtOrder:
+            if not isinstance(raw, dict):
+                raise TemporaryError("PM algo lookup response shape is unverified")
+            aliases = {
+                str(value) for value in (raw.get("clientAlgoId"), raw.get("algoId"))
+                if value is not None
+            }
+            if str(order_id) not in aliases:
+                raise TemporaryError("PM algo lookup response identity is unverified")
+            parsed = self._parse_pm_conditional_order(raw, pair)
+            # Preserve the durable local lookup key, while retaining both
+            # exchange aliases in info. Never rewrite the database ownership key.
+            parsed["id"] = str(order_id)
+            if str(parsed.get("info", {}).get("algo_status") or "").upper() in {
+                "TRIGGERED", "FINISHED",
+            }:
+                # Missing/not-yet-visible child is an in-flight exit, not a
+                # fresh active trigger and certainly not proof of a full fill.
+                parsed["status_stop"] = "triggered"
+                if parsed.get("info", {}).get("actual_order_id"):
+                    return self._pm_resolve_conditional_actual_order(parsed, pair)
+            return parsed
+
         try:
             raw_order = self._papi_request(
                 f"{self._pm_namespace_for_pair(pair)}/algo/algoOrder", "GET", request
             )
             self._log_exchange_response("papi_fetch_stoploss_algo_order", raw_order)
-            return self._parse_pm_conditional_order(raw_order, pair)
+            return parse_lookup(raw_order)
         except ccxt.BaseError as e:
             if not self._pm_order_not_found(e):
                 # Transient error -> propagate; the caller must not treat the
@@ -3506,16 +3599,24 @@ class Binance(Exchange):
             # Binance returns a list today.  Accept documented wrapper variants as
             # well, but never regard an unrecognised response as an absent stoploss.
             records = raw_orders if isinstance(raw_orders, list) else (
-                raw_orders.get("orders", raw_orders.get("data", []))
+                raw_orders.get("orders", raw_orders.get("data"))
                 if isinstance(raw_orders, dict)
-                else []
+                else None
             )
+            if not isinstance(records, list) or any(
+                not isinstance(record, dict) for record in records
+            ):
+                raise TemporaryError("PM algo history response shape is unverified")
             raw_order = next(
                 (
                     record
                     for record in records
                     if isinstance(record, dict)
-                    and str(record.get("clientAlgoId") or record.get("algoId")) == str(order_id)
+                    and str(order_id) in {
+                        str(value) for value in (
+                            record.get("clientAlgoId"), record.get("algoId")
+                        ) if value is not None
+                    }
                 ),
                 None,
             )
@@ -3524,15 +3625,7 @@ class Binance(Exchange):
                     f"Binance PM algo order {order_id} on {pair} does not exist "
                     "(not open, not in history)."
                 )
-            order = self._parse_pm_conditional_order(raw_order, pair)
-            # TRIGGERED/FINISHED with a real order id -> resolve the real order.
-            algo_status = str(order.get("info", {}).get("algo_status") or "").upper()
-            if order.get("info", {}).get("actual_order_id") and algo_status in {
-                "TRIGGERED",
-                "FINISHED",
-            }:
-                return self._pm_resolve_conditional_actual_order(order, pair)
-            return order
+            return parse_lookup(raw_order)
 
     @retrier(retries=0)
     def fetch_open_conditional_orders(self, pair: str | None = None) -> list[CcxtOrder]:

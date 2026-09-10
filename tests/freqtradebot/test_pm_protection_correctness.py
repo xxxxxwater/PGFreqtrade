@@ -69,6 +69,8 @@ def switch_bot(mocker, pm_conf):
     bot.exchange.cancel_stoploss_order_with_result = MagicMock()
     bot.rpc.send_msg = MagicMock()
     bot._pm_link_intent_for_order = MagicMock()
+    # Isolate NEW-candidate behavior; real OLD preflight/reload is tested separately.
+    bot._pm_existing_stop_lifecycles_known = MagicMock(return_value=True)
     return bot, trade
 
 
@@ -347,7 +349,7 @@ def test_dual_protection_window_never_touches_second_protection(mocker, pm_conf)
         return_value=ccxt_order("stnew", "open", "sell", filled=0)
     )
     bot.exchange.fetch_stoploss_order = MagicMock(
-        return_value=conditional("stnew", amount=11.0, info={"reduceOnly": True})
+        side_effect=lambda oid, pair: conditional(oid, amount=11.0, info={"reduceOnly": True})
     )
     bot.exchange.cancel_stoploss_order_with_result = MagicMock(
         return_value=ccxt_order("stold", "canceled", "sell", filled=0)

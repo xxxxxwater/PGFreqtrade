@@ -3438,3 +3438,48 @@ async def test_business_state_rebuild_backfills_crash_before_notification_enqueu
     assert row.state == "PENDING"
     assert "duplicate POST is forbidden" in row.message
     PMNotificationOutbox.session.remove()
+
+
+def test_recovery_notice_wording_does_not_claim_restart(
+    default_conf, mocker, init_persistence, fee
+):
+    """Periodic rebuild runs during normal uptime, so the actual queued notice is restart-neutral."""
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    telegram._config.setdefault("telegram", {}).setdefault("notification_settings", {})[
+        str(RPCMessageType.EXIT_FILL)
+    ] = "on"
+    create_mock_trades(fee)
+    trade = Trade.get_trades([Trade.is_open.is_(False)]).first()
+    trade.close_date = dt_now()
+    Trade.commit()
+    close_ts = trade.close_date.isoformat()
+
+    queued = telegram._rebuild_critical_notifications_from_business_state()
+
+    full_incident = f"pm-closed-{trade.id}-{close_ts}"
+    expected_incident = telegram._compact_notification_incident_id(full_incident)
+    rows = PMNotificationOutbox.session.query(PMNotificationOutbox).all()
+    matching = [row for row in rows if row.incident_id == expected_incident]
+    assert matching, (
+        f"queued={queued} target={expected_incident} "
+        f"rows={[row.incident_id for row in rows]}"
+    )
+    row = matching[0]
+    assert "reconstructed from durable business state" in row.message
+    assert "reconstructed after restart" not in row.message
+    PMNotificationOutbox.session.remove()
+
+
+def test_long_explicit_incident_ids_are_hashed_not_raw_truncated(default_conf, mocker):
+    mocker.patch("freqtrade.rpc.telegram.Telegram._init", MagicMock())
+    telegram, _, _ = get_telegram_testobject(mocker, default_conf, mock=False)
+    one = "pm-closed-7-2026-09-10T01:40:43.421722"
+    two = "pm-closed-7-2026-09-10T01:40:43.421723"
+    a = telegram._compact_notification_incident_id(one)
+    b = telegram._compact_notification_incident_id(two)
+    assert len(a) <= 32 and len(b) <= 32
+    assert a != one[:32]
+    assert b != two[:32]
+    assert a != b
+    assert a == telegram._compact_notification_incident_id(one)

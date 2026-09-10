@@ -1368,6 +1368,11 @@ class RPC:
             if hasattr(self._freqtrade.exchange, "get_pm_read_freshness_stats")
             else {}
         )
+        pm_symbol_config = (
+            self._freqtrade.exchange.get_pm_symbol_config_health()
+            if hasattr(self._freqtrade.exchange, "get_pm_symbol_config_health")
+            else {}
+        )
         blocked_reasons = getattr(
             self._freqtrade, "_pm_blocked_order_reasons", lambda: []
         )()
@@ -1381,6 +1386,13 @@ class RPC:
         last_reconcile = getattr(self._freqtrade, "_pm_last_reconcile_result", None) or {}
         last_reconcile_at = getattr(self._freqtrade, "_pm_last_success_reconcile_time", None)
         open_bot_trades = Trade.get_open_trades()
+        exposure_data_blocks: list[str] = []
+        if pm_symbol_config.get("degraded"):
+            exposure_data_blocks.append("pm_symbol_config_degraded")
+        cycle_block = getattr(self._freqtrade, "_pm_cycle_exposure_block_reason", None)
+        if cycle_block:
+            exposure_data_blocks.append(str(cycle_block))
+        effective_entry_blocks = [*blocked_reasons, *exposure_data_blocks]
 
         return {
             "account_status": risk.get("account_status") or "unknown",
@@ -1395,13 +1407,15 @@ class RPC:
             "run_state": self._freqtrade.state.name,
             "orders_blocked_reasons": blocked_reasons,
             "entry_permission": {
-                "global_allowed": not blocked_reasons,
-                "global_block_reasons": blocked_reasons,
+                "global_allowed": not effective_entry_blocks,
+                "global_block_reasons": effective_entry_blocks,
+                "durable_gate_reasons": blocked_reasons,
+                "exposure_data_reasons": exposure_data_blocks,
                 "pair_local_foreign_conflicts": foreign_conflicts,
                 "allowed_whitelist_pairs": [
                     pair
                     for pair in active_whitelist
-                    if not blocked_reasons and pair not in foreign_conflicts
+                    if not effective_entry_blocks and pair not in foreign_conflicts
                 ],
             },
             "exit_capability": {
@@ -1411,12 +1425,14 @@ class RPC:
             "protection": {
                 "open_bot_trades": len(open_bot_trades),
                 "unprotected_positions": last_reconcile.get("unprotected_positions", []),
+                "verification_pending": last_reconcile.get("stop_verification_pending", []),
                 "last_success_reconcile_at": (
                     last_reconcile_at.isoformat() if last_reconcile_at is not None else None
                 ),
             },
             "market_data": market_data,
             "papi_reads": papi_reads,
+            "pm_symbol_config": pm_symbol_config,
             "signal_coverage": signal_coverage,
             "balances": non_zero_balances,
             "positions": [

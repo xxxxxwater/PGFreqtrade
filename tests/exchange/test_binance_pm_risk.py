@@ -7,7 +7,7 @@ import ccxt
 import pytest
 
 from freqtrade.enums import PriceType
-from freqtrade.exceptions import OperationalException, TemporaryError
+from freqtrade.exceptions import OperationalException, PMRiskLimitExceeded, TemporaryError
 from freqtrade.exchange.binance import Binance
 
 
@@ -67,7 +67,7 @@ def test_pm_replace_entry_counts_new_notional():
     exchange = make_pm_exchange({"max_total_notional": 100})
 
     # existing position 50 + replace 60 = 110 > 100 -> refused
-    with pytest.raises(OperationalException, match="entry_mode=replace"):
+    with pytest.raises(PMRiskLimitExceeded, match="entry_mode=replace"):
         exchange.assert_pm_risk_allows_order(
             pair=PAIR, amount=0.001, leverage=5, entry_mode="replace"
         )
@@ -78,7 +78,7 @@ def test_pm_replace_entry_counts_new_notional():
 def test_pm_position_adjustment_counts_incremental_notional():
     exchange = make_pm_exchange({"max_total_notional": 100})
 
-    with pytest.raises(OperationalException, match="entry_mode=pos_adjust"):
+    with pytest.raises(PMRiskLimitExceeded, match="entry_mode=pos_adjust"):
         exchange.assert_pm_risk_allows_order(
             pair=PAIR, amount=0.001, leverage=5, entry_mode="pos_adjust"
         )
@@ -87,7 +87,7 @@ def test_pm_position_adjustment_counts_incremental_notional():
 def test_pm_dynamic_pairlist_uses_wildcard_position_notional_cap():
     exchange = make_pm_exchange({"max_position_notional": {"*": 100}})
 
-    with pytest.raises(OperationalException, match=r"per-pair max 100"):
+    with pytest.raises(PMRiskLimitExceeded, match=r"per-pair max 100"):
         exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=1)
 
     exchange.fetch_positions.assert_called_once()
@@ -96,7 +96,7 @@ def test_pm_dynamic_pairlist_uses_wildcard_position_notional_cap():
 def test_pm_exact_position_cap_overrides_dynamic_pairlist_wildcard():
     exchange = make_pm_exchange({"max_position_notional": {"*": 1000, PAIR: 100}})
 
-    with pytest.raises(OperationalException, match=r"per-pair max 100"):
+    with pytest.raises(PMRiskLimitExceeded, match=r"per-pair max 100"):
         exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=1)
 
 

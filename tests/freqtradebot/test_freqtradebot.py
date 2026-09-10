@@ -27,6 +27,7 @@ from freqtrade.exceptions import (
     InsufficientFundsError,
     InvalidOrderException,
     OperationalException,
+    PMRiskLimitExceeded,
     PricingError,
     TemporaryError,
 )
@@ -669,6 +670,26 @@ def test_process_operational_exception(default_conf_usdt, ticker_usdt, mocker) -
     worker._process_running()
     assert worker.freqtrade.state == State.STOPPED
     assert "OperationalException" in msg_mock.call_args_list[-1][0][0]["status"]
+
+
+def test_process_pm_risk_limit_rejection_does_not_stop_trader(
+    default_conf_usdt, ticker_usdt, mocker, caplog
+) -> None:
+    """A deterministic per-order PM cap rejection must never become process-fatal."""
+    patch_RPCManager(mocker)
+    patch_exchange(mocker)
+    mocker.patch.multiple(
+        EXMS,
+        fetch_ticker=ticker_usdt,
+        create_order=MagicMock(side_effect=PMRiskLimitExceeded("projected notional exceeds cap")),
+    )
+    worker = Worker(args=None, config=default_conf_usdt)
+    patch_get_signal(worker.freqtrade)
+
+    assert worker.freqtrade.state == State.RUNNING
+    worker._process_running()
+    assert worker.freqtrade.state == State.RUNNING
+    assert "PM risk cap blocked" in caplog.text
 
 
 def test_process_trade_handling(

@@ -410,7 +410,7 @@ def test_trailing_stop_switch_creates_and_verifies_before_cancel(mocker, pm_conf
         return_value=ccxt_order("stnew", "open", "sell", filled=0)
     )
     bot.exchange.fetch_stoploss_order = MagicMock(
-        return_value=ccxt_order("stnew", "open", "sell", filled=0)
+        side_effect=lambda oid, pair: ccxt_order(oid, "open", "sell", filled=0)
     )
     bot.exchange.cancel_stoploss_order_with_result = MagicMock(
         return_value=ccxt_order("stold", "canceled", "sell", filled=0)
@@ -433,7 +433,9 @@ def test_trailing_stop_switch_creates_and_verifies_before_cancel(mocker, pm_conf
     bot.exchange.cancel_stoploss_order_with_result.assert_called_once_with(
         "stold", trade.pair, trade.amount
     )
-    bot.exchange.fetch_stoploss_order.assert_called_once_with("stnew", trade.pair)
+    assert [
+        args.args for args in bot.exchange.fetch_stoploss_order.call_args_list
+    ] == [("stold", trade.pair), ("stnew", trade.pair)]
     bot.update_trade_state.assert_called_once()
     assert bot.update_trade_state.call_args.args[1] == "stold"
     assert {sl.order_id for sl in trade.open_sl_orders} == {"stnew"}

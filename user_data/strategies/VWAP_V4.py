@@ -562,15 +562,16 @@ class VWAP_V4(IStrategy):
     buy_bb_factor = DecimalParameter(0.990, 0.999, default=0.995, optimize=False)
     buy_closedelta = DecimalParameter(12.0, 18.0, default=15.0, optimize=is_optimize_local_uptrend)
 
-    orderbook_depth_levels = 20
-    # Require 2x the initial order notional within 2% of the best price.
+    orderbook_depth_levels = 50
+    # Require 1.2x initial collateral: asks within +5%, bids within -2%.
     # This remains a market-order slippage safeguard while admitting PM
     # perpetuals whose liquidity is distributed beyond the first 1% band.
     orderbook_depth_price_band = 0.02
-    min_depth_to_stake_ratio = 2.0
-    max_entry_spread_ratio = 0.00405
-    max_entry_slippage_ratio = 0.0035
-    max_exit_slippage_ratio = 0.005
+    orderbook_ask_depth_price_band = 0.05
+    min_depth_to_stake_ratio = 1.2
+    max_entry_spread_ratio = 0.00705
+    max_entry_slippage_ratio = 0.01
+    max_exit_slippage_ratio = 0.0075
     @staticmethod
     def _normalize_orderbook_side(levels) -> list[tuple[float, float]]:
         normalized = []
@@ -639,8 +640,9 @@ class VWAP_V4(IStrategy):
         except Exception as exception:
             return f'orderbook unavailable: {exception}'
 
-        asks = self._normalize_orderbook_side(orderbook.get('asks') if isinstance(orderbook, dict) else None)
-        bids = self._normalize_orderbook_side(orderbook.get('bids') if isinstance(orderbook, dict) else None)
+        # Bound depth and slippage checks to the configured best-price levels.
+        asks = sorted(self._normalize_orderbook_side(orderbook.get('asks') if isinstance(orderbook, dict) else None))[:self.orderbook_depth_levels]
+        bids = sorted(self._normalize_orderbook_side(orderbook.get('bids') if isinstance(orderbook, dict) else None), reverse=True)[:self.orderbook_depth_levels]
         if not asks or not bids:
             return 'orderbook missing bids or asks'
 
@@ -659,9 +661,16 @@ class VWAP_V4(IStrategy):
             return f'invalid stake amount for liquidity check: amount={amount}, rate={rate}'
 
         base_amount = stake_amount / best_ask
-        required_depth = stake_amount * self.min_depth_to_stake_ratio
+        # amount * rate is leveraged notional. Use the actual leverage supplied
+        # to custom_stake_amount, not a configured target which may be capped.
+        leverage = getattr(self, '_entry_liquidity_leverage', {}).get(pair)
+        if leverage is None or not math.isfinite(leverage) or leverage < 1:
+            return 'actual entry leverage unavailable for collateral depth check'
+        initial_collateral = stake_amount / leverage
+        required_depth = initial_collateral * self.min_depth_to_stake_ratio
         band = self.orderbook_depth_price_band
-        ask_depth = self._depth_quote_within(asks, best_ask, best_ask * (1 + band))
+        ask_upper = math.nextafter(best_ask * (1 + self.orderbook_ask_depth_price_band), math.inf)
+        ask_depth = self._depth_quote_within(asks, best_ask, ask_upper)
         bid_depth = self._depth_quote_within(bids, best_bid * (1 - band), best_bid)
         if ask_depth < required_depth:
             return f'ask depth too thin: {ask_depth:.2f} < {required_depth:.2f}'
@@ -1049,6 +1058,9 @@ class VWAP_V4(IStrategy):
     def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
                             proposed_stake: float, min_stake: Optional[float], max_stake: float,
                             leverage: float, entry_tag: Optional[str], side: str, **kwargs) -> float:
+        if not hasattr(self, '_entry_liquidity_leverage'):
+            self._entry_liquidity_leverage = {}
+        self._entry_liquidity_leverage[pair] = float(leverage)
         stake_amount = self._initial_entry_stake_amount(min_stake, max_stake)
         if not self._is_backtest_mode():
             logger.info(

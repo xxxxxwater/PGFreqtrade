@@ -44,6 +44,7 @@ from freqtrade.exchange.exchange_utils_timeframe import timeframe_to_msecs
 from freqtrade.misc import deep_merge_dicts, json_load
 from freqtrade.exchange.pm_governor import PapiGovernor, endpoint_weight
 from freqtrade.exchange.pm_identity import canonical_pm_pair
+from freqtrade.exchange.pm_leverage import allowed_leverage, number, parse_brackets
 from freqtrade.exchange.pm_locks import pm_pipeline_lock
 from freqtrade.util import FtTTLCache
 from freqtrade.util.datetime_helpers import dt_from_ts, dt_now, dt_ts
@@ -3028,6 +3029,7 @@ class Binance(Exchange):
                     needs_price = self._order_needs_price(side, ordertype)
                     rate_for_order = self.price_to_precision(pair, rate) if needs_price else None
                     preflight_started = time.perf_counter()
+                    self.assert_pm_leverage_allows_order(pair, amount, rate, leverage)
                     self.assert_pm_stoploss_channel_available()
                     self.assert_pm_risk_allows_order(
                         pair=pair,
@@ -3036,7 +3038,7 @@ class Binance(Exchange):
                         entry_mode=entry_mode,
                         is_short=side == "sell",
                     )
-                    self._lev_prep(pair, leverage, side, accept_fail=not initial_order)
+                    self._lev_prep(pair, leverage, side, accept_fail=False)
                     preflight_ms = (time.perf_counter() - preflight_started) * 1000
                     submit_started = time.perf_counter()
                     order = self._pm_place_order(
@@ -3182,6 +3184,13 @@ class Binance(Exchange):
                 {"symbol": self._pm_symbol_for_pair(pair), "leverage": leverage},
             )
             self._log_exchange_response("papi_set_leverage", res)
+            if not isinstance(res, dict) or str(res.get('symbol')) != self._pm_symbol_for_pair(pair) or self._float_or_zero(res.get('leverage')) != leverage:
+                if not accept_fail:
+                    raise PMRiskLimitExceeded(
+                        f'PM LEVERAGE BLOCKED: exchange did not acknowledge {leverage}x for {pair}.'
+                    )
+                logger.warning('PM protection order leverage response unverified for %s; '
+                               'preserving legacy stoploss path; no exposure increase authorized.', pair)
         except ccxt.DDoSProtection as e:
             raise DDosProtection(e) from e
         except (ccxt.BadRequest, ccxt.OperationRejected, ccxt.InsufficientFunds) as e:
@@ -3982,7 +3991,14 @@ class Binance(Exchange):
 
     def load_leverage_tiers(self) -> dict[str, list[dict]]:
         if self.trading_mode == TradingMode.FUTURES:
-            if self._config["dry_run"] or self._is_portfolio_margin():
+            if self._is_portfolio_margin() and not self._config["dry_run"]:
+                try:
+                    return self._refresh_pm_leverage_tiers()
+                except PMRiskLimitExceeded:
+                    # Keep recovery / reduce-only management available on startup.
+                    # Every exposure increase independently requires fresh data.
+                    return {}
+            if self._config["dry_run"]:
                 leverage_tiers_path = Path(__file__).parent / "binance_leverage_tiers.json"
                 with leverage_tiers_path.open() as json_file:
                     return json_load(json_file)
@@ -3990,6 +4006,94 @@ class Binance(Exchange):
                 return self.get_leverage_tiers()
         else:
             return {}
+
+    def _refresh_pm_leverage_tiers(self) -> dict[str, list[dict]]:
+        try:
+            raw = self._papi_request('um/leverageBracket', 'GET', {})
+            tiers = parse_brackets(raw, self.markets)
+            parsed = {pair: [self.parse_leverage_tier(t) for t in rows]
+                      for pair, rows in tiers.items()}
+        except Exception as exc:
+            self._pm_brackets_loaded_at = 0.0
+            logger.error('PM LEVERAGE BLOCKED: live brackets unavailable (%s)',
+                         type(exc).__name__)
+            raise PMRiskLimitExceeded('PM LEVERAGE BLOCKED: cannot verify live brackets; '
+                                      'no static/1x fallback permitted.') from exc
+        self._leverage_tiers = parsed
+        self._pm_brackets_loaded_at = time.monotonic()
+        logger.info('PM leverage brackets refreshed from signed UM API: %s symbols', len(tiers))
+        return tiers
+
+    def _verified_pm_tiers(self, pair: str, *, force=False) -> list[dict]:
+        if force or time.monotonic() - getattr(self, '_pm_brackets_loaded_at', 0) > 60:
+            self._refresh_pm_leverage_tiers()
+        tiers = self._leverage_tiers.get(pair)
+        if not tiers:
+            logger.error('PM LEVERAGE BLOCKED: no verified brackets for %s', pair)
+            raise PMRiskLimitExceeded(f'PM LEVERAGE BLOCKED: missing brackets for {pair}.')
+        return tiers
+
+    def get_max_leverage(self, pair: str, stake_amount: float | None) -> float:
+        if not self._is_portfolio_margin() or self._config['dry_run']:
+            return super().get_max_leverage(pair, stake_amount)
+        try:
+            tiers = self._verified_pm_tiers(pair)
+            # This live PM strategy requires exactly 2x; never silently downsize
+            # leverage to 1x. Actual aggregate exposure is checked before submit.
+            maximum = allowed_leverage(tiers, number(stake_amount) * 2.0)
+            if maximum < 2.0:
+                raise ValueError('2x not supported for proposed stake')
+            return maximum
+        except (ValueError, TypeError) as exc:
+            logger.error('PM LEVERAGE BLOCKED: %s: %s', pair, exc)
+            raise PMRiskLimitExceeded(f'PM LEVERAGE BLOCKED: {pair}: {exc}') from exc
+
+    def assert_pm_leverage_allows_order(self, pair, amount, rate, leverage):
+        """Fresh account brackets + existing exposure + pending orders, under pipeline lock.
+
+        Called only for exposure increases, never for reduce-only / stop orders.
+        Existing 1x positions may exit normally but cannot add exposure at 1x.
+        """
+        try:
+            if number(leverage) != 2.0:
+                raise ValueError('new PM exposure requires exactly 2x; no silent fallback')
+            if self._pm_namespace_for_pair(pair) != 'um':
+                raise ValueError('only verified UM USDT perpetual brackets are supported')
+            tiers = self._verified_pm_tiers(pair, force=True)
+            symbol = self._pm_symbol_for_pair(pair)
+            positions = self._papi_request('um/positionRisk', 'GET', {'symbol': symbol})
+            orders = self._papi_request('um/openOrders', 'GET', {'symbol': symbol})
+            if not isinstance(positions, list) or not isinstance(orders, list):
+                raise ValueError('unverified positions/open orders response')
+            price = number(rate, minimum=1e-12)
+            projected = number(amount, minimum=1e-12) * price
+            for pos in positions:
+                if pos['symbol'] != symbol:
+                    raise ValueError('position response symbol mismatch')
+                qty = self._contracts_to_amount(pair, number(abs(float(pos['positionAmt']))))
+                if qty and number(pos.get('leverage')) != 2.0:
+                    raise ValueError('existing position leverage differs from 2x; '
+                                     'refusing to alter a live 1x/other position')
+                projected += number(qty) * max(price, number(pos['markPrice']))
+            for order in orders:
+                if order['symbol'] != symbol:
+                    raise ValueError('order response symbol mismatch')
+                if str(order.get('reduceOnly', '')).lower() == 'true':
+                    continue
+                remaining = number(order['origQty']) - number(order['executedQty'])
+                remaining_amount = self._contracts_to_amount(pair, number(remaining))
+                projected += number(remaining_amount) * max(price, number(order['price']))
+            maximum = allowed_leverage(tiers, projected)
+            if maximum < leverage:
+                raise ValueError(f'projected notional {projected:.2f} permits only {maximum}x')
+            logger.info('PM leverage verified: %s requested=2x projected_notional=%.2f '
+                        'bracket_max=%.0fx source=live_papi', pair, projected, maximum)
+        except PMRiskLimitExceeded:
+            raise
+        except Exception as exc:
+            logger.error('PM LEVERAGE BLOCKED: %s (%s)', pair, type(exc).__name__)
+            raise PMRiskLimitExceeded(f'PM LEVERAGE BLOCKED: {pair}; '
+                                      '2x/aggregate exposure not verified.') from exc
 
     async def _async_get_trade_history_id_startup(
         self, pair: str, since: int

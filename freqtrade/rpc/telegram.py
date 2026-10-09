@@ -941,6 +941,27 @@ class Telegram(RPCHandler):
                     .all()
                 )
             ]
+            # A final exit_fill already in the durable outbox is the canonical
+            # completion notification. Do not send a second recovery notice for
+            # the same Trade; pending rows will still be retried by the outbox.
+            exit_fill_trade_ids: set[int] = set()
+            exit_fill_rows = (
+                PMNotificationOutbox.session.query(PMNotificationOutbox)
+                .filter(
+                    PMNotificationOutbox.channel == "telegram",
+                    PMNotificationOutbox.state.in_(("PENDING", "SENT")),
+                    PMNotificationOutbox.message.like('%"event_type": "exit_fill"%'),
+                )
+                .all()
+            )
+            for row in exit_fill_rows:
+                try:
+                    payload = json.loads(row.message)
+                    trade_id = payload.get("trade_id")
+                    if payload.get("event_type") == str(RPCMessageType.EXIT_FILL) and trade_id is not None:
+                        exit_fill_trade_ids.add(int(trade_id))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
         except Exception as exc:
             try:
                 PMNotificationOutbox.session.rollback()
@@ -999,6 +1020,8 @@ class Telegram(RPCHandler):
         )
         if exit_fill_setting != "off":
             for item in closed:
+                if item["id"] in exit_fill_trade_ids:
+                    continue
                 close_ts = item["close_date"].isoformat() if item["close_date"] else "unknown"
                 msg = {
                     "type": RPCMessageType.WARNING,
@@ -1317,11 +1340,23 @@ class Telegram(RPCHandler):
         :return: None
         """
 
+        # In PM mode, an unqualified status command is an ACCOUNT snapshot, not
+        # only the bot-owned Trade table. Explicit /status <id> still uses the
+        # historical Freqtrade trade details below.
+        if (
+            self._config.get("trading_mode") == "futures"
+            and self._config.get("exchange", {}).get("portfolio_margin")
+            and not (context.args and any(str(x).isnumeric() for x in context.args))
+        ):
+            if context.args and "table" in context.args:
+                await self._status_table(update, context)
+            else:
+                await self._pm_status(update, context)
+            return
         if context.args and "table" in context.args:
             await self._status_table(update, context)
             return
-        else:
-            await self._status_msg(update, context)
+        await self._status_msg(update, context)
 
     async def _status_msg(self, update: Update, context: CallbackContext) -> None:
         """
@@ -1471,6 +1506,12 @@ class Telegram(RPCHandler):
         :param update: message update
         :return: None
         """
+        if (
+            self._config.get("trading_mode") == "futures"
+            and self._config.get("exchange", {}).get("portfolio_margin")
+        ):
+            await self._pm_status(update, context)
+            return
         fiat_currency = self._config.get("fiat_display_currency", "")
         try:
             statlist, head, fiat_profit_sum, fiat_total_profit_sum = self._rpc._rpc_status_table(
@@ -2086,68 +2127,107 @@ class Telegram(RPCHandler):
         except RPCException as e:
             await self._send_msg(str(e))
 
+    @staticmethod
+    def _pm_status_text(status: dict[str, Any], *, table: bool = False) -> str:
+        """Bounded, plain-text PM account status. Never treat missing reads as flat.
+
+        Exchange positions are authoritative; bot Trade rows identify ownership
+        only and are not imported from manually owned positions.
+        """
+        def number(value: Any) -> str:
+            try:
+                return f"{float(value):,.4f}" if value is not None else "-"
+            except (TypeError, ValueError, OverflowError):
+                return "-"
+
+        positions = list(status.get("positions") or [])
+        owned = list(status.get("bot_open_trades") or [])
+        owned_by_pair = {str(t.get("pair")): t for t in owned}
+        gate = status.get("entry_permission") or {}
+        blocks = gate.get("global_block_reasons") or []
+        lines = [
+            f"Binance PM /status | snapshot {status.get('snapshot_at') or 'unknown'}",
+            f"Bot: {status.get('run_state') or 'UNKNOWN'} | Account: {status.get('account_status') or 'UNKNOWN'}",
+            f"Bot trades: {len(owned)} | Exchange positions: {len(positions)}",
+            f"Equity: {number(status.get('account_equity'))} USD | uniMMR: {number(status.get('uni_mmr'))}",
+            f"New entry: {'BLOCKED ' + ', '.join(map(str, blocks[:3])) if blocks else 'ALLOWED (subject to pair/risk checks)' if gate.get('global_allowed') else 'UNKNOWN'}",
+        ]
+        if not positions:
+            lines.append("Exchange positions: FLAT (confirmed by this snapshot)")
+        elif table:
+            rows = []
+            for position in positions[:12]:
+                pair = str(position.get("symbol") or "?")
+                bot = owned_by_pair.get(pair)
+                rows.append([
+                    f"BOT#{bot['id']}" if bot else "EXTERNAL",
+                    pair,
+                    str(position.get("side") or "?"),
+                    number(position.get("contracts")),
+                    number(position.get("unrealizedPnl")),
+                ])
+            lines.append(tabulate(rows, headers=["Owner", "Pair", "Side", "Qty", "uPnL"], tablefmt="plain"))
+        else:
+            for position in positions[:12]:
+                pair = str(position.get("symbol") or "?")
+                bot = owned_by_pair.get(pair)
+                label = f"BOT#{bot['id']}" if bot else "EXTERNAL/read-only"
+                lines.append(
+                    f"{label} {pair} {position.get('side') or '?'} "
+                    f"qty={number(position.get('contracts'))} "
+                    f"entry={number(position.get('entryPrice'))} "
+                    f"mark={number(position.get('markPrice'))} "
+                    f"uPnL={number(position.get('unrealizedPnl'))}"
+                )
+        if owned and not positions:
+            lines.append("ALERT: bot-owned trade exists without a matching exchange position; reconcile required")
+        elif owned:
+            missing = [str(t.get("id")) for t in owned if str(t.get("pair")) not in {str(p.get("symbol")) for p in positions}]
+            if missing:
+                lines.append("ALERT: bot trade IDs missing on exchange: " + ",".join(missing[:10]))
+        closed = list(status.get("recent_closed_trades") or [])
+        if closed:
+            lines.append("Latest closed (historical, NOT an open position):")
+            for trade in closed[:2]:
+                lines.append(
+                    f"#{trade.get('id')} {trade.get('pair')} {trade.get('exit_reason') or '-'} "
+                    f"PnL={number(trade.get('profit'))} USDT"
+                )
+        stream = status.get("user_stream") or {}
+        lines.append(
+            f"Stream connected={stream.get('connected')} dropped={stream.get('events_dropped')} "
+            f"| data view: read-only"
+        )
+        return "\n".join(lines)[:3500]
+
     @authorized_only
     async def _pm_status(self, update: Update, context: CallbackContext) -> None:
-        """Handler for /pm_status."""
+        """Live PM status for /status, /status table, and /pm_status."""
+        table = bool(context.args and "table" in context.args) or bool(update.callback_query)
         try:
             loop = asyncio.get_running_loop()
-            status = await loop.run_in_executor(None, safe_async_db(self._rpc._rpc_pm_status))
-        except RPCException as e:
-            await self._send_msg(str(e))
+            status = await asyncio.wait_for(
+                loop.run_in_executor(None, safe_async_db(self._rpc._rpc_pm_status)),
+                timeout=15.0,
+            )
+            message = self._pm_status_text(status, table=table)
+        except Exception as exc:
+            # A failed live read is UNKNOWN, never an assumed flat position.
+            logger.warning("PM Telegram status snapshot failed: %s", type(exc).__name__)
+            await self._send_msg(
+                "PM live status UNAVAILABLE; exchange positions are UNKNOWN. "
+                "Bot heartbeat does not prove the account is flat. Retry /status."
+            )
             return
-
-        balances = status["balances"]
-        positions = status["positions"]
-        stream = status.get("user_stream") or {}
-
-        balance_lines = []
-        for currency, balance in sorted(balances.items()):
-            balance_lines.append(
-                f"{currency}: total={round_value(balance.get('total', 0), 8)}, "
-                f"free={round_value(balance.get('free', 0), 8)}, "
-                f"used={round_value(balance.get('used', 0), 8)}"
-            )
-        if not balance_lines:
-            balance_lines.append("none")
-
-        position_lines = []
-        for position in positions[:20]:
-            entry = round_value(position.get("entryPrice"), 8)
-            mark = round_value(position.get("markPrice"), 8)
-            pnl = round_value(position.get("unrealizedPnl"), 8)
-            leverage = round_value(position.get("leverage"), 8)
-            liquidation = round_value(position.get("liquidationPrice"), 8)
-            position_lines.append(
-                f"{position.get('symbol')}: {position.get('side')} "
-                f"contracts={round_value(position.get('contracts', 0), 8)} "
-                f"{leverage}x entry={entry} mark={mark} uPnL={pnl} "
-                f"liq={liquidation} margin={round_value(position.get('initialMargin') or 0, 8)}"
-            )
-        if len(positions) > 20:
-            position_lines.append(f"... {len(positions) - 20} more")
-        if not position_lines:
-            position_lines.append("none")
-
-        message = (
-            "*Binance PM Status (read-only account view)*\n"
-            "External/manual positions are displayed only; this bot does not manage them.\n"
-            f"Account: `{status['account_status']}`\n"
-            f"uniMMR: `{status['uni_mmr']}`\n"
-            f"Equity: `{status['account_equity']}`\n"
-            f"Initial margin: `{status['initial_margin']}`\n"
-            f"Maintenance margin: `{status['maintenance_margin']}`\n"
-            f"User stream: `enabled={stream.get('enabled')}, "
-            f"running={stream.get('running')}, connected={stream.get('connected')}, "
-            f"queued={stream.get('queued_events')}, last={stream.get('last_event_type')}`\n"
-            f"Stream health: `reconnects={stream.get('reconnects')}, "
-            f"dropped={stream.get('events_dropped')}, parse_errors={stream.get('parse_errors')}, "
-            f"last_error={stream.get('last_error')}`\n\n"
-            "*Balances:*\n"
-            f"`{chr(10).join(balance_lines)}`\n\n"
-            "*Positions:*\n"
-            f"`{chr(10).join(position_lines)}`"
+        sent = await self._send_msg(
+            f"<pre>{escape(message)}</pre>",
+            parse_mode=ParseMode.HTML,
+            reload_able=table,
+            callback_path="update_status_table" if table else "",
+            query=update.callback_query,
         )
-        await self._send_msg(message, ParseMode.MARKDOWN)
+        if not sent:
+            logger.warning("PM Telegram status response delivery failed")
 
     @authorized_only
     async def _pm_risk(self, update: Update, context: CallbackContext) -> None:

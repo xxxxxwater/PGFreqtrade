@@ -426,6 +426,7 @@ class Wallets:
         min_stake_amount: float | None,
         max_stake_amount: float,
         trade_amount: float | None,
+        require_full_stake: bool = False,
     ):
         if not stake_amount or isinstance(stake_amount, str) or stake_amount <= 0:
             self._local_log(
@@ -439,6 +440,25 @@ class Wallets:
             # if in a trade, then the resulting trade size cannot go beyond the max stake
             # Otherwise we could no longer exit.
             max_allowed_stake = min(max_allowed_stake, max_stake_amount - trade_amount)
+
+        # Fixed-clip strategies must reject an unaffordable order, rather than
+        # silently converting a planned DCA step into a smaller filled step.
+        # This is the final wallet gate, including limits after existing stake.
+        if require_full_stake:
+            tolerance = max(1e-8, abs(stake_amount) * 1e-12)
+            below_min = (
+                min_stake_amount is not None
+                and stake_amount + tolerance < min_stake_amount
+            )
+            above_max = stake_amount > max_allowed_stake + tolerance
+            if below_min or above_max:
+                self._local_log(
+                    f"Full stake required for {pair}: requested={stake_amount:.8f}, "
+                    f"minimum={min_stake_amount}, available_limit={max_allowed_stake:.8f}; "
+                    "rejecting order without resizing.",
+                    level="warning",
+                )
+                return 0
 
         if min_stake_amount is not None and min_stake_amount > max_allowed_stake:
             self._local_log(

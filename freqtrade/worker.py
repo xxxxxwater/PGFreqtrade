@@ -3,10 +3,12 @@ Main Freqtrade worker class.
 """
 
 import logging
+import os
 import time
 import traceback
 from collections.abc import Callable
 from os import getpid
+from pathlib import Path
 from typing import Any
 
 import sdnotify
@@ -41,6 +43,11 @@ class Worker:
         self._init(False)
 
         self._heartbeat_msg: float = 0
+        self._telegram_heartbeat_msg: float = 0
+        # Keep the liveness marker on the container-local tmpfs so it is always
+        # writable by the unprivileged ftuser and never depends on host bind-mount
+        # ownership. The host watchdog reads it through ``docker exec``.
+        self._heartbeat_file = Path("/tmp/pgfreqtrade-worker-heartbeat")
 
         # Tell systemd that we completed initialization phase
         self._notify("READY=1")
@@ -136,6 +143,20 @@ class Worker:
             logger.debug(f"PM heartbeat risk fetch failed: {e}")
         return ""
 
+    def _write_worker_heartbeat(self, state: State) -> None:
+        """Write an independent liveness marker consumed by the host watchdog."""
+        try:
+            heartbeat_file = self._heartbeat_file
+            heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = heartbeat_file.with_name(f".{heartbeat_file.name}.{os.getpid()}.tmp")
+            tmp.write_text(
+                f"timestamp={time.time():.6f}\npid={getpid()}\nstate={state.name}\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp, heartbeat_file)
+        except OSError as exc:
+            logger.debug(f"Worker heartbeat marker write failed: {exc}")
+
     def _worker(self, old_state: State | None) -> State:
         """
         The main routine that runs each throttling iteration and handles the states.
@@ -188,8 +209,8 @@ class Worker:
                 timeframe_offset=1,
             )
 
+        now = time.time()
         if self._heartbeat_interval:
-            now = time.time()
             if (now - self._heartbeat_msg) > self._heartbeat_interval:
                 version = __version__
                 strategy_version = self.freqtrade.strategy.version()
@@ -201,6 +222,25 @@ class Worker:
                 heartbeat_msg += self._pm_heartbeat_suffix()
                 logger.info(heartbeat_msg)
                 self._heartbeat_msg = now
+                self._write_worker_heartbeat(state)
+
+        # Record the five-minute PM live status in the logfile only.
+        # Routine liveness must never spam Telegram; alerts/trades remain RPC-driven.
+        if now - self._telegram_heartbeat_msg >= 300:
+            self._telegram_heartbeat_msg = now
+            try:
+                if (
+                    not self._config.get("dry_run", True)
+                    and getattr(self.freqtrade.exchange, "_is_portfolio_margin", lambda: False)()
+                ):
+                    pm_status = self._pm_heartbeat_suffix() or ", PM risk=UNAVAILABLE"
+                    logger.info(
+                        f"PM heartbeat: strategy={self._config.get('strategy', 'unknown')}, "
+                        f"framework={__version__}, PID={getpid()}, state={state.name}"
+                        f"{pm_status}"
+                    )
+            except Exception:
+                logger.exception("Could not write PM heartbeat")
 
         return state
 

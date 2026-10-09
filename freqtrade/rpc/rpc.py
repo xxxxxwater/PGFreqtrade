@@ -1386,6 +1386,14 @@ class RPC:
         last_reconcile = getattr(self._freqtrade, "_pm_last_reconcile_result", None) or {}
         last_reconcile_at = getattr(self._freqtrade, "_pm_last_success_reconcile_time", None)
         open_bot_trades = Trade.get_open_trades()
+        # Both bot ownership and recent completed trades are read-only display
+        # metadata. Never import external exchange positions into the Trade DB.
+        recent_closed = Trade.session.scalars(
+            select(Trade)
+            .where(Trade.is_open.is_(False), Trade.close_date.isnot(None))
+            .order_by(Trade.close_date.desc())
+            .limit(2)
+        ).all()
         exposure_data_blocks: list[str] = []
         if pm_symbol_config.get("degraded"):
             exposure_data_blocks.append("pm_symbol_config_degraded")
@@ -1395,6 +1403,16 @@ class RPC:
         effective_entry_blocks = [*blocked_reasons, *exposure_data_blocks]
 
         return {
+            "snapshot_at": datetime.now(UTC).isoformat(),
+            "bot_open_trades": [
+                {"id": trade.id, "pair": trade.pair, "amount": trade.amount}
+                for trade in open_bot_trades
+            ],
+            "recent_closed_trades": [
+                {"id": trade.id, "pair": trade.pair, "exit_reason": trade.exit_reason,
+                 "profit": trade.close_profit_abs}
+                for trade in recent_closed
+            ],
             "account_status": risk.get("account_status") or "unknown",
             "uni_mmr": risk.get("uni_mmr"),
             "account_equity": risk.get("account_equity"),

@@ -1235,7 +1235,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             self._pm_foreign_stream_order_events.clear()
         if event_key not in self._pm_foreign_stream_order_events:
             self._pm_foreign_stream_order_events.add(event_key)
-            logger.info(
+            logger.debug(
                 f"PM user stream: observed foreign order event {order_id} on {pair} "
                 f"classification={PMOwnershipClass.EXTERNAL_ORDER} "
                 f"(state={event_state}); read-only account refresh only, not managed by this bot."
@@ -2957,6 +2957,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             pending_exit_ids: set[str] = set()
             pending_verify_ids: set[str] = set()
             unresolved_old_ids: set[str] = set()
+            retryable_retire_ids: set[str] = set()
             problems: list[str] = []
 
             for sl in list(trade.open_sl_orders):
@@ -3015,13 +3016,82 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     )
                     continue
                 unresolved_old_ids.add(sid)
+                # A BOT-owned, identity-verified, still-active conditional which
+                # no longer validates (most commonly the pre-DCA undersized stop)
+                # is safe to RETRY retiring once an independently verified
+                # replacement exists. Unknown identity/lifecycle is never deleted.
+                if (
+                    status in {"open", "new"}
+                    and str((checked or {}).get("status_stop") or "").lower() != "triggered"
+                    and self._pm_stop_identity_matches(trade, sid, checked)
+                ):
+                    retryable_retire_ids.add(sid)
                 problems.append(f"{sid}:{verdict}")
 
             if not trade.is_open or not trade.has_open_position:
                 continue
             if verified:
+                # If restart/recovery observes multiple full-cover BOT stops,
+                # the newest local stop is the replacement created by the
+                # create->verify->retire protocol. Keep exactly that one and
+                # retry retirement of older verified duplicates.
+                if len(verified) > 1:
+                    local_stop_rows = {
+                        str(sl.order_id): sl
+                        for sl in trade.open_sl_orders
+                        if str(sl.order_id) in verified
+                    }
+                    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+
+                    ranked_stops: list[tuple[datetime, str]] = []
+                    for stop_id in verified:
+                        row = local_stop_rows.get(stop_id)
+                        created = row.order_date_utc if row is not None else None
+                        ranked_stops.append((created or epoch, stop_id))
+                    keeper_id = max(ranked_stops)[1]
+                    retryable_retire_ids.update(verified - {keeper_id})
+                    verified = {keeper_id}
+
+                # A triggered old conditional/real child is an in-flight
+                # risk-reducing exit. Never cancel it as "redundant".
+                retryable_retire_ids.difference_update(pending_exit_ids)
+                retryable_retire_ids.difference_update(pending_verify_ids)
+
+                if retryable_retire_ids:
+                    logger.info(
+                        "PM stop retirement recovery for Trade #%s %s: keeper=%s "
+                        "retrying old ids=%s",
+                        trade.id,
+                        trade.pair,
+                        sorted(verified),
+                        sorted(retryable_retire_ids),
+                    )
+                    retired = self._pm_retire_stop_ids(
+                        trade, sorted(retryable_retire_ids)
+                    )
+                    if retired:
+                        unresolved_old_ids.difference_update(retryable_retire_ids)
+                        local_ids = {
+                            str(sl.order_id) for sl in trade.open_sl_orders
+                        }
+
+                if pending_exit_ids:
+                    triggered_pending.append(
+                        {
+                            "trade_id": trade.id,
+                            "pair": trade.pair,
+                            "ids": sorted(pending_exit_ids),
+                        }
+                    )
+
                 unresolved = sorted(
-                    (local_ids - verified - pending_verify_ids) | unresolved_old_ids
+                    (
+                        local_ids
+                        - verified
+                        - pending_verify_ids
+                        - pending_exit_ids
+                    )
+                    | unresolved_old_ids
                 )
                 if unresolved:
                     retire_pending.append(
@@ -5201,6 +5271,9 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
         max_entry_stake = self.exchange.get_max_pair_stake_amount(
             trade.pair, current_entry_rate, trade.leverage
         )
+        if getattr(self.strategy, "require_full_entry_stake", False):
+            # Match the final wallet gate: max_pair_stake is a cumulative limit.
+            max_entry_stake = max(0.0, max_entry_stake - trade.stake_amount)
         stake_available = self.wallets.get_available_stake_amount()
         logger.debug(f"Calling adjust_trade_position for pair {trade.pair}")
         stake_amount, order_tag = self.strategy._adjust_trade_position_internal(
@@ -5734,6 +5807,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             min_stake_amount=min_stake_amount,
             max_stake_amount=max_stake_amount,
             trade_amount=trade.stake_amount if trade else None,
+            require_full_stake=bool(getattr(self.strategy, "require_full_entry_stake", False)),
         )
 
         return enter_limit_requested, stake_amount, leverage

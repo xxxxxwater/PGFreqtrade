@@ -1098,16 +1098,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                     # _pm_existing_stop_lifecycles_known keep owning it and no
                     # duplicate reduce-only conditional is created. Never
                     # re-raise: a redelivered event must not fail the batch.
-                    reason = "stream event: not visible in lookup/history"
-                    if self._pm_stop_ack_within_verification_grace(trade, strategy_id):
-                        self._pm_stop_verification_pending_hold(trade, strategy_id, reason)
-                    else:
-                        logger.warning(
-                            f"PM user stream: stoploss {strategy_id} on {trade.pair} is not "
-                            "visible in open/history; terminal state NOT established, "
-                            "keeping it open locally."
-                        )
-                        self._pm_protection_hold(trade, f"existing stop {strategy_id}: {reason}")
+                    self._pm_hold_unresolved_stream_stop(trade, strategy_id)
                     return False
                 self._pm_validate_rest_ownership(trade, order, exchange_order)
                 self._pm_record_actual_order(exchange_order, strategy_id, trade.pair)
@@ -1249,6 +1240,18 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 f"(state={event_state}); read-only account refresh only, not managed by this bot."
             )
         return False
+
+    def _pm_hold_unresolved_stream_stop(self, trade: Trade, stop_id: str) -> None:
+        """A stream event names a local stop that open/history lookup cannot see."""
+        reason = "stream event: not visible in lookup/history"
+        if self._pm_stop_ack_within_verification_grace(trade, stop_id):
+            self._pm_stop_verification_pending_hold(trade, stop_id, reason)
+            return
+        logger.warning(
+            f"PM user stream: stoploss {stop_id} on {trade.pair} is not visible in "
+            "open/history; terminal state NOT established, keeping it open locally."
+        )
+        self._pm_protection_hold(trade, f"existing stop {stop_id}: {reason}")
 
     @staticmethod
     def _pm_stream_time(value: str | None) -> datetime | None:

@@ -547,6 +547,25 @@ def user_dir(mocker, tmp_path) -> Path:
     return user_dir
 
 
+@pytest.fixture(autouse=True)
+def isolate_persisted_bot_state(monkeypatch, tmp_path) -> None:
+    """Keep persisted bot state (user_data/.freqtrade/state) out of the source tree.
+
+    default_conf uses the relative "user_data" dir, so any bot that calls
+    set_state() would otherwise write into the repo and leak e.g. PAUSED into
+    every later test and run.
+    """
+    from freqtrade import state_persistence
+
+    original = state_persistence.state_file_path
+
+    def _state_file_path(config: dict) -> Path:
+        path = original(config)
+        return path if path.is_absolute() else tmp_path / path
+
+    monkeypatch.setattr(state_persistence, "state_file_path", _state_file_path)
+
+
 @pytest.fixture()
 def keep_log_config_loggers(mocker):
     # Mock the _handle_existing_loggers function to prevent it from disabling all loggers.

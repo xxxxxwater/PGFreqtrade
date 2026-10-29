@@ -412,6 +412,40 @@ def test_stop_fill_event_never_retires_other_protection(mocker, pm_conf):
     bot.exchange.cancel_stoploss_order_with_result.assert_not_called()
     assert {sl.order_id for sl in trade.open_sl_orders} == {"stold", "stnew"}
 
+@pytest.mark.parametrize("within_grace", [False, True])
+def test_stream_stop_event_absent_lookup_keeps_local_stop_open(mocker, pm_conf, within_grace):
+    """A stream event for a stop that is absent from open/history is NOT a cancel.
+
+    Marking it canceled locally removed it from open_sl_orders, so the next
+    handle_stoploss_on_exchange bypassed _pm_existing_stop_lifecycles_known and
+    created a second full-size reduce-only conditional.
+    """
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = make_stoploss_trade(pm_conf, order_id="stold", side="sell")
+    old = trade.open_sl_orders[0]
+    bot.exchange.fetch_stoploss_order = MagicMock(
+        side_effect=InvalidOrderException("not open, not in history")
+    )
+    bot.exchange.create_stoploss = MagicMock(
+        return_value=ccxt_order("stnew", "open", "sell", filled=0)
+    )
+    bot.rpc.send_msg = MagicMock()
+    bot._pm_stop_ack_within_verification_grace = MagicMock(return_value=within_grace)
+    ev = event(order_id="stold", client="", status="FILLED", filled="11")
+
+    assert bot._pm_handle_order_trade_update(ev, {}) is False
+
+    assert old.ft_is_open is True
+    assert old.status not in {"canceled", "cancelled"}
+    expected_gate = "stop_verification_pending" if within_grace else "stop_protection_missing"
+    assert expected_gate in bot._pm_blocked_order_reasons()
+
+    # The next protection pass must keep owning the unresolved stop.
+    bot.handle_stoploss_on_exchange(trade)
+    bot.exchange.create_stoploss.assert_not_called()
+    assert {sl.order_id for sl in trade.open_sl_orders} == {"stold"}
+
+
 def test_retire_not_found_then_history_absent_keeps_local_pending(mocker, pm_conf):
     """DELETE not-found + no lifecycle proof must never be rewritten as canceled."""
     bot, trade = switch_bot(mocker, pm_conf)
@@ -650,3 +684,57 @@ def test_nonfinite_protection_quantity_never_proves_coverage(mocker, pm_conf, qu
     check = conditional("stold", amount=quantity, info={"reduceOnly": True})
     verdict, _ = bot._pm_validate_protection_order(trade, "stold", check)
     assert verdict == "invalid"
+
+
+def _closed_trade_with_open_stop(pm_conf):
+    trade = make_stoploss_trade(pm_conf, order_id="stleft", side="sell")
+    trade.is_open = False
+    trade.close_date = datetime.now(UTC)
+    Trade.commit()
+    return trade
+
+
+@pytest.mark.parametrize(
+    "cancel_effect",
+    [InvalidOrderException("delete says not found"), TemporaryError("retries exhausted")],
+)
+def test_closed_trade_left_open_stop_keeps_retire_gate(mocker, pm_conf, cancel_effect):
+    """A stop the exit-fill path could not retire must keep blocking new exposure.
+
+    The open-trade loop never revisits a closed trade, so without the closed-trade
+    sweep stop_retire_unresolved was released on the next verification while a
+    full-size reduce-only conditional could still be live on the exchange.
+    """
+    bot = make_pm_bot(mocker, pm_conf)
+    bot.strategy.order_types["stoploss_on_exchange"] = True
+    trade = _closed_trade_with_open_stop(pm_conf)
+    bot._pm_block_orders("stop_retire_unresolved")
+    bot.exchange.fetch_open_conditional_orders.return_value = []
+    bot.exchange.cancel_stoploss_order_with_result = MagicMock(side_effect=cancel_effect)
+    bot.exchange.fetch_stoploss_order = MagicMock(
+        side_effect=InvalidOrderException("not open, not in history")
+    )
+
+    bot._pm_verify_stop_protection()
+
+    bot.exchange.cancel_stoploss_order_with_result.assert_called_once_with(
+        "stleft", trade.pair, trade.amount
+    )
+    assert [sl.order_id for sl in trade.open_sl_orders] == ["stleft"]
+    assert "stop_retire_unresolved" in bot._pm_blocked_order_reasons()
+
+
+def test_closed_trade_left_open_stop_is_retired_and_gate_released(mocker, pm_conf):
+    bot = make_pm_bot(mocker, pm_conf)
+    bot.strategy.order_types["stoploss_on_exchange"] = True
+    trade = _closed_trade_with_open_stop(pm_conf)
+    bot._pm_block_orders("stop_retire_unresolved")
+    bot.exchange.fetch_open_conditional_orders.return_value = []
+    bot.exchange.cancel_stoploss_order_with_result = MagicMock(
+        return_value=conditional("stleft", status="canceled", info={"reduceOnly": True})
+    )
+
+    bot._pm_verify_stop_protection()
+
+    assert trade.open_sl_orders == []
+    assert "stop_retire_unresolved" not in bot._pm_blocked_order_reasons()

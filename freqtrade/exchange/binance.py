@@ -1532,9 +1532,12 @@ class Binance(Exchange):
             else:
                 order = self._pm_fetch_order_by_client_id(client_id, pair)
         except InvalidOrderException:
-            report["resolved"] = True
-            report["exists"] = False
-            return report
+            # fetch_stoploss_order raises this when the id is merely absent from
+            # the queried open/history windows (allAlgoOrders only covers ~7d /
+            # 500 rows) - NOT proof that Binance never accepted the request.
+            # Treat it like a "currently absent" lookup so a crossed dispatch
+            # boundary below keeps the intent UNKNOWN instead of tombstoning it.
+            order = None
         except Exception as e:
             report["uncertain"] = True
             report["error"] = f"{e.__class__.__name__}: {e}"
@@ -2342,8 +2345,14 @@ class Binance(Exchange):
                     remaining = self._float_or_zero(open_order.get("remaining", 0))
                     if remaining <= 0:
                         continue
-                    if str(open_order.get("side", "")).lower() == "sell":
-                        continue  # reduces exposure - never reserved
+                    info = open_order.get("info") or {}
+                    if (
+                        str(info.get("reduceOnly", "")).lower() == "true"
+                        or str(info.get("closePosition", "")).lower() == "true"
+                    ):
+                        # Reduce-only orders shrink exposure - never reserved. Side
+                        # alone says nothing in futures: a SELL may open a short.
+                        continue
                     price = self._float_or_zero(
                         open_order.get("price", 0)
                     ) or self._float_or_zero(open_order.get("average", 0))

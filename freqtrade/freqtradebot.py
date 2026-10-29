@@ -1091,16 +1091,24 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 try:
                     exchange_order = self.exchange.fetch_stoploss_order(strategy_id, trade.pair)
                 except InvalidOrderException:
-                    # The conditional is definitively gone (triggered or
-                    # canceled). Mark it canceled locally - never re-raise:
-                    # a redelivered event must not fail the batch repeatedly.
-                    logger.warning(
-                        f"PM user stream: stoploss {strategy_id} on {trade.pair} no longer "
-                        "exists on the exchange; marking canceled locally."
-                    )
-                    order.ft_is_open = False
-                    order.status = "canceled"
-                    return True
+                    # Absent from open/history is NOT proof of cancellation
+                    # (see Binance.fetch_stoploss_order): the strategy may have
+                    # just triggered or be a freshly ACKed, not yet visible stop.
+                    # Keep the local stop open so the scheduled verification /
+                    # _pm_existing_stop_lifecycles_known keep owning it and no
+                    # duplicate reduce-only conditional is created. Never
+                    # re-raise: a redelivered event must not fail the batch.
+                    reason = "stream event: not visible in lookup/history"
+                    if self._pm_stop_ack_within_verification_grace(trade, strategy_id):
+                        self._pm_stop_verification_pending_hold(trade, strategy_id, reason)
+                    else:
+                        logger.warning(
+                            f"PM user stream: stoploss {strategy_id} on {trade.pair} is not "
+                            "visible in open/history; terminal state NOT established, "
+                            "keeping it open locally."
+                        )
+                        self._pm_protection_hold(trade, f"existing stop {strategy_id}: {reason}")
+                    return False
                 self._pm_validate_rest_ownership(trade, order, exchange_order)
                 self._pm_record_actual_order(exchange_order, strategy_id, trade.pair)
                 self.update_trade_state(

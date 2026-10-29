@@ -412,6 +412,40 @@ def test_stop_fill_event_never_retires_other_protection(mocker, pm_conf):
     bot.exchange.cancel_stoploss_order_with_result.assert_not_called()
     assert {sl.order_id for sl in trade.open_sl_orders} == {"stold", "stnew"}
 
+@pytest.mark.parametrize("within_grace", [False, True])
+def test_stream_stop_event_absent_lookup_keeps_local_stop_open(mocker, pm_conf, within_grace):
+    """A stream event for a stop that is absent from open/history is NOT a cancel.
+
+    Marking it canceled locally removed it from open_sl_orders, so the next
+    handle_stoploss_on_exchange bypassed _pm_existing_stop_lifecycles_known and
+    created a second full-size reduce-only conditional.
+    """
+    bot = make_pm_bot(mocker, pm_conf)
+    trade = make_stoploss_trade(pm_conf, order_id="stold", side="sell")
+    old = trade.open_sl_orders[0]
+    bot.exchange.fetch_stoploss_order = MagicMock(
+        side_effect=InvalidOrderException("not open, not in history")
+    )
+    bot.exchange.create_stoploss = MagicMock(
+        return_value=ccxt_order("stnew", "open", "sell", filled=0)
+    )
+    bot.rpc.send_msg = MagicMock()
+    bot._pm_stop_ack_within_verification_grace = MagicMock(return_value=within_grace)
+    ev = event(order_id="stold", client="", status="FILLED", filled="11")
+
+    assert bot._pm_handle_order_trade_update(ev, {}) is False
+
+    assert old.ft_is_open is True
+    assert old.status not in {"canceled", "cancelled"}
+    expected_gate = "stop_verification_pending" if within_grace else "stop_protection_missing"
+    assert expected_gate in bot._pm_blocked_order_reasons()
+
+    # The next protection pass must keep owning the unresolved stop.
+    bot.handle_stoploss_on_exchange(trade)
+    bot.exchange.create_stoploss.assert_not_called()
+    assert {sl.order_id for sl in trade.open_sl_orders} == {"stold"}
+
+
 def test_retire_not_found_then_history_absent_keeps_local_pending(mocker, pm_conf):
     """DELETE not-found + no lifecycle proof must never be rewritten as canceled."""
     bot, trade = switch_bot(mocker, pm_conf)

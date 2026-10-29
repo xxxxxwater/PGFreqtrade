@@ -2928,6 +2928,46 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
             logger.info("PM stop protection resized for %s.", trade.pair)
         return verdict
 
+    def _pm_retry_closed_trade_stop_retirement(self) -> list[dict[str, Any]]:
+        """Retry retiring stops still open locally on trades that are already closed.
+
+        The exit-fill path retires stops only after the trade is closed. If that
+        retirement is ambiguous (cancel not-found but lifecycle unresolved) or
+        raises, the stop row stays open while the open-trade loop above never
+        looks at the trade again - and the stop_retire_unresolved gate would be
+        released on the next pass with a live reduce-only conditional left behind.
+        """
+        pending: list[dict[str, Any]] = []
+        by_trade: dict[int, tuple[Trade, list[str]]] = {}
+        for order in Order.get_open_orders():
+            trade = order.trade
+            if order.ft_order_side != "stoploss" or trade is None or trade.is_open:
+                continue
+            by_trade.setdefault(trade.id, (trade, []))[1].append(str(order.order_id))
+        for trade, stop_ids in by_trade.values():
+            try:
+                resolved = self._pm_retire_stop_ids(trade, stop_ids)
+            except Exception as exc:
+                logger.warning(
+                    "PM stop retire retry for closed Trade #%s %s failed: %s",
+                    trade.id,
+                    trade.pair,
+                    exc,
+                )
+                resolved = False
+            if resolved:
+                continue
+            pending.append(
+                {
+                    "trade_id": trade.id,
+                    "pair": trade.pair,
+                    "old_ids": sorted({str(sl.order_id) for sl in trade.open_sl_orders}),
+                    "verified_ids": [],
+                    "trade_closed": True,
+                }
+            )
+        return pending
+
     def _pm_verify_stop_protection(self) -> list[dict[str, Any]]:
         """Return BOT Trades whose remaining exposure lacks verified protection.
 
@@ -3151,6 +3191,7 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 }
             )
 
+        retire_pending.extend(self._pm_retry_closed_trade_stop_retirement())
         if retire_pending:
             self._pm_block_orders("stop_retire_unresolved")
         else:

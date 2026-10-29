@@ -5713,12 +5713,11 @@ class FreqtradeBot(PMOrderOwnershipMixin, LoggingMixin):
                 )
                 self.update_trade_state(trade, oslo.order_id, co, stoploss_order=True)
             except InvalidOrderException:
-                logger.warning(
-                    f"Stoploss order {oslo.order_id} for pair {trade.pair} no longer "
-                    "exists on the exchange; marking it canceled locally."
+                # Upstream semantics: a failed cancel is not proof the stop is gone,
+                # so keep it open locally and let the next stoploss pass re-check it.
+                logger.exception(
+                    f"Could not cancel stoploss order {oslo.order_id} for pair {trade.pair}"
                 )
-                oslo.ft_is_open = False
-                oslo.status = "canceled"
         return trade
 
     def get_valid_enter_price_and_stake(

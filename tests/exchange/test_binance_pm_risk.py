@@ -143,6 +143,8 @@ def test_pm_create_order_passes_entry_mode_and_direction_to_risk_check(side, is_
     exchange._amount_to_contracts = MagicMock(side_effect=lambda pair, amount: amount)
     exchange._order_needs_price = MagicMock(return_value=False)
     exchange.assert_pm_risk_allows_order = MagicMock()
+    # The live 2x bracket/exposure gate is covered by its own tests.
+    exchange.assert_pm_leverage_allows_order = MagicMock()
     exchange._lev_prep = MagicMock()
     exchange.pm_has_unresolved_intents = MagicMock(return_value=False)
     exchange._pm_place_order = MagicMock(return_value={"id": "1", "status": "open"})
@@ -153,14 +155,14 @@ def test_pm_create_order_passes_entry_mode_and_direction_to_risk_check(side, is_
         side=side,
         amount=0.001,
         rate=60000,
-        leverage=5,
+        leverage=2,
         entry_mode="pos_adjust",
     )
 
     exchange.assert_pm_risk_allows_order.assert_called_once_with(
         pair=PAIR,
         amount=0.001,
-        leverage=5,
+        leverage=2,
         entry_mode="pos_adjust",
         is_short=is_short,
     )

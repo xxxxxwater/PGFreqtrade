@@ -155,7 +155,8 @@ def test_pm_user_stream_health_restarts_after_long_disconnect(mocker):
 
 
 def test_pm_foreign_order_event_is_read_only_and_deduplicated(mocker, caplog):
-    caplog.set_level(logging.INFO)
+    # The per-event line is DEBUG (foreign manual orders are noisy); still deduplicated.
+    caplog.set_level(logging.DEBUG)
     bot = FreqtradeBot.__new__(FreqtradeBot)
     bot.config = {"exchange": {"portfolio_margin_risk": {}}}
     bot.rpc = mocker.Mock()

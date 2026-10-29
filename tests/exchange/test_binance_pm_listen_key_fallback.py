@@ -37,13 +37,17 @@ def get_patched_pm_exchange(mocker, default_conf_usdt):
             "portfolio_margin_risk": {"user_stream_enabled": False},
         }
     )
-    return get_patched_exchange(
+    exchange = get_patched_exchange(
         mocker,
         conf,
         api_mock=MagicMock(),
         exchange="binance",
         mock_markets=True,
     )
+    # Construction loads live PM leverage brackets (um/leverageBracket) through
+    # the same mocked transport; only the listenKey calls below are under test.
+    exchange._api.request.reset_mock()
+    return exchange
 
 
 class _RawResponse:

@@ -419,17 +419,19 @@ def test_async_ws_ohlcv_or_rest_revalidates_and_falls_back(mocker, default_conf)
     ws.klines_last_refresh = {}
     exchange._exchange_ws = ws
     exchange._pairs_last_refresh_time[(pair, tf, ct)] = candle_ts - timeframe_to_msecs(tf)
+    # Same shape as the real REST result: (pair, timeframe, candle_type, data, drop).
+    rest_result = (pair, tf, ct, [[candle_ts - timeframe_to_msecs(tf), 1, 2, 0.5, 1.5, 10]], True)
     rest = mocker.patch.object(
-        exchange, "_async_get_candle_history", new=AsyncMock(return_value="REST")
+        exchange, "_async_get_candle_history", new=AsyncMock(return_value=rest_result)
     )
 
     # A reconnect cleared the buffer AFTER job selection: the same refresh
     # must fetch REST instead of skipping the pair.
-    assert asyncio.run(exchange._async_ws_ohlcv_or_rest(pair, tf, ct, candle_ts)) == "REST"
+    assert asyncio.run(exchange._async_ws_ohlcv_or_rest(pair, tf, ct, candle_ts)) == rest_result
     rest.assert_awaited_once()
 
     # A consumer-side error (snapshot invalidated) also falls back to REST.
     ws.get_ohlcv = AsyncMock(side_effect=TemporaryError("boom"))
     rest.reset_mock()
-    assert asyncio.run(exchange._async_ws_ohlcv_or_rest(pair, tf, ct, candle_ts)) == "REST"
+    assert asyncio.run(exchange._async_ws_ohlcv_or_rest(pair, tf, ct, candle_ts)) == rest_result
     rest.assert_awaited_once()

@@ -214,6 +214,8 @@ def test_create_order_pm_routes_to_papi_and_uses_client_order_id(default_conf_us
     exchange = get_patched_pm_exchange(mocker, default_conf_usdt)
     exchange._papi_request = MagicMock(return_value=PM_ORDER)
     exchange.assert_pm_risk_allows_order = MagicMock()
+    # The live 2x bracket/exposure gate is covered by its own tests.
+    exchange.assert_pm_leverage_allows_order = MagicMock()
     exchange._lev_prep = MagicMock()
     exchange.amount_to_precision = MagicMock(return_value=1)
     exchange.price_to_precision = MagicMock(return_value=100)
@@ -225,7 +227,7 @@ def test_create_order_pm_routes_to_papi_and_uses_client_order_id(default_conf_us
         side="buy",
         amount=1,
         rate=100,
-        leverage=5,
+        leverage=2,
     )
 
     path, method, params = exchange._papi_request.call_args[0]
@@ -242,13 +244,14 @@ def test_pm_leverage_prep_skips_standard_margin_mode_and_uses_papi(default_conf_
     """PM must never call FAPI/CCXT setMarginMode before a PAPI order."""
     exchange = get_patched_pm_exchange(mocker, default_conf_usdt)
     exchange._api.set_margin_mode = MagicMock()
-    exchange._papi_request = MagicMock(return_value={"leverage": 1})
+    # _set_pm_leverage requires the exchange to echo the symbol and leverage.
+    exchange._papi_request = MagicMock(return_value={"symbol": "ETHUSDT", "leverage": 2})
 
-    exchange._lev_prep("ETH/USDT:USDT", 1.0, "buy")
+    exchange._lev_prep("ETH/USDT:USDT", 2.0, "buy")
 
     exchange._api.set_margin_mode.assert_not_called()
     exchange._papi_request.assert_called_once_with(
-        "um/leverage", "POST", {"symbol": "ETHUSDT", "leverage": 1}
+        "um/leverage", "POST", {"symbol": "ETHUSDT", "leverage": 2}
     )
 
 
@@ -987,6 +990,8 @@ def test_intent_store_write_failure_blocks_order_post(default_conf_usdt, mocker)
     exchange.amount_to_precision = MagicMock(return_value=1)
     exchange.price_to_precision = MagicMock(return_value=100)
     exchange.assert_pm_risk_allows_order = MagicMock()
+    # The live 2x bracket/exposure gate is covered by its own tests.
+    exchange.assert_pm_leverage_allows_order = MagicMock()
     # Gate reads work; the WRITE fails (e.g. disk full).
     mocker.patch.object(PMOrderIntent, "has_unresolved", return_value=False)
     mocker.patch.object(PMOrderIntent, "get_unresolved", return_value=[])
@@ -1012,7 +1017,7 @@ def test_intent_store_write_failure_blocks_order_post(default_conf_usdt, mocker)
             amount=1,
             stop_price=95,
             side="sell",
-            leverage=5,
+            leverage=2,
             order_types={"stoploss": "market"},
         )
     assert exchange._papi_request.call_count == 0
@@ -1110,6 +1115,8 @@ def test_normal_order_timeout_no_second_client_id_or_post(default_conf_usdt, moc
     exchange.price_to_precision = MagicMock(return_value=100)
     exchange._order_contracts_to_amount = MagicMock(side_effect=lambda o: o)
     exchange.assert_pm_risk_allows_order = MagicMock()
+    # The live 2x bracket/exposure gate is covered by its own tests.
+    exchange.assert_pm_leverage_allows_order = MagicMock()
     new_id_spy = mocker.spy(exchange, "_pm_new_client_order_id")
 
     # First trigger: POST times out, lookup fails -> UNKNOWN intent, TemporaryError.
@@ -1162,6 +1169,8 @@ def test_normal_order_timeout_same_id_lookup_returns_existing(default_conf_usdt,
     exchange.amount_to_precision = MagicMock(return_value=1)
     exchange.price_to_precision = MagicMock(return_value=100)
     exchange.assert_pm_risk_allows_order = MagicMock()
+    # The live 2x bracket/exposure gate is covered by its own tests.
+    exchange.assert_pm_leverage_allows_order = MagicMock()
 
     order = exchange.create_order(
         pair="ETH/USDT:USDT",

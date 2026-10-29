@@ -100,6 +100,36 @@ def test_pm_exact_position_cap_overrides_dynamic_pairlist_wildcard():
         exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=1)
 
 
+def _open_order(side: str, reduce_only: bool) -> dict:
+    return {
+        "symbol": PAIR,
+        "side": side,
+        "status": "open",
+        "remaining": 0.002,
+        "price": 60000,
+        "info": {"reduceOnly": reduce_only, "closePosition": False},
+    }
+
+
+def test_pm_risk_reserves_open_short_entry_orders():
+    """A non-reduce-only SELL opens a short in futures and must reserve notional."""
+    exchange = make_pm_exchange({"max_total_notional": 200})
+    # position 50 + open short entry 120 + new order 60 = 230 > 200
+    exchange.fetch_open_orders = MagicMock(return_value=[_open_order("sell", False)])
+
+    with pytest.raises(PMRiskLimitExceeded):
+        exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=5)
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+def test_pm_risk_skips_reduce_only_open_orders(side):
+    exchange = make_pm_exchange({"max_total_notional": 200})
+    # Reduce-only orders shrink exposure: position 50 + new order 60 = 110 <= 200
+    exchange.fetch_open_orders = MagicMock(return_value=[_open_order(side, True)])
+
+    exchange.assert_pm_risk_allows_order(pair=PAIR, amount=0.001, leverage=5)
+
+
 @pytest.mark.parametrize(("side", "is_short"), [("buy", False), ("sell", True)])
 def test_pm_create_order_passes_entry_mode_and_direction_to_risk_check(side, is_short):
     exchange = Binance.__new__(Binance)

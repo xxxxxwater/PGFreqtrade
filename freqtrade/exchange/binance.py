@@ -2342,8 +2342,14 @@ class Binance(Exchange):
                     remaining = self._float_or_zero(open_order.get("remaining", 0))
                     if remaining <= 0:
                         continue
-                    if str(open_order.get("side", "")).lower() == "sell":
-                        continue  # reduces exposure - never reserved
+                    info = open_order.get("info") or {}
+                    if (
+                        str(info.get("reduceOnly", "")).lower() == "true"
+                        or str(info.get("closePosition", "")).lower() == "true"
+                    ):
+                        # Reduce-only orders shrink exposure - never reserved. Side
+                        # alone says nothing in futures: a SELL may open a short.
+                        continue
                     price = self._float_or_zero(
                         open_order.get("price", 0)
                     ) or self._float_or_zero(open_order.get("average", 0))

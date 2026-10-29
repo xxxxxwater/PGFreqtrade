@@ -925,6 +925,36 @@ def test_resolve_pm_pending_intent_cases(default_conf_usdt, mocker, tmp_path):
     assert report["uncertain"] is True
 
 
+def test_resolve_dispatched_conditional_intent_absent_stays_uncertain(
+    default_conf_usdt, mocker, tmp_path
+):
+    """A stop POST that crossed the dispatch boundary is never tombstoned on absence.
+
+    fetch_stoploss_order raising InvalidOrderException only means the id is not in
+    the queried open/history windows (allAlgoOrders covers ~7 days / 500 rows).
+    """
+    exchange = get_patched_pm_exchange(mocker, default_conf_usdt)
+    exchange._config["user_data_dir"] = str(tmp_path)
+    exchange._pm_intent_mark_uncertain = MagicMock()
+    exchange.fetch_stoploss_order = MagicMock(side_effect=InvalidOrderException("absent"))
+    intent = {
+        "client_id": "stabc",
+        "kind": "conditional",
+        "pair": "ETH/USDT:USDT",
+        "state": "UNKNOWN",
+        "dispatch_started_at": "2026-10-29T00:00:00+00:00",
+    }
+
+    report = exchange.resolve_pm_pending_intent(intent)
+
+    assert report["uncertain"] is True
+    assert report["resolved"] is False
+    assert report["exists"] is None
+    assert "automatic re-POST forbidden" in report["error"]
+    exchange._pm_intent_mark_uncertain.assert_called_once()
+    assert exchange._pm_intent_mark_uncertain.call_args[0][0] == "stabc"
+
+
 def test_fetch_open_conditional_orders_routes_papi(default_conf_usdt, mocker):
     exchange = get_patched_pm_exchange(mocker, default_conf_usdt)
     exchange._papi_request = MagicMock(return_value=[PM_ALGO_ORDER])
